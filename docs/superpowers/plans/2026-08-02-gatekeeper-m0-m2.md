@@ -2147,6 +2147,13 @@ curl.exe -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" h
 Expected: `401`, `200`, whoami JSON, spoofed tenant **overwritten**, direct call with empty
 `fromHeaders`, `401`, `200`.
 
+**Check 2 returns `200` with an empty body `[]`, and that is correct.** `authcore-machine` is a
+client-credentials client, so its token carries no `tenant` claim, and `/ledger/entries` is scoped to
+that claim — a tenant-less caller sees nothing rather than everything. To see actual rows, obtain a
+user token through the authorization-code flow (README walkthrough 1) for a user in the `acme`
+tenant; `ezzat`/`acme-password` maps to the seeded `LDG-1001` and `LDG-1002`. Demonstrating both is
+worth doing: the empty machine result *is* the tenant boundary working.
+
 - [ ] **Step 3: Verify rotation end to end**
 
 Rotate AuthCore's signing key via its operator API, mint a fresh token, and confirm it still passes

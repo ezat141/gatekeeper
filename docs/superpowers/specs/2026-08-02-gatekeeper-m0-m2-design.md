@@ -229,7 +229,7 @@ authentication exists.
 
 | Endpoint | Requirement | Purpose |
 |---|---|---|
-| `GET /ledger/entries` | authenticated | the ordinary case — returns seeded entries |
+| `GET /ledger/entries` | authenticated, **scoped to the caller's `tenant` claim** | the ordinary case — returns only that tenant's entries |
 | `POST /ledger/entries` | `hasAuthority('payments:write')` | proves the service enforces permissions itself, independent of GateKeeper |
 | `GET /ledger/whoami` | authenticated | **the demo endpoint** — see below |
 
@@ -242,6 +242,13 @@ authentication exists.
   "match": true
 }
 ```
+
+**Tenant scoping is enforced here, not only at the edge.** The seeded entries span two tenants, and
+`GET /ledger/entries` returns only those matching the caller's `tenant` claim. A client-credentials
+token carries no `tenant` claim — AuthCore omits it when there is no user — and such a caller
+therefore receives an empty list. Failing closed is the point: the wrong answer to "which tenant is
+this?" must be *nothing*, never *everything*. GateKeeper's tenant rules (M4) are a coarse outer
+layer; this is the authoritative check, and it still applies when the gateway is bypassed.
 
 `fromToken` is derived by ledger-service verifying the JWT itself. `fromHeaders` is whatever
 `X-GK-*` arrived. In normal operation they match. Call ledger-service directly on `:8082` with no
