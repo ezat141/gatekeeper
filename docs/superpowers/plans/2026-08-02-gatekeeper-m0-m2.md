@@ -21,6 +21,9 @@ These are established facts about this machine. Violating them wastes a session.
 - **PowerShell variables do not persist between tool calls.** Any multi-step demo must run in a single call.
 - **Docker Desktop must be running** only for AuthCore's Postgres/Redis. Neither new service needs Docker.
 - **Commit messages:** use `git commit -F <file>` with a message file. Quotes inside `-m` break in this shell. **Never add a `Co-Authored-By` line.**
+- **Branching.** Every task gets its own `feature/task-N` branch off `master`, merged back with `git merge --no-ff` so the topology stays visible on GitHub. Both repos are private on GitHub under `ezat141`; flip them to public at the end of Task 14.
+- **Boot 4 renamed the starters.** Use `spring-boot-starter-webmvc` (not `-web`), `spring-boot-starter-security-oauth2-resource-server` (not `-oauth2-resource-server`), and the per-feature test starters `spring-boot-starter-webmvc-test` / `-webflux-test` / `-security-test` / `-actuator-test` instead of the monolithic `spring-boot-starter-test` and the raw `spring-security-test`. The old names still resolve identically but are deprecated, and AuthCore already uses the new ones.
+- **Copy `.gitattributes` from AuthCore** into every new repo (`/mvnw text eol=lf`, `*.cmd text eol=crlf`). Without it a Windows checkout can commit `mvnw` with CRLF, which breaks it under bash and CI.
 
 ---
 
@@ -120,11 +123,11 @@ target/
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+            <artifactId>spring-boot-starter-security-oauth2-resource-server</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -132,12 +135,17 @@ target/
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
+            <artifactId>spring-boot-starter-webmvc-test</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
-            <groupId>org.springframework.security</groupId>
-            <artifactId>spring-security-test</artifactId>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator-test</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -924,7 +932,7 @@ The repo and git identity already exist — the spec was committed here.
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+            <artifactId>spring-boot-starter-security-oauth2-resource-server</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -932,7 +940,17 @@ The repo and git identity already exist — the spec was committed here.
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
+            <artifactId>spring-boot-starter-webflux-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator-test</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
