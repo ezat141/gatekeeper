@@ -230,7 +230,7 @@ authentication exists.
 | Endpoint | Requirement | Purpose |
 |---|---|---|
 | `GET /ledger/entries` | authenticated, **scoped to the caller's `tenant` claim** | the ordinary case — returns only that tenant's entries |
-| `POST /ledger/entries` | `hasAuthority('payments:write')` | proves the service enforces permissions itself, independent of GateKeeper |
+| `POST /ledger/entries` | `hasAuthority('payments:write')` **and** a `tenant` claim | proves the service enforces permissions itself, independent of GateKeeper |
 | `GET /ledger/whoami` | authenticated | **the demo endpoint** — see below |
 
 `GET /ledger/whoami` returns both identities side by side:
@@ -242,6 +242,19 @@ authentication exists.
   "match": true
 }
 ```
+
+**A tenant-less token cannot write either.** The read and write paths agree on what a missing
+`tenant` claim means. A client-credentials caller holding `payments:write` is refused with `403`
+rather than having its entry stored — because reads are tenant-scoped, an accepted write would
+produce a row unreadable by every caller in the system including its own author. Returning `201` for
+an operation whose result can never be observed is worse than refusing it.
+
+**Known limitation — no input validation.** `NewEntryRequest` is unvalidated in M0–M2. A null or
+absent `reference`, a null `amount`, a negative amount, an arbitrarily large amount, and a
+non-ISO `currency` are all accepted, and a duplicate `reference` creates a second row. This is
+deliberate scope, not an oversight: the milestone is about the edge, and closing it requires
+`spring-boot-starter-validation` plus a decision about error shape. It is recorded in the
+ledger-service README rather than silently carried.
 
 **Tenant scoping is enforced here, not only at the edge.** The seeded entries span two tenants, and
 `GET /ledger/entries` returns only those matching the caller's `tenant` claim. A client-credentials
