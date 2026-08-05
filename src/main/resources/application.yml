@@ -17,4 +17,11 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,gateway
+        # "gateway" is deliberately absent. Listing it here does nothing: Spring Cloud
+        # Gateway annotates its endpoint @RestControllerEndpoint(defaultAccess = NONE),
+        # and the access check short-circuits before exposure is ever consulted, so the
+        # endpoint would still never register. Turning it on needs
+        # management.endpoint.gateway.access: read-only — deferred until there is an
+        # authorization model to decide who may read it, since after M2 it would fall
+        # under anyExchange().authenticated() and be readable by any caller at all.
+        include: health,info
