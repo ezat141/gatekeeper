@@ -1461,6 +1461,15 @@ public class JwtDecoderConfig {
 }
 ```
 
+> **Expect `/actuator/info` to keep returning 401, and do not treat it as a bug you introduced.**
+> Before this task, Boot's `ReactiveManagementWebSecurityAutoConfiguration` installs a deny-all chain
+> over every actuator path except health — and because `OpaqueTokenIntrospector` is on the classpath
+> via the resource-server starter, `ReactiveUserDetailsServiceAutoConfiguration` is suppressed and no
+> generated password is ever printed, so nothing can authenticate against it. The config below
+> replaces that chain and permits `/actuator/health` only, so `info` stays behind authentication —
+> now deliberately rather than accidentally. Verified by running the app and reading the `--debug`
+> conditions report.
+
 - [ ] **Step 5: Write `GatewaySecurityConfig.java`**
 
 ```java
