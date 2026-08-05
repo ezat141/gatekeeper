@@ -269,6 +269,15 @@ gateway in front and `fromHeaders` is empty while `fromToken` is populated — w
 one response both that the headers are not authoritative and that the service is secure without the
 gateway. This is the endpoint to open in an interview.
 
+**`match` covers subject, tenant and permissions — all three.** Comparing only subject and tenant
+would let headers forging `admin:all` still report `match: true`, which for the one endpoint whose
+job is proving the headers are not authoritative would teach precisely the wrong lesson. Permissions
+are compared as sets, because the header is a joined string whose order carries no meaning.
+
+**`match: false` has two distinct causes**, and the README must distinguish them: no headers arrived
+to compare (the direct-to-`:8082` call), or headers arrived and disagreed (the spoofing case). Both
+render as `false`, and only `fromHeaders` being empty tells them apart.
+
 ---
 
 ## 9. Authentication (M2)
