@@ -794,6 +794,13 @@ public record WhoAmI(Identity fromToken, Identity fromHeaders, boolean match) {
 
 - [ ] **Step 4: Add the endpoint to `LedgerController`**
 
+> **Do not copy `create(...)`'s tenant guard onto this endpoint.** Task 4 established the pattern
+> "no `tenant` claim → throw `AccessDeniedException` → 403" for writes. Applying it here would make
+> `whoami` refuse in exactly the situations it exists to diagnose — a token whose identity is
+> incomplete or disagrees with the headers is the interesting case, not an error case. `whoami`
+> follows `entries()`'s shape instead: report absence visibly (a null field, an empty list) and let
+> the caller see it. A `whoami` that returns 403 when identity is missing tells you nothing.
+
 Additional imports: `RequestHeader`, `Nullable` (`org.springframework.lang.Nullable`), `Arrays`.
 
 ```java
@@ -2080,6 +2087,16 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
     }
 }
 ```
+
+**Also settle ledger-service's 403 body here.** A live probe during Task 4 found that *both* of its
+403 paths — wrong permission, and right permission with no `tenant` claim — return an identical
+0-byte body carrying `WWW-Authenticate: Bearer error="insufficient_scope"`. That label is actively
+wrong for the tenant case: the caller already holds `payments:write`, and no larger scope can supply
+a claim the token structurally lacks. It sends anyone debugging from that header after a fix that
+cannot work. Spring Security's `BearerTokenAccessDeniedHandler` produces this for any
+`AccessDeniedException`, so distinguishing the two causes means overriding the access-denied handler.
+Do it as part of this task, so the two services agree on one error shape rather than each inventing
+its own.
 
 **Note for the implementer:** Spring Security writes the 401 directly through its
 `ServerAuthenticationEntryPoint`, bypassing this handler, so the `WWW-Authenticate` header is
