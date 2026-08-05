@@ -1,0 +1,20 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: gatekeeper
+
+gatekeeper:
+  downstream:
+    authcore: http://localhost:8080
+    ledger: http://localhost:8082
+  auth:
+    issuer: http://localhost:8080
+    jwk-set-uri: http://localhost:8080/oauth2/jwks
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,gateway
