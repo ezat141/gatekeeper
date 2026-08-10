@@ -4,6 +4,30 @@ server:
 spring:
   application:
     name: gatekeeper
+  cloud:
+    gateway:
+      server:
+        webflux:
+          # StripPrefix=1 applies to the ledger route only. The gateway namespaces every
+          # downstream under /api, but ledger-service itself serves /ledger/** with no /api
+          # prefix, so that leading segment must be removed before forwarding. AuthCore, by
+          # contrast, serves /api/accounts and /api/machine verbatim, so those two routes
+          # forward the path unchanged.
+          routes:
+            - id: authcore-accounts
+              uri: ${gatekeeper.downstream.authcore}
+              predicates:
+                - Path=/api/accounts/**
+            - id: authcore-machine
+              uri: ${gatekeeper.downstream.authcore}
+              predicates:
+                - Path=/api/machine/**
+            - id: ledger
+              uri: ${gatekeeper.downstream.ledger}
+              predicates:
+                - Path=/api/ledger/**
+              filters:
+                - StripPrefix=1
 
 gatekeeper:
   downstream:

@@ -1090,6 +1090,15 @@ Message: `feat(M0): bootstrap GateKeeper on Spring Cloud Gateway 5`
 - Modify: `src/main/resources/application.yml`
 - Test: `src/test/java/com/gatekeeper/routing/RoutingTest.java`
 
+> **The gateway is closed by default here, not open.** Task 7 put the OAuth2 resource-server starter
+> on the classpath before any code used it, so Boot installs a deny-all `SecurityWebFilterChain` over
+> every path — and suppresses the generated password, because `OpaqueTokenIntrospector` is present.
+> Without intervention every assertion below fails on `401` before routing is even consulted. The
+> test therefore carries a nested `@TestConfiguration` supplying a permit-all chain, which makes
+> Boot's own security autoconfiguration back off. That scaffolding is scoped to this class and is
+> **removed in Task 9**, which installs the real chain and rewrites these expectations to carry a
+> token.
+
 - [ ] **Step 1: Write the failing test**
 
 ```java
@@ -1460,6 +1469,12 @@ public class JwtDecoderConfig {
     }
 }
 ```
+
+> **Delete Task 8's `PermitAllSecurity` scaffolding as part of this task.** `RoutingTest` carries a
+> nested `@TestConfiguration` supplying a permit-all chain, added only because no real chain existed
+> yet. Once `GatewaySecurityConfig` lands, two `SecurityWebFilterChain` beans would be in play and
+> the routing tests would be asserting against the wrong one. Remove the nested class and update
+> those four tests to present a valid token, exactly as the tests below do.
 
 > **Expect `/actuator/info` to keep returning 401, and do not treat it as a bug you introduced.**
 > Before this task, Boot's `ReactiveManagementWebSecurityAutoConfiguration` installs a deny-all chain
