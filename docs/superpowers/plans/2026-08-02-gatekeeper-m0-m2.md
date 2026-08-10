@@ -1470,6 +1470,23 @@ public class JwtDecoderConfig {
 }
 ```
 
+> **Add this tripwire so the scaffold cannot rot unnoticed**, to `GateKeeperApplicationTests`:
+>
+> ```java
+>     /**
+>      * Two chains do not conflict — Spring starts cleanly and {@code WebFilterChainProxy}
+>      * simply takes the first that matches, silently. A leftover test-scoped chain would
+>      * therefore never announce itself. This says so out loud instead.
+>      */
+>     @Test
+>     void onlyOneSecurityChainIsInPlay() {
+>         assertThat(context.getBeanNamesForType(SecurityWebFilterChain.class)).hasSize(1);
+>     }
+> ```
+>
+> It passes trivially today and fails the moment a second chain appears, naming the cause
+> instead of leaving someone to root-cause four unrelated-looking 401s.
+
 > **Delete Task 8's `PermitAllSecurity` scaffolding as part of this task.** `RoutingTest` carries a
 > nested `@TestConfiguration` supplying a permit-all chain, added only because no real chain existed
 > yet. Once `GatewaySecurityConfig` lands, two `SecurityWebFilterChain` beans would be in play and
