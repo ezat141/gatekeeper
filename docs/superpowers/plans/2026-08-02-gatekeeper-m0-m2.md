@@ -2129,6 +2129,16 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
 }
 ```
 
+**A JWKS fetch failure currently yields 500, not the 401 the spec calls for — and the exact cause is
+known.** A live probe traced it: `ReactiveRemoteJWKSource.getJWKSet()`'s `WebClientRequestException`
+is wrapped as `IllegalStateException("Could not obtain the keys", ...)` inside
+`NimbusReactiveJwtDecoder`. `JwtReactiveAuthenticationManager.authenticate()` maps only
+`JwtException` to a 401 (`onErrorMap(JwtException.class, ...)`), so an `IllegalStateException` passes
+through unmapped to Boot's default handler. No bypass occurs — the request is still refused, and the
+body carries no stack trace — but the status misreports the cause as a server fault rather than an
+authentication failure. Special-case that exception type here so an unreachable AuthCore reads as
+`401`, and add a test that stops the JWKS stub mid-run.
+
 **Also settle ledger-service's 403 body here.** A live probe during Task 4 found that *both* of its
 403 paths — wrong permission, and right permission with no `tenant` claim — return an identical
 0-byte body carrying `WWW-Authenticate: Bearer error="insufficient_scope"`. That label is actively
