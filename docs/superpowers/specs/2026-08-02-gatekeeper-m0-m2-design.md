@@ -304,6 +304,19 @@ AuthCore redirect.
 consistently. Failing closed on a mismatch is correct behaviour; the README states the cause so the
 failure is diagnosable rather than mysterious.
 
+### What the default validator does and does not check
+
+`JwtValidators.createDefaultWithIssuer(issuer)` composes, in Spring Security 7.0.6:
+`X509CertificateThumbprintValidator`, `JwtTimestampValidator` (so `exp` and, when present, `nbf`),
+`JwtTypeValidator`, and the `JwtIssuerValidator` built from the pinned issuer.
+
+**Audience is not validated.** AuthCore emits `aud`, but nothing at the edge checks it, so a token
+minted for one client is accepted by the gateway on behalf of any other. That is acceptable here
+because the gateway is not the party a token is addressed to — it is a pass-through, and the
+downstream resource server re-verifies independently. It would stop being acceptable the moment
+GateKeeper made a decision that depended on which client the token was for. Recorded so that
+decision is taken deliberately rather than inherited.
+
 ### Identity propagation and header anti-spoofing
 
 GateKeeper forwards three headers, derived **only** from verified claims:
