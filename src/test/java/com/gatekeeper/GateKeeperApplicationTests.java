@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.ApplicationContext;
 import org.springframework.http.server.reactive.HttpHandler;
+import org.springframework.security.web.server.SecurityWebFilterChain;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -23,5 +24,15 @@ class GateKeeperApplicationTests {
     @Test
     void startsAsAReactiveApplicationOnNetty() {
         assertThat(context.getBeanNamesForType(HttpHandler.class)).isNotEmpty();
+    }
+
+    /**
+     * Two chains do not conflict — Spring starts cleanly and {@code WebFilterChainProxy}
+     * simply takes the first that matches, silently. A leftover test-scoped chain would
+     * therefore never announce itself. This says so out loud instead.
+     */
+    @Test
+    void onlyOneSecurityChainIsInPlay() {
+        assertThat(context.getBeanNamesForType(SecurityWebFilterChain.class)).hasSize(1);
     }
 }
