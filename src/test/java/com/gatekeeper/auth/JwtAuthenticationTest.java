@@ -96,6 +96,25 @@ class JwtAuthenticationTest {
                 .expectStatus().isUnauthorized();
     }
 
+    /**
+     * The trap this decoder's issuer pinning exists to catch. AuthCore derives its issuer
+     * from the request host, so a token obtained at 127.0.0.1:8080 carries a different
+     * {@code iss} than one obtained at localhost:8080 — same key, same signature, same
+     * expiry, still refused. Failing closed is correct; this test is what stops someone
+     * "fixing" the resulting 401 by removing the validator.
+     */
+    @Test
+    void refusesATokenFromAnUnexpectedIssuer() {
+        String token = activeKey.mint("http://127.0.0.1:8080", "ezzat",
+                Instant.now().plus(5, ChronoUnit.MINUTES),
+                Map.of("tenant", "acme"));
+
+        client.get().uri("/api/ledger/entries")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus().isUnauthorized();
+    }
+
     /** Health has to stay reachable without a credential or nothing can probe liveness. */
     @Test
     void permitsHealthWithoutAToken() {
