@@ -1749,23 +1749,33 @@ import reactor.core.publisher.Mono;
 @Order(Ordered.HIGHEST_PRECEDENCE)
 public class InboundHeaderStripFilter implements WebFilter {
 
-    static final String PREFIX = "x-gk-";
+    static final String PREFIX = "X-GK-";
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
-        boolean carriesGatewayHeaders = exchange.getRequest().getHeaders().keySet().stream()
-                .anyMatch(name -> name.toLowerCase().startsWith(PREFIX));
+        boolean carriesGatewayHeaders = exchange.getRequest().getHeaders().headerNames().stream()
+                .anyMatch(InboundHeaderStripFilter::isGatewayHeader);
 
         if (!carriesGatewayHeaders) {
             return chain.filter(exchange);
         }
 
         ServerWebExchange stripped = exchange.mutate()
-                .request(request -> request.headers(headers ->
-                        headers.keySet().removeIf(name -> name.toLowerCase().startsWith(PREFIX))))
+                .request(request -> request.headers(headers -> headers.headerNames().stream()
+                        .filter(InboundHeaderStripFilter::isGatewayHeader)
+                        .toList()
+                        .forEach(headers::remove)))
                 .build();
 
         return chain.filter(stripped);
+    }
+
+    /**
+     * Case-insensitive prefix match. {@code regionMatches} rather than lower-casing avoids
+     * both an allocation per header and the Turkish-dotless-i class of locale surprise.
+     */
+    private static boolean isGatewayHeader(String name) {
+        return name.regionMatches(true, 0, PREFIX, 0, PREFIX.length());
     }
 }
 ```
@@ -2128,6 +2138,18 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
     }
 }
 ```
+
+**There are two unmapped-exception paths to 500, not one.** Both were found by live probe, both fail
+closed, and both belong to this task.
+
+The second one: a claim value containing a control character. A token whose `permissions` claim holds
+`evil\r\nX-Injected: yes` produces `IllegalArgumentException: Validation failed for header
+'X-GK-Permissions'` — thrown by Netty's `DefaultHeaders.validateValue` from inside Spring Cloud
+Gateway's own `NettyRoutingFilter`, when it copies headers onto the outbound request. `IdentityStampFilter`
+does not throw; Spring's reactive `HttpHeaders.set()` stores the value happily and the failure surfaces
+later, in framework code. Nothing is injectable — Netty refuses to put the CRLF on the wire and the
+request is never proxied — but the caller sees a 500 for what is a malformed-token problem. Map it
+alongside the JWKS case.
 
 **A JWKS fetch failure currently yields 500, not the 401 the spec calls for — and the exact cause is
 known.** A live probe traced it: `ReactiveRemoteJWKSource.getJWKSet()`'s `WebClientRequestException`
