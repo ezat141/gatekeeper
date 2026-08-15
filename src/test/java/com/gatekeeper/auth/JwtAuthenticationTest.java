@@ -115,6 +115,39 @@ class JwtAuthenticationTest {
                 .expectStatus().isUnauthorized();
     }
 
+    /**
+     * Signed by a key that was never published, but advertising a {@code kid} that was.
+     * The decoder finds k1, attempts verification, and the signature does not match — so
+     * this exercises verification failure rather than key lookup failure.
+     */
+    @Test
+    void refusesATokenWithAnInvalidSignature() {
+        TestKey foreignKey = TestKey.generate("k1");
+        String token = foreignKey.mint(ISSUER, "attacker",
+                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of());
+
+        client.get().uri("/api/ledger/entries")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus().isUnauthorized();
+    }
+
+    /**
+     * Advertises a {@code kid} absent from the JWKS. The decoder cannot resolve the key,
+     * refetches the key set, and only then gives up — a different path from a signature
+     * mismatch, and the one key rotation depends on.
+     */
+    @Test
+    void refusesATokenWithAnUnknownKeyId() {
+        String token = activeKey.mintAdvertisingKeyId("k-does-not-exist", ISSUER, "ezzat",
+                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of());
+
+        client.get().uri("/api/ledger/entries")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus().isUnauthorized();
+    }
+
     /** Health has to stay reachable without a credential or nothing can probe liveness. */
     @Test
     void permitsHealthWithoutAToken() {
