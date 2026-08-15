@@ -20,9 +20,11 @@ import java.util.Map;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * M2 answers exactly one question: is this a valid, unexpired token from AuthCore. Whether
@@ -113,6 +115,51 @@ class JwtAuthenticationTest {
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange()
                 .expectStatus().isUnauthorized();
+    }
+
+    /**
+     * Signed by a key that was never published, but advertising a {@code kid} that was.
+     * The decoder finds k1, attempts verification, and the signature does not match — so
+     * this exercises verification failure rather than key lookup failure.
+     */
+    @Test
+    void refusesATokenWithAnInvalidSignature() {
+        TestKey foreignKey = TestKey.generate("k1");
+        String token = foreignKey.mint(ISSUER, "attacker",
+                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of());
+
+        client.get().uri("/api/ledger/entries")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus().isUnauthorized();
+    }
+
+    /**
+     * Advertises a {@code kid} absent from the JWKS. The decoder cannot resolve the key,
+     * refetches the key set, and only then gives up — a different code path from a
+     * signature mismatch.
+     *
+     * <p>The fetch-count assertion is the point. Nimbus throws on an empty candidate-key
+     * list whether or not a refetch was attempted, so asserting only the 401 would pass
+     * just as happily with refresh-on-miss removed. Key rotation depends on that refetch,
+     * so the test has to watch for it rather than infer it.
+     */
+    @Test
+    void refusesATokenWithAnUnknownKeyId() {
+        String token = activeKey.mintAdvertisingKeyId("k-does-not-exist", ISSUER, "ezzat",
+                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of());
+
+        authCore.resetRequests();
+
+        client.get().uri("/api/ledger/entries")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus().isUnauthorized();
+
+        assertThat(authCore.findAll(getRequestedFor(urlEqualTo("/oauth2/jwks"))))
+                .as("an unresolvable kid must trigger a JWKS refetch, since that is what "
+                        + "lets a rotated key be picked up without a redeploy")
+                .isNotEmpty();
     }
 
     /** Health has to stay reachable without a credential or nothing can probe liveness. */
