@@ -152,4 +152,34 @@ class IdentityPropagationTest {
                 .withoutHeader("X-GK-Tenant")
                 .withoutHeader("X-GK-Permissions"));
     }
+
+    /**
+     * The case the other tests cannot catch, and the only one where spoofing would work.
+     *
+     * <p>A client-credentials token carries no {@code tenant} claim, so {@link
+     * IdentityStampFilter} skips that header entirely rather than overwriting it — its
+     * {@code if (tenant != null)} guard sees to that. Every other test here passes even
+     * with the strip filter deleted, because stamping happens to overwrite the forged
+     * value anyway. Here nothing overwrites it, so if the strip did not run the client's
+     * {@code X-GK-Tenant} would reach the downstream intact.
+     */
+    @Test
+    void stripsASpoofedHeaderTheStampFilterWouldNotOverwrite() {
+        downstream.resetRequests();
+
+        String machineToken = activeKey.mint(ISSUER, "authcore-machine",
+                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of());
+
+        client.get().uri("/api/ledger/entries")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken)
+                .header("X-GK-Tenant", "default")
+                .header("X-GK-Permissions", "admin:all")
+                .exchange()
+                .expectStatus().isOk();
+
+        downstream.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
+                .withHeader("X-GK-Subject", equalTo("authcore-machine"))
+                .withoutHeader("X-GK-Tenant")
+                .withoutHeader("X-GK-Permissions"));
+    }
 }

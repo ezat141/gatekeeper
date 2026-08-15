@@ -8,7 +8,7 @@ The thing worth understanding before anything else: **the gateway is a coarse fi
 
 That division is the whole design. A gateway that owns authorization becomes a single point of failure whose compromise unlocks everything behind it. This one is built so that removing it weakens throughput, not security.
 
-**Scope:** this repository covers milestones M0–M2 — a running reverse proxy that authenticates AuthCore-issued JWTs. Identity propagation, route-level authorization, rate limiting, and revocation are planned and **not built**. [Known limitations](#known-limitations) and [Roadmap](#roadmap) say exactly where the line is.
+**Scope:** this repository covers milestones M0–M2 — a running reverse proxy that authenticates AuthCore-issued JWTs. Route-level authorization, rate limiting, and revocation are planned and **not built**. [Known limitations](#known-limitations) and [Roadmap](#roadmap) say exactly where the line is.
 
 ---
 
@@ -21,7 +21,7 @@ That division is the whole design. A gateway that owns authorization becomes a s
 - [Routes](#routes)
 - [Authentication](#authentication)
 - [Issuer pinning, and the trap it exists to catch](#issuer-pinning-and-the-trap-it-exists-to-catch)
-- [The identity headers it does not stamp yet](#the-identity-headers-it-does-not-stamp-yet)
+- [The identity headers it stamps](#the-identity-headers-it-stamps)
 - [Why reactive here, when ledger-service is not](#why-reactive-here-when-ledger-service-is-not)
 - [Testing](#testing)
 - [Known limitations](#known-limitations)
@@ -201,21 +201,19 @@ Failing closed is correct — an issuer check that shrugs at a hostname it was n
 
 ---
 
-## The identity headers it does not stamp yet
+## The identity headers it stamps
 
-ledger-service's README describes three headers — `X-GK-Subject`, `X-GK-Tenant`, `X-GK-Permissions` — that this gateway's design says it will stamp from verified claims, and it documents a `GET /ledger/whoami` endpoint that reports them back for inspection.
+ledger-service's README describes three headers — `X-GK-Subject`, `X-GK-Tenant`, `X-GK-Permissions` — and a `GET /ledger/whoami` endpoint that reports them back for inspection. This gateway stamps them, from verified claims only.
 
-**This service does not stamp them yet, and it does not strip inbound ones either.** There is no such filter in `src/main/java`. Two consequences follow, and they point in opposite directions:
+The work splits across two filters, and the split is the design rather than an accident of structure.
 
-**The harmless one.** Called through the gateway today, ledger-service sees no `X-GK-*` headers, so `whoami` reports `fromHeaders` empty and `match: false` — the same shape as a direct call that bypasses the gateway. That is not a bug in either service; it is an accurate report that nothing upstream asserted an identity.
+`InboundHeaderStripFilter` is a `WebFilter` at `HIGHEST_PRECEDENCE`, which puts it ahead of Spring Security's own chain at order `-100`. It removes **every** inbound header whose name begins with `X-GK-`, matched case-insensitively rather than against a fixed list of three, so a fourth header added later cannot silently become spoofable. It strips unconditionally — on every route including permitted ones, and before authentication runs, so a request that fails authentication cannot launder a header through an error path.
 
-**The one worth stating plainly.** Spring Cloud Gateway forwards request headers to the downstream by default. A client can therefore send `X-GK-Tenant: acme` to `:8081` today and have it arrive at ledger-service unaltered. In a system whose downstream trusted that header, this would be a cross-tenant read for the cost of one `curl` flag.
+`IdentityStampFilter` is a `GlobalFilter`, which runs inside the gateway handler and therefore after Spring Security has authenticated. It reads the verified `Jwt` from `ReactiveSecurityContextHolder` and sets the three headers from its claims. A claim AuthCore omits produces no header at all rather than an empty one a downstream might misread — every client-credentials token lacks `tenant` and `permissions`, so this is the normal case, not an edge one.
 
-It is currently harmless here for exactly one reason, and it is the reason the platform is built this way: **ledger-service never authorizes on those headers.** It re-derives the caller's tenant and permissions from the token's own verified claims and treats `X-GK-*` as informational, which its `whoami` endpoint demonstrates by reporting forged headers alongside the real claims and flagging the disagreement.
+One class cannot occupy both positions. Stripping needs the request untouched and must precede authentication; stamping needs the authentication result and cannot precede it.
 
-So the unbuilt filter is a defence-in-depth layer, not the thing standing between a client and someone else's data. That is a deliberate ordering: the authoritative check was built first, in the service that owns the data, and the convenience layer that lets downstreams skip re-parsing a token comes second. An unfinished gateway that cannot compromise the system is the intended property, not a lucky accident.
-
-When the filter lands (M3), it strips **every** inbound header whose name begins with `X-GK-`, matched case-insensitively rather than against a fixed list of three, and it strips them unconditionally — on every route including permitted ones, and before authentication runs, so an unauthenticated request cannot launder a header through an error path.
+**These headers are still not authoritative, and that has not changed.** ledger-service re-derives the caller's tenant and permissions from the token's own verified claims and treats `X-GK-*` as informational — its `whoami` endpoint demonstrates exactly that, reporting header-asserted identity beside token-derived identity and flagging any disagreement. The gateway stamping them is a convenience for downstreams that are not themselves resource servers, layered on top of a boundary that was built first and holds without it.
 
 ---
 
