@@ -2139,6 +2139,18 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
 }
 ```
 
+**There are two unmapped-exception paths to 500, not one.** Both were found by live probe, both fail
+closed, and both belong to this task.
+
+The second one: a claim value containing a control character. A token whose `permissions` claim holds
+`evil\r\nX-Injected: yes` produces `IllegalArgumentException: Validation failed for header
+'X-GK-Permissions'` — thrown by Netty's `DefaultHeaders.validateValue` from inside Spring Cloud
+Gateway's own `NettyRoutingFilter`, when it copies headers onto the outbound request. `IdentityStampFilter`
+does not throw; Spring's reactive `HttpHeaders.set()` stores the value happily and the failure surfaces
+later, in framework code. Nothing is injectable — Netty refuses to put the CRLF on the wire and the
+request is never proxied — but the caller sees a 500 for what is a malformed-token problem. Map it
+alongside the JWKS case.
+
 **A JWKS fetch failure currently yields 500, not the 401 the spec calls for — and the exact cause is
 known.** A live probe traced it: `ReactiveRemoteJWKSource.getJWKSet()`'s `WebClientRequestException`
 is wrapped as `IllegalStateException("Could not obtain the keys", ...)` inside
