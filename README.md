@@ -245,17 +245,18 @@ The failure mode these share is what makes them dangerous: **a blocking call ins
 ./mvnw test
 ```
 
-**13 tests, no Docker.** WireMock stands in for both AuthCore's JWKS endpoint and the downstream services, so the suite runs offline in under ten seconds. Testcontainers arrives when Redis does, at M5.
+**18 tests, no Docker.** WireMock stands in for both AuthCore's JWKS endpoint and the downstream services, so the suite runs offline in under ten seconds. Testcontainers arrives when Redis does, at M5.
 
 | Class | Tests | Covers |
 |---|---|---|
 | `GateKeeperApplicationTests` | 2 | The app is reactive rather than servlet; exactly one security chain is in play |
 | `RoutingTest` | 4 | `StripPrefix=1` applied to the ledger route and *not* to either AuthCore route; an unmatched path reaches no downstream |
 | `JwtAuthenticationTest` | 7 | No token, valid token, expired token, wrong issuer, bad signature, unknown `kid`, public health |
+| `IdentityPropagationTest` | 5 | Verified claims stamped downstream; forged headers overwritten; casing variants stripped; absent claims produce no header; the spoof stamping cannot mask |
 
-Current run: `Tests run: 13, Failures: 0, Errors: 0, Skipped: 0`.
+Current run: `Tests run: 18, Failures: 0, Errors: 0, Skipped: 0`.
 
-Four of these are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
+Five of these are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
 
 **`onlyOneSecurityChainIsInPlay`** asserts there is exactly one `SecurityWebFilterChain` bean. Two chains do not conflict loudly — Spring starts cleanly and `WebFilterChainProxy` silently takes the first that matches. A leftover test-scoped permit-all chain would therefore never announce itself; it would just quietly disable authentication for the whole suite. This test says out loud what would otherwise be invisible.
 
@@ -274,13 +275,15 @@ assertThat(authCore.findAll(getRequestedFor(urlEqualTo("/oauth2/jwks"))))
 
 Nimbus throws on an empty candidate-key list whether or not a refetch was attempted, so asserting only the status code would pass just as happily against an implementation with refresh-on-miss removed — and removing it would silently break key rotation, which is the entire reason this service trusts a JWKS URL instead of a copied key. The test has to watch for the refetch rather than infer it from the outcome.
 
+**`stripsASpoofedHeaderTheStampFilterWouldNotOverwrite`** exists because the four obvious anti-spoofing tests are all blind. Delete `InboundHeaderStripFilter` entirely and they keep passing — `IdentityStampFilter` calls `headers.set(...)`, which replaces a forged value case-insensitively whether or not anything stripped it first. The one case stamping cannot mask is a claim the token does not carry: a client-credentials token has no `tenant`, so the stamp filter's `if (tenant != null)` guard skips that header and leaves whatever the client sent. That is the only scenario where a spoofed header would actually reach a downstream, and it is therefore the only test that fails when the strip filter is removed — verified by deleting the file and watching precisely one of the five go red.
+
 ---
 
 ## Known limitations
 
 Honest about what this is not, yet. Several of these are the direct consequence of M0–M2 being a deliberately narrow slice.
 
-- **No identity propagation.** `X-GK-*` headers are neither stamped nor stripped — see [the section above](#the-identity-headers-it-does-not-stamp-yet), which explains why this is currently harmless and why it still has to be built.
+- **Identity headers are informational, not authoritative.** They are stamped from verified claims and inbound ones are stripped — see [the section above](#the-identity-headers-it-stamps) — but no downstream should authorize on them, and ledger-service deliberately does not. Treating `X-GK-*` as a trust signal would make every service behind this gateway depend on the gateway being unbypassable, which it is not.
 
 - **No route-level authorization.** `anyExchange().authenticated()` is the entire model. Any valid AuthCore token reaches any route, and the downstream is what stops it going further. A client-credentials token with no `tenant` claim can reach `/api/ledger/**` through this gateway; ledger-service is what returns it an empty list.
 
@@ -309,7 +312,8 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 | M0 | Skeleton on Netty, health endpoint | ✅ |
 | M1 | Routing to AuthCore and ledger-service, prefix rewriting | ✅ |
 | M2 | JWT authentication against JWKS, issuer pinning | ✅ |
-| M3 | Identity propagation and inbound `X-GK-*` stripping; API-key authentication | planned |
+| M3 | Identity propagation and inbound `X-GK-*` stripping | **done** |
+| M3 | API-key authentication | planned |
 | M4 | Route → scope authorization, tenant enforcement at the edge | planned |
 | M5 | Distributed rate limiting and per-plan quotas (Redis) | planned |
 | M6 | Revocation check against AuthCore's deny-list | planned |
