@@ -67,6 +67,7 @@ class UnreachableJwksErrorShapeTest {
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange()
                 .expectStatus().isUnauthorized()
+                .expectHeader().valueMatches(HttpHeaders.WWW_AUTHENTICATE, "Bearer.*")
                 .expectBody()
                 .jsonPath("$.error").isEqualTo("unauthorized")
                 .jsonPath("$.status").isEqualTo(401)

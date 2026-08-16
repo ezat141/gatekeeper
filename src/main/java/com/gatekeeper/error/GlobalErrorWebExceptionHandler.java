@@ -6,6 +6,7 @@ import org.springframework.boot.webflux.autoconfigure.error.AbstractErrorWebExce
 import org.springframework.boot.webflux.error.ErrorAttributes;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.annotation.Order;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.ServerCodecConfigurer;
@@ -16,8 +17,6 @@ import org.springframework.web.reactive.function.server.RouterFunctions;
 import org.springframework.web.reactive.function.server.ServerRequest;
 import org.springframework.web.reactive.function.server.ServerResponse;
 import reactor.core.publisher.Mono;
-
-import java.util.Map;
 
 /**
  * One JSON error shape across the platform. Without it a client gets an empty body from
@@ -60,11 +59,22 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
     private Mono<ServerResponse> render(ServerRequest request) {
         Throwable error = getError(request);
         HttpStatus status = statusFor(request, error);
-        Map<String, Object> body = ErrorBody.of(status, request.path());
 
-        return ServerResponse.status(status)
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(body);
+        ServerResponse.BodyBuilder builder = ServerResponse.status(status)
+                .contentType(MediaType.APPLICATION_JSON);
+
+        if (status == HttpStatus.UNAUTHORIZED) {
+            // RFC 6750 requires it on a 401 from a bearer-token resource.
+            // JsonServerAuthenticationEntryPoint already sets it on the path it owns (no
+            // credential at all); omitting it here would mean the other two ways this
+            // gateway says "unauthorized" - an unreachable JWKS, a rejected outbound header -
+            // fail to tell the caller how to authenticate, contradicting that class's own
+            // reasoning about the same header. Not unconditional: a 503 or 404 carrying
+            // WWW-Authenticate would be wrong and confusing.
+            builder = builder.header(HttpHeaders.WWW_AUTHENTICATE, "Bearer");
+        }
+
+        return builder.bodyValue(ErrorBody.of(status, request.path()));
     }
 
     /**
@@ -106,8 +116,12 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
     /**
      * {@code NimbusReactiveJwtDecoder}'s fixed message when {@code
      * ReactiveRemoteJWKSource.getJWKSet()} fails for any reason — connection refused, DNS
-     * failure, timeout, a non-2xx response. The message carries no variable text, so an
-     * exact match is safe and does not need the cause chain inspected as well.
+     * failure, timeout, a non-2xx response, or malformed JSON from the JWKS endpoint. All of
+     * these surface through the same unconditional, single-argument {@code
+     * Mono#onErrorMap(Function)} wrapping the key-fetch pipeline (confirmed by reading the
+     * decoder's bytecode: the mapper is {@code t -> new IllegalStateException("Could not
+     * obtain the keys", t)} with no type check on {@code t}), so the message carries no
+     * variable text and an exact match is safe without also inspecting the cause chain.
      */
     private static boolean isUnreachableJwks(Throwable error) {
         return error instanceof IllegalStateException
