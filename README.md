@@ -8,7 +8,7 @@ The thing worth understanding before anything else: **the gateway is a coarse fi
 
 That division is the whole design. A gateway that owns authorization becomes a single point of failure whose compromise unlocks everything behind it. This one is built so that removing it weakens throughput, not security.
 
-**Scope:** this repository covers milestones M0–M2 — a running reverse proxy that authenticates AuthCore-issued JWTs. Route-level authorization, rate limiting, and revocation are planned and **not built**. [Known limitations](#known-limitations) and [Roadmap](#roadmap) say exactly where the line is.
+**Scope:** this repository covers milestones M0–M3 — a reverse proxy that authenticates AuthCore-issued JWTs and propagates the verified caller identity to downstreams. Route-level authorization, rate limiting, and revocation are planned and **not built**. [Known limitations](#known-limitations) and [Roadmap](#roadmap) say exactly where the line is.
 
 ---
 
@@ -74,6 +74,8 @@ Run the suite — no Docker required, since WireMock stands in for both AuthCore
 | JWKS trust anchor | Public keys fetched from AuthCore, never copied into configuration |
 | Key rotation support | An unresolvable `kid` triggers a JWKS refetch, so a rotated key is picked up without redeploying |
 | Issuer pinning | Tokens from an unexpected `iss` are refused even when the signature is valid |
+| Identity propagation | Verified `sub`, `tenant`, and `permissions` stamped downstream as `X-GK-*`, for consumers that are not themselves resource servers |
+| Header anti-spoofing | Every inbound `X-GK-*` header removed before authentication runs — prefix-matched, case-insensitive, unconditional |
 | Stateless | No session, no CSRF token, no server-side state. Killable and restartable at any moment |
 | Public health | `/actuator/health` reachable without a credential, so liveness can be probed |
 
@@ -94,7 +96,7 @@ One packaging note that costs an hour if you hit it: the starter is **`spring-cl
 | Service | Port | Owns | Repo |
 |---|---|---|---|
 | **AuthCore** | `:8080` | Authenticating users, issuing and signing JWTs, publishing JWKS | [ezat141/authcore](https://github.com/ezat141/authcore) |
-| **GateKeeper** | `:8081` | Routing, edge rejection of unauthenticated traffic | this repo |
+| **GateKeeper** | `:8081` | Routing, edge rejection of unauthenticated traffic, identity propagation | this repo |
 | **ledger-service** | `:8082` | Ledger data, and fine-grained authorization over it | [ezat141/ledger-service](https://github.com/ezat141/ledger-service) |
 
 Each service holds only the public half of AuthCore's signing keys, fetched from JWKS. Only AuthCore holds a private key, and only AuthCore decides anyone's roles or permissions. GateKeeper never issues a token, never mints a claim, and never overrules a downstream's refusal.
@@ -108,18 +110,22 @@ graph TB
     C["Client"]
 
     subgraph GK["GateKeeper :8081 — Netty / WebFlux, stateless"]
+        STRIP["InboundHeaderStripFilter<br/>WebFilter · HIGHEST_PRECEDENCE<br/>drops every inbound X-GK-*"]
         SEC["SecurityWebFilterChain<br/>health public · everything else authenticated"]
         DEC["ReactiveJwtDecoder<br/>signature · exp · issuer"]
+        STAMP["IdentityStampFilter<br/>GlobalFilter · reads the verified Jwt<br/>sets X-GK-Subject · -Tenant · -Permissions"]
         ROUTE["Route predicates<br/>/api/accounts · /api/machine · /api/ledger"]
     end
 
     A["AuthCore :8080<br/>issuer · JWKS"]
     L["ledger-service :8082<br/>resource server"]
 
-    C -->|"Bearer JWT"| SEC
+    C -->|"Bearer JWT<br/>+ any X-GK-* the client invented"| STRIP
+    STRIP --> SEC
     SEC --> DEC
     DEC -.->|"GET /oauth2/jwks<br/>cached, refetched on unknown kid"| A
-    DEC -->|"valid"| ROUTE
+    DEC -->|"valid"| STAMP
+    STAMP --> ROUTE
     SEC -->|"missing / invalid"| R401["401<br/>WWW-Authenticate: Bearer"]
 
     ROUTE -->|"/api/accounts/** · /api/machine/**<br/>path unchanged"| A
@@ -129,7 +135,11 @@ graph TB
     A -. "JWKS" .-> L
 ```
 
-The dashed line from the client straight to ledger-service is the important one. It is not a gap in the diagram — it is a supported path. ledger-service verifies tokens against AuthCore's JWKS on its own and enforces its own tenant and permission rules, so bypassing this gateway costs you rate limiting and routing convenience, and buys you nothing in access.
+Two things in that diagram are load-bearing.
+
+**The strip and the stamp sit on opposite sides of the security chain**, which is why they are two classes rather than one. Stripping has to happen before authentication, on the untouched request, so that no forged header survives into an error path. Stamping cannot happen until after, because the verified `Jwt` does not exist any earlier. No single filter position satisfies both.
+
+**The dashed line from the client straight to ledger-service is a supported path, not a gap.** ledger-service verifies tokens against AuthCore's JWKS on its own and enforces its own tenant and permission rules, so bypassing this gateway costs you rate limiting and routing convenience, and buys you nothing in access.
 
 ---
 
@@ -281,7 +291,7 @@ Nimbus throws on an empty candidate-key list whether or not a refetch was attemp
 
 ## Known limitations
 
-Honest about what this is not, yet. Several of these are the direct consequence of M0–M2 being a deliberately narrow slice.
+Honest about what this is not, yet. Several of these are the direct consequence of M0–M3 being a deliberately narrow slice.
 
 - **Identity headers are informational, not authoritative.** They are stamped from verified claims and inbound ones are stripped — see [the section above](#the-identity-headers-it-stamps) — but no downstream should authorize on them, and ledger-service deliberately does not. Treating `X-GK-*` as a trust signal would make every service behind this gateway depend on the gateway being unbypassable, which it is not.
 
