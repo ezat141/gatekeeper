@@ -2139,6 +2139,21 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
 }
 ```
 
+**Two things found during this task that belong to later milestones, recorded so they are not
+rediscovered from scratch:**
+
+*The 403 path still has the empty-body gap that 401 just lost.* `OAuth2ResourceServerSpec`'s default
+`accessDeniedHandler` commits its own response exactly as the default authentication entry point did,
+so a 403 will come back with no JSON body. It is unreachable today — GateKeeper has no
+`hasAuthority`/`access` rules, so nothing can produce a 403 — but M4 adds route-level authorization
+and will make it live. Wire a JSON access-denied handler at the same time, reusing `ErrorBody`.
+
+*The JWKS fetch has no response timeout.* Spring Security's `ReactiveRemoteJWKSource` builds a bare
+`WebClient.create()`, so a JWKS host that accepts the TCP connection but never answers hangs the
+request rather than failing to a 401 — an active refusal is handled, a silent hang is not. This is a
+characteristic of Spring Security's own decoder rather than anything here, and closing it means
+supplying a custom `WebClient` to the decoder builder. Worth doing when resilience arrives at M7.
+
 **There are two unmapped-exception paths to 500, not one.** Both were found by live probe, both fail
 closed, and both belong to this task.
 
