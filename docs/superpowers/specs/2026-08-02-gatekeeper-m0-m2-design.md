@@ -362,7 +362,16 @@ other than `localhost`.
 | JWKS fetch failure | `401` (fail closed), logged at `WARN` |
 
 A single `GlobalErrorWebExceptionHandler` renders all of these as JSON matching AuthCore's existing
-error shape, so a client sees one error format across the platform. Circuit breaking, retries and
+error shape, so a client sees one error format across the platform.
+
+**The two services agree on `401` and `403`, and diverge below that — say so rather than claiming
+otherwise.** GateKeeper's handler is a blanket `@Order(-2)` override matching `RequestPredicates.all()`,
+so *every* error it produces takes the platform shape, a `404` included. ledger-service replaces only
+its authentication entry point and access-denied handler, so a `400`, `404` or `405` from it still
+renders Boot's stock `{timestamp, status, error, path}`. That is deliberate scope — the failures worth
+unifying were the ones a caller acts on, and reshaping the rest would mean an error controller this
+milestone did not need. It is a real difference all the same, and a client parsing errors across both
+services meets two shapes. Recorded so the README does not advertise a uniformity that stops at `403`. Circuit breaking, retries and
 fallbacks are **M7**, not here; M2 only guarantees the error is clean.
 
 ---
