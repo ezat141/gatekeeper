@@ -243,6 +243,21 @@ authentication exists.
 }
 ```
 
+**One of those two refusals cannot actually occur, and the live run is what proved it.**
+`TenantRequiredException` fires only when a caller clears `hasAuthority('payments:write')` and then
+turns out to have no `tenant` claim. AuthCore cannot mint such a token: `AuthCoreTokenCustomizer`
+writes `tenant`, `roles` and `permissions` inside a single `ifPresent` block, so a token carries all
+of them or none. A client-credentials token has neither, and is therefore refused a step earlier, at
+the permission gate — with the *other* detail. Confirmed end to end: a machine token holding
+`scope=payments:write` still fails `hasAuthority`, because scope maps to `SCOPE_payments:write` while
+that expression reads the `permissions` claim.
+
+The guard is still worth keeping — it protects an invariant the two services must not silently
+disagree about, and a future issuer or a changed customizer could break the coupling. But it is
+defensive rather than live, and its unit test passes only because `jwt().authorities(...)` builds a
+principal AuthCore could not issue. Worth stating plainly rather than implying both refusals are
+reachable today.
+
 **A tenant-less token cannot write either.** The read and write paths agree on what a missing
 `tenant` claim means. A client-credentials caller holding `payments:write` is refused with `403`
 rather than having its entry stored — because reads are tenant-scoped, an accepted write would
