@@ -84,13 +84,64 @@ Three more, each of which cost a build:
 **M3 — API-key authentication.** An `X-API-Key` converter plus a reactive authentication manager,
 composed with JWT so *either* mechanism authenticates.
 
-The seam already exists in AuthCore: table `api_keys`, where `key_hash` is **SHA-256 hex** — not
+The *data* already exists in AuthCore: table `api_keys`, where `key_hash` is **SHA-256 hex** — not
 bcrypt, because this is a per-request lookup rather than a password — with comma-separated `scopes`,
 `enabled`, and `expires_at`. Keys carry an `ak_` prefix so a leaked one is greppable. Seeded demo key:
 `ak_demo_reporting_job_local_only_0000000000`, scope `payments:read`.
 
-Note GateKeeper is **stateless and owns no database**; reaching Postgres directly would break that
-property. Prefer a reactive Redis cache or a call to AuthCore, decide deliberately, and record why.
+What does **not** exist is any way for another service to ask about it. There is no HTTP seam, only a
+database table — which is the wrong kind of seam for this platform. The decision below settles what
+to do about that before any code is written.
+
+### Decided: M3 may change AuthCore, and should
+
+The question comes up immediately, so it is answered here rather than re-argued. **AuthCore exposes
+no seam for validating an API key.** It has fourteen HTTP endpoints and none of them do this; the
+`api_keys` table is reached only through `ApiKeyStore.findByRawKey()`, a direct `JdbcTemplate` query
+used solely by `ApiKeyAuthenticationProvider` inside AuthCore's own filter chain. The only seam that
+exists is a database table.
+
+**Adding one to AuthCore is in scope, and is the right choice rather than a concession**, because
+every alternative is worse and one of them destroys what this platform exists to demonstrate:
+
+- *GateKeeper reading AuthCore's Postgres directly* would mean three services sharing a database.
+  The design claim, stated in the responsibility matrix and all three READMEs, is that these services
+  couple by a wire contract with no shared code and no shared database, and that GateKeeper is
+  stateless and owns no business data. A JDBC connection into AuthCore's schema quietly deletes the
+  most distinctive property of the project.
+- *A shared Redis cache* only appears to dodge the question. Nothing populates such a cache today —
+  AuthCore hits Postgres per request — so adding that population **is itself an AuthCore change**. It
+  does not avoid modifying AuthCore; it makes the contract implicit and undocumented instead of
+  explicit and reviewable.
+- *Not validating at the edge* contradicts M3's own acceptance criterion.
+
+There is precedent: M0–M2 scoped AuthCore as untouched **for that milestone**, and explicitly recorded
+one deferred AuthCore change (pinning `issuer-uri`) as something to revisit. That was a milestone
+boundary, not a standing rule.
+
+It is also the honest architecture. AuthCore owns identity, and "is this credential valid, and what
+does it grant" is an identity question. The issuer answering it is correct; the enforcer inferring it
+from another service's tables is not. RFC 7662 token introspection is the same shape — API keys are
+not OAuth tokens, but an issuer exposing an authenticated endpoint that answers whether a credential
+is valid is the standard pattern.
+
+**Constraints on the change:**
+
+- One small endpoint, **authenticated**, so only trusted callers reach it. Left open it becomes an
+  oracle for testing stolen keys at line rate.
+- Return validity, scopes and expiry only. Never the key or its hash.
+- Cache the answer in GateKeeper's Redis with a short TTL rather than calling per request. GateKeeper
+  needs Redis for M5 and M6 regardless.
+- Treat it as a contract change: add it to the design spec's integration table beside JWKS and the
+  revocation key, so it is documented rather than folklore.
+
+**Two consequences to plan for:**
+
+- **M3 is a two-repo milestone**, as Task 13 was. AuthCore gets its own branch, tests and review
+  rather than riding along inside a GateKeeper commit.
+- **`last_used_at` becomes less accurate.** `ApiKeyStore.touchLastUsed()` updates it on validation;
+  once GateKeeper caches introspection results, the timestamp stops reflecting real usage. Decide
+  deliberately whether the endpoint touches it, and record the consequence either way.
 
 **M4 — Route-to-scope authorization and tenant check.** A
 `ReactiveAuthorizationManager<AuthorizationContext>` mapping route to required authority, and refusing
