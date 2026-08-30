@@ -411,6 +411,18 @@ Two things already verified, recorded here so they are not re-derived:
 Run: `.\mvnw.cmd -o test -Dtest=ApiKeyIntrospectionAccessTest`
 Expected: PASS.
 
+- [ ] **Step 4b: Update the controller's javadoc, which now says the opposite of the truth**
+
+Task 2 shipped `ApiKeyIntrospectionController` with a javadoc paragraph stating that **no** scope rule guards it yet and that any authenticated caller can use it as an oracle — accurate when written, false the moment Step 3 lands. Replace that paragraph with:
+
+```java
+ * <p>Guarded by {@code SCOPE_apikeys:introspect} in {@code AuthorizationServerConfig}. Left
+ * open it would be an oracle for testing stolen keys at line rate — and merely requiring
+ * authentication is not enough, since any low-privilege key would then qualify.
+```
+
+Do not skip this. A comment that overstates safety is worse than one that overstates risk, and this milestone has already corrected two javadoc claims that drifted from the code.
+
 - [ ] **Step 5: Run the whole AuthCore suite**
 
 Run: `.\mvnw.cmd -o test`
@@ -1041,6 +1053,34 @@ class IntrospectionClientTest {
                 .withHeader("X-API-Key", equalTo("ak_gateway_test_key")));
     }
 
+    /**
+     * A redirect is not an error to retrieve(), and carries no body. Without explicit
+     * status handling this completes EMPTY instead of failing, which downstream becomes a
+     * silent fallthrough to the JWT path rather than a refusal. AuthCore genuinely produced
+     * a 302 to /login for a malformed body until it grew its own 400 handler.
+     */
+    @Test
+    void failsOnARedirectRatherThanCompletingEmpty() {
+        authCore.resetAll();
+        authCore.stubFor(post(urlEqualTo(PATH)).willReturn(
+                aResponse().withStatus(302).withHeader("Location", "/login")));
+
+        StepVerifier.create(client(Duration.ofSeconds(2)).introspect("ak_good"))
+                .expectError(IntrospectionUnavailableException.class)
+                .verify();
+    }
+
+    /** A 200 with no body must fail, not complete empty, for the same reason. */
+    @Test
+    void failsOnAnEmptyBodyRatherThanCompletingEmpty() {
+        authCore.resetAll();
+        authCore.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withStatus(200)));
+
+        StepVerifier.create(client(Duration.ofSeconds(2)).introspect("ak_good"))
+                .expectError(IntrospectionUnavailableException.class)
+                .verify();
+    }
+
     @Test
     void failsWhenAuthCoreErrors() {
         authCore.resetAll();
@@ -1140,7 +1180,21 @@ public class IntrospectionClient {
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(Map.of("key", rawKey))
                 .retrieve()
+                // retrieve() errors on 4xx and 5xx but NOT on 3xx, and a redirect carries no
+                // body — so without this, bodyToMono would complete EMPTY rather than fail.
+                // That is not hypothetical: before AuthCore added its own 400 handler, a
+                // malformed body there produced a 302 to /login, because the chain that
+                // catches the /error forward registers only formLogin(). An empty completion
+                // here propagates through the manager and reaches AuthenticationWebFilter as
+                // "no authentication", which CONTINUES the filter chain — turning a failed
+                // introspection into the exact JWT fallthrough the precedence table forbids.
+                .onStatus(status -> !status.is2xxSuccessful(),
+                        response -> Mono.error(new IntrospectionUnavailableException(
+                                "Introspection answered " + response.statusCode(), null)))
                 .bodyToMono(ApiKeyIntrospection.class)
+                // A 200 with an empty or unparseable body would complete empty too.
+                .switchIfEmpty(Mono.error(new IntrospectionUnavailableException(
+                        "Introspection returned no body", null)))
                 .timeout(properties.timeout())
                 .onErrorMap(error -> !(error instanceof IntrospectionUnavailableException),
                         error -> new IntrospectionUnavailableException(
@@ -1270,7 +1324,14 @@ public class ApiKeyReactiveAuthenticationManager implements ReactiveAuthenticati
 
         return cache.get(keyHash)
                 .switchIfEmpty(introspectAndCache(rawKey, keyHash))
-                .flatMap(ApiKeyReactiveAuthenticationManager::toAuthentication);
+                .flatMap(ApiKeyReactiveAuthenticationManager::toAuthentication)
+                // Defence in depth. AuthenticationWebFilter reads an empty Mono from a
+                // manager as "no authentication attempted" and CONTINUES the chain, so an
+                // empty completion anywhere above would silently become the JWT fallthrough
+                // that the precedence table forbids. IntrospectionClient already refuses to
+                // complete empty; this guarantees it regardless of what it does later.
+                .switchIfEmpty(Mono.error(new IntrospectionUnavailableException(
+                        "Introspection produced no answer", null)));
     }
 
     private Mono<ApiKeyIntrospection> introspectAndCache(String rawKey, String keyHash) {
@@ -1683,6 +1744,14 @@ Expected: FAIL on the gateway-key-replay test.
 Make the API-key filter continue the chain on failure instead of invoking the failure handler.
 Run: `.\mvnw.cmd -o test -Dtest=ApiKeyAuthenticationTest`
 Expected: FAIL on the invalid-key-plus-valid-token row. **If every row still passes, the precedence table is untested.**
+
+- [ ] **Step 3b: Delete the non-2xx status handling in `IntrospectionClient`**
+
+Remove the `.onStatus(...)` block, leaving bare `.retrieve().bodyToMono(...)`.
+Run: `.\mvnw.cmd -o test -Dtest=IntrospectionClientTest+ApiKeyAuthenticationTest`
+Expected: FAIL on the redirect test. **If the redirect test passes, it is not testing what it claims** — a 3xx is not an error to `retrieve()`, so this must fail.
+
+Then also remove the manager's trailing `.switchIfEmpty(...)` guard and confirm a redirect-answering AuthCore lets a bad key fall through to the JWT path. That fallthrough is the security property; if no test catches it, add one before continuing.
 
 - [ ] **Step 4: Delete the timeout**
 
