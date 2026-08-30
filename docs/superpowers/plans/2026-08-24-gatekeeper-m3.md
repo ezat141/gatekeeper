@@ -1056,8 +1056,9 @@ class IntrospectionClientTest {
     /**
      * A redirect is not an error to retrieve(), and carries no body. Without explicit
      * status handling this completes EMPTY instead of failing, which downstream becomes a
-     * silent fallthrough to the JWT path rather than a refusal. AuthCore genuinely produced
-     * a 302 to /login for a malformed body until it grew its own 400 handler.
+     * silent fallthrough to the JWT path rather than a refusal. Measured against the real
+     * AuthCore before it grew a 400 handler: a malformed body produced a 302 to /login for
+     * a client accepting text/html, and a 401 for a JSON client.
      */
     @Test
     void failsOnARedirectRatherThanCompletingEmpty() {
@@ -1182,12 +1183,14 @@ public class IntrospectionClient {
                 .retrieve()
                 // retrieve() errors on 4xx and 5xx but NOT on 3xx, and a redirect carries no
                 // body — so without this, bodyToMono would complete EMPTY rather than fail.
-                // That is not hypothetical: before AuthCore added its own 400 handler, a
-                // malformed body there produced a 302 to /login, because the chain that
-                // catches the /error forward registers only formLogin(). An empty completion
-                // here propagates through the manager and reaches AuthenticationWebFilter as
-                // "no authentication", which CONTINUES the filter chain — turning a failed
+                // Not hypothetical: before AuthCore grew its own 400 handler, a malformed
+                // body there fell through to a second security chain and the response
+                // depended on content negotiation — 401 for a JSON client, 302 to /login for
+                // one accepting text/html. Measured, not assumed. An empty completion here
+                // propagates through the manager and reaches AuthenticationWebFilter as "no
+                // authentication", which CONTINUES the filter chain — turning a failed
                 // introspection into the exact JWT fallthrough the precedence table forbids.
+                // The guard matters for any non-2xx, so which one AuthCore picks is moot.
                 .onStatus(status -> !status.is2xxSuccessful(),
                         response -> Mono.error(new IntrospectionUnavailableException(
                                 "Introspection answered " + response.statusCode(), null)))
@@ -1857,7 +1860,11 @@ Add API-key authentication to the capability list and the request-flow descripti
 
 - [ ] **Step 4: Update `docs/superpowers/HANDOFF-M3-M6.md`**
 
-Mark M3 done, record the new commit hashes and test counts in the table in §1, and move anything M3 deferred into §5 against the milestone that owns it — at minimum the gateway-key rotation debt and the `X-API-Key` stripping deferred to M4.
+Mark M3 done, record the new commit hashes and test counts in the table in §1, and move anything M3 deferred into §5 against the milestone that owns it. At minimum:
+
+- The gateway-key rotation debt (design §5), owner M9.
+- `X-API-Key` stripping on routes that cannot use it, owner M4.
+- **AuthCore returns a redirect, not an error, to a client sending `Accept: text/html`.** Found during Task 2's review and pre-existing, not introduced by M3. Jackson-only converters cannot satisfy `text/html`, so writing any response body throws `HttpMediaTypeNotAcceptableException`, which escapes the controller's own handler and takes the same forward-to-`/error` path into the fallthrough chain. It affects well-formed requests too, not just malformed ones. Low practical risk — GateKeeper is a JSON client and has no reason to send that header — and GateKeeper is hardened against it regardless, since it refuses any non-2xx. Record it; do not fix it inside M3.
 
 - [ ] **Step 5: Commit.**
 
