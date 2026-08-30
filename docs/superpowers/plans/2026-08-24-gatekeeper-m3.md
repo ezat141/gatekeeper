@@ -24,6 +24,17 @@ These cost real time in M0–M2. They are not optional.
 - **Never add a `Co-Authored-By` line.**
 - **Docker Desktop must be running** for AuthCore: `docker compose up -d postgres redis` from the authcore directory. GateKeeper now needs that Redis too.
 - **Verify names against the jar before writing them.** `jar tf <jar> | grep ClassName`, `javap -cp <jar> <FQCN>`. Nearly every M0–M2 defect was a confidently-remembered name that had changed.
+- **Jackson 3, not Jackson 2 — this catches everyone.** Boot 4 ships the Jackson 3 rebrand. Verified against GateKeeper's actual resolved classpath (`mvnw.cmd dependency:list`):
+
+  | Artifact | Package | Note |
+  |---|---|---|
+  | `tools.jackson.core:jackson-databind:3.1.4` | `tools.jackson.databind` | **not** `com.fasterxml.jackson.databind` |
+  | `com.fasterxml.jackson.core:jackson-annotations:2.21` | `com.fasterxml.jackson.annotation` | annotations kept the old coordinates *and* package |
+  | — | — | **no `jackson-datatype-jsr310`.** `java.time` support is folded into databind at `tools/jackson/databind/ext/javatime/`. `JavaTimeModule` does not exist; do not import or register it. |
+
+  So `ObjectMapper` is `tools.jackson.databind.ObjectMapper`, while `@JsonInclude`, `@JsonCreator` and `@JsonProperty` stay on `com.fasterxml.jackson.annotation`. Mixing the two packages in one file is correct here and is not a mistake to "fix". Jackson 3 also made `writeValueAsString` / `readValue` throw the unchecked `JacksonException` rather than a checked `JsonProcessingException`; `Mono.fromCallable` handles either, so the code below is unaffected.
+
+  **AuthCore is on Boot 4.1.0 and GateKeeper on 4.0.7** — different parent versions, same Jackson 3 story.
 - Every task gets a `feature/task-N` branch off `master`, merged back with `git merge --no-ff`.
 
 **This plan spans two repositories.** Tasks 1–5 are in `authcore`. Tasks 6–15 are in `gatekeeper`. They are separate branches, separate reviews, separate merges. Finish and merge the AuthCore side first — the GateKeeper integration tests stub it with WireMock, but the manual verification in Task 15 needs it live.
@@ -826,12 +837,11 @@ The test needs a Redis. Use the one Docker Compose already runs for AuthCore —
 ```java
 package com.gatekeeper.apikey;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import tools.jackson.databind.ObjectMapper;
 import reactor.test.StepVerifier;
 
 import java.time.Duration;
@@ -881,8 +891,9 @@ class RedisApiKeyCacheTest {
                 .verifyComplete();
     }
 
+    /** No JavaTimeModule — Jackson 3 folds java.time into databind. See the environment rules. */
     private static ObjectMapper objectMapper() {
-        return new ObjectMapper().registerModule(new JavaTimeModule());
+        return new ObjectMapper();
     }
 }
 ```
@@ -897,9 +908,9 @@ Expected: FAIL — `RedisApiKeyCache` does not exist.
 ```java
 package com.gatekeeper.apikey;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import reactor.core.publisher.Mono;
+import tools.jackson.databind.ObjectMapper;
 
 import java.time.Duration;
 
@@ -969,7 +980,6 @@ Cover four cases with WireMock: an active answer, an inactive answer, a 500 from
 ```java
 package com.gatekeeper.apikey;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -1061,7 +1071,7 @@ class IntrospectionClientTest {
         ApiKeyProperties properties = new ApiKeyProperties(
                 authCore.baseUrl() + PATH, "ak_gateway_test_key",
                 Duration.ofSeconds(60), Duration.ofSeconds(10), timeout);
-        return new IntrospectionClient(WebClient.builder().build(), properties, new ObjectMapper());
+        return new IntrospectionClient(WebClient.builder().build(), properties);
     }
 }
 ```
@@ -1099,7 +1109,6 @@ public class IntrospectionUnavailableException extends RuntimeException {
 ```java
 package com.gatekeeper.apikey;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
@@ -1118,12 +1127,10 @@ public class IntrospectionClient {
 
     private final WebClient webClient;
     private final ApiKeyProperties properties;
-    private final ObjectMapper objectMapper;
 
-    public IntrospectionClient(WebClient webClient, ApiKeyProperties properties, ObjectMapper objectMapper) {
+    public IntrospectionClient(WebClient webClient, ApiKeyProperties properties) {
         this.webClient = webClient;
         this.properties = properties;
-        this.objectMapper = objectMapper;
     }
 
     public Mono<ApiKeyIntrospection> introspect(String rawKey) {
@@ -1142,7 +1149,7 @@ public class IntrospectionClient {
 }
 ```
 
-The `WebClient` and the `ObjectMapper` (with `JavaTimeModule` registered, for `Instant`) come from beans; wire them in Task 11.
+The `WebClient` comes from a bean; wire it in Task 11. This class needs no `ObjectMapper` — `bodyToMono(ApiKeyIntrospection.class)` uses WebClient's own configured codecs, and `Instant` decodes without extra registration because Jackson 3 folds `java.time` into databind.
 
 - [ ] **Step 5: Run and confirm it passes**
 
@@ -1411,8 +1418,8 @@ public ApiKeyCache apiKeyCache(ReactiveStringRedisTemplate redis, ObjectMapper o
 
 @Bean
 public IntrospectionClient introspectionClient(
-        WebClient introspectionWebClient, ApiKeyProperties properties, ObjectMapper objectMapper) {
-    return new IntrospectionClient(introspectionWebClient, properties, objectMapper);
+        WebClient introspectionWebClient, ApiKeyProperties properties) {
+    return new IntrospectionClient(introspectionWebClient, properties);
 }
 
 @Bean
