@@ -482,16 +482,40 @@ seedApiKey();
 seedGatewayApiKey();
 ```
 
-- [ ] **Step 4: Document the `last_used_at` consequence**
+- [ ] **Step 4: Document the `last_used_at` consequence — in a NEW migration**
 
-In `src/main/resources/db/migration/V7__create_api_keys.sql`, extend the comment above `last_used_at`. **Do not alter any DDL** — the migration has already run; changing a statement would break checksum validation. Comments only:
+The design (§10) requires this be recorded in AuthCore's schema documentation, not only in the design doc.
+
+**Do not edit `V7__create_api_keys.sql`.** An earlier draft of this plan said to add a comment there and claimed comments were safe because no DDL changed. That is wrong, and it was verified wrong against the live database: Flyway checksums the whole file, and `validate-on-migrate` defaults to `true` with nothing in this project overriding it, so the edit produced
+
+```
+FlywayValidateException: Migration checksum mismatch for migration version 7
+-> Applied to database : -338152876
+-> Resolved locally    : -394142168
+```
+
+and the app refused to boot. That would break every environment where V7 has already run, which is the normal case.
+
+Add a forward migration instead. `V12` is the next free version (V1–V11 are taken and applied). Create `src/main/resources/db/migration/V12__comment_api_key_last_used_at.sql`:
 
 ```sql
-    -- Updated on every validation at the source, including introspection calls from
-    -- GateKeeper. Because the gateway caches an introspection answer for its configured
-    -- TTL, a continuously-used key is introspected only once per TTL: read this as "last
-    -- validated at the source, accurate to within that TTL", not "last used".
-    last_used_at TIMESTAMPTZ
+-- Records what last_used_at now means, since M3 changed it.
+--
+-- It is updated on every validation at the source, including introspection calls from
+-- GateKeeper. Because the gateway caches an introspection answer for its configured TTL,
+-- a continuously-used key is introspected only once per TTL. Read this as "last validated
+-- at the source, accurate to within that TTL", not "last used".
+--
+-- A separate migration rather than an edit to V7: Flyway checksums the whole file,
+-- comments included, so editing an applied migration breaks validation on boot.
+COMMENT ON COLUMN api_keys.last_used_at IS
+    'Last validated at the source. Gateway caching means this is accurate only to within the gateway''s introspection cache TTL, not per-request.';
+```
+
+Verify it applies: boot the app and confirm it starts, then check the comment landed:
+
+```bash
+docker exec authcore-postgres-1 psql -U authcore -d authcore -c "SELECT col_description('api_keys'::regclass, (SELECT attnum FROM pg_attribute WHERE attrelid='api_keys'::regclass AND attname='last_used_at'));"
 ```
 
 - [ ] **Step 5: Verify the seeding runs**
