@@ -150,8 +150,8 @@ M5 and M6 regardless.
 |---|---|
 | Key | `gatekeeper:apikey:<sha256-hex-of-key>` |
 | Value | the introspection result, compactly encoded |
-| Positive TTL | `60s` (`gatekeeper.apikey.cache.ttl`) |
-| Negative TTL | `10s` (`gatekeeper.apikey.cache.negative-ttl`) |
+| Positive TTL | `60s` (`gatekeeper.api-key.cache-ttl`) |
+| Negative TTL | `10s` (`gatekeeper.api-key.negative-cache-ttl`) |
 
 **The cache key is the SHA-256 of the key, never the key itself.** A Redis dump, a `KEYS` scan, or a
 misconfigured replica must not yield usable credentials. This mirrors why the database stores a hash.
