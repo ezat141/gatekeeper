@@ -28,6 +28,10 @@ spring:
                 - Path=/api/ledger/**
               filters:
                 - StripPrefix=1
+  data:
+    redis:
+      host: localhost
+      port: 6379
 
 gatekeeper:
   downstream:
@@ -36,6 +40,20 @@ gatekeeper:
   auth:
     issuer: http://localhost:8080
     jwk-set-uri: http://localhost:8080/oauth2/jwks
+  api-key:
+    # AuthCore's introspection endpoint, and the credential the gateway presents to it.
+    # The key is scoped to apikeys:introspect only — see the M3 design, section 5.
+    introspection-uri: ${gatekeeper.downstream.authcore}/api/internal/api-keys/introspect
+    gateway-key: ak_gatekeeper_introspection_local_only_00000
+    # The positive TTL IS the API-key revocation latency. A disabled key keeps working
+    # for at most this long.
+    cache-ttl: 60s
+    # Shorter: caching a rejection absorbs a retry storm from a misconfigured client,
+    # while a short window limits how much an enumeration attempt is amplified.
+    negative-cache-ttl: 10s
+    # The JWKS fetch has no timeout and that is filed as an M7 defect. Do not repeat it:
+    # a host that accepts the connection and never answers must fail, not hang.
+    timeout: 2s
 
 management:
   endpoints:
