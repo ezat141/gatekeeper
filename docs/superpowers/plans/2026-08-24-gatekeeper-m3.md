@@ -732,7 +732,10 @@ public class ApiKeyAuthenticationToken extends AbstractAuthenticationToken {
 
     /** Unauthenticated — what the converter produces. */
     public ApiKeyAuthenticationToken(String rawKey) {
-        super(null);
+        // The cast is required, not stylistic. Spring Security 7 added a second, protected
+        // AbstractAuthenticationToken(AbstractAuthenticationBuilder<?>) constructor, so a
+        // bare super(null) is ambiguous and does not compile. Confirmed with javap.
+        super((Collection<? extends GrantedAuthority>) null);
         this.rawKey = rawKey;
         this.name = null;
         setAuthenticated(false);
@@ -755,13 +758,10 @@ public class ApiKeyAuthenticationToken extends AbstractAuthenticationToken {
     public Object getPrincipal() {
         return name;
     }
-
-    @Override
-    public String getName() {
-        return name;
-    }
 }
 ```
+
+**No `getName()` override.** `AbstractAuthenticationToken.getName()` already falls back to `getPrincipal().toString()` for a plain `String` principal, so an override would restate the inherited behaviour. Both callers that matter — the manager in Task 10 and the stamp filter in Task 13 — read `getName()` only on an *authenticated* token, where the principal is the key's name and non-null.
 
 - [ ] **Step 4: Write the converter**
 
