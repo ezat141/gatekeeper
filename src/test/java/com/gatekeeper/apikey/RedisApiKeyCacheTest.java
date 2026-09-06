@@ -67,6 +67,26 @@ class RedisApiKeyCacheTest {
     }
 
     /**
+     * An entry this process cannot parse is a miss by design, not a failure: the shape can
+     * drift across a rolling deploy, and a value written by a differently-shaped version of
+     * this service must not turn a caller holding a perfectly good key into a 503. Proven here
+     * by writing unparseable bytes straight into Redis, bypassing {@link #cache} entirely, so
+     * this exercises {@link RedisApiKeyCache}'s {@code deserialize} error path rather than
+     * anything {@code put} would have prevented.
+     */
+    @Test
+    void treatsAnUnparseableCachedEntryAsAMiss() {
+        String hash = UUID.randomUUID().toString();
+        try {
+            redis.opsForValue().set(KEY_PREFIX + hash, "{not valid json").block();
+
+            StepVerifier.create(cache.get(hash)).verifyComplete();
+        } finally {
+            delete(hash);
+        }
+    }
+
+    /**
      * The stored key must be the hash, never the credential. A Redis dump or a {@code KEYS}
      * scan must not yield anything usable — see {@link RedisApiKeyCache}'s class comment.
      */

@@ -1,5 +1,7 @@
 package com.gatekeeper.apikey;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import reactor.core.publisher.Mono;
 import tools.jackson.databind.ObjectMapper;
@@ -12,6 +14,8 @@ import java.time.Duration;
  * working credential.
  */
 public class RedisApiKeyCache implements ApiKeyCache {
+
+    private static final Logger log = LoggerFactory.getLogger(RedisApiKeyCache.class);
 
     private static final String KEY_PREFIX = "gatekeeper:apikey:";
 
@@ -43,6 +47,9 @@ public class RedisApiKeyCache implements ApiKeyCache {
      */
     private Mono<ApiKeyIntrospection> deserialize(String json) {
         return Mono.fromCallable(() -> objectMapper.readValue(json, ApiKeyIntrospection.class))
-                .onErrorResume(error -> Mono.empty());
+                .onErrorResume(error -> {
+                    log.warn("Unreadable cached API-key introspection entry; treating as a miss", error);
+                    return Mono.empty();
+                });
     }
 }
