@@ -74,13 +74,17 @@ class IntrospectionClientTest {
     /**
      * A 3xx is not an error to {@code retrieve()}, and a redirect carries no body — so
      * without explicit status handling, {@code bodyToMono} would complete EMPTY rather than
-     * fail. An empty completion here would propagate through the (future) authentication
-     * manager and reach {@code AuthenticationWebFilter} as "no authentication attempted",
-     * which CONTINUES the filter chain — turning a failed introspection into exactly the JWT
-     * fallthrough the precedence rule forbids, letting a bad key ride in alongside a valid
-     * token. Not hypothetical: measured against the real AuthCore before it grew a 400
+     * fail. Not hypothetical: measured against the real AuthCore before it grew a 400
      * handler, a malformed body produced a 302 to {@code /login} for a client accepting
      * {@code text/html}, and a 401 for a JSON client.
+     *
+     * <p>An empty completion does not become a JWT fallthrough, as an earlier version of
+     * this comment claimed. {@code AuthenticationWebFilter} guards its own manager call with
+     * {@code switchIfEmpty(error(IllegalStateException("No provider found for ...")))}, so
+     * an empty manager result fails closed as a 500 — verified against Spring Security
+     * 7.0.6, not assumed. Failing here instead makes the error say what actually went wrong
+     * rather than leaning on the framework to keep failing closed. The genuine fallthrough
+     * risk lives one level up, on the converter's empty, and is pinned separately.
      */
     @Test
     void failsOnARedirectRatherThanCompletingEmpty() {

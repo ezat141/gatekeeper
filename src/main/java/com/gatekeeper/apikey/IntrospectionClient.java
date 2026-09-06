@@ -32,11 +32,16 @@ public class IntrospectionClient {
                 .bodyValue(Map.of("key", rawKey))
                 .retrieve()
                 // retrieve() errors on 4xx and 5xx but NOT on 3xx, and a redirect carries no
-                // body — so without this, bodyToMono would complete EMPTY rather than fail.
-                // An empty completion propagates through the manager and reaches
-                // AuthenticationWebFilter as "no authentication", which CONTINUES the filter
-                // chain — turning a failed introspection into the JWT fallthrough that the
-                // precedence rule forbids.
+                // body — so without this, bodyToMono would complete EMPTY rather than fail,
+                // and worse, a 3xx that DOES carry a body would decode as a real answer: a
+                // redirect accepted as proof the key is active. Both are pinned by tests.
+                //
+                // An empty completion does not reach the caller as a fallthrough, as an
+                // earlier version of this comment claimed. AuthenticationWebFilter guards
+                // its own manager call with switchIfEmpty(error(IllegalStateException("No
+                // provider found for ..."))), so an empty manager result fails closed as a
+                // 500. Failing here instead makes the error say what actually went wrong,
+                // and does not lean on the framework continuing to fail closed.
                 .onStatus(status -> !status.is2xxSuccessful(),
                         response -> Mono.error(new IntrospectionUnavailableException(
                                 "Introspection answered " + response.statusCode(), null)))

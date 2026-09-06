@@ -1210,11 +1210,10 @@ public class IntrospectionClient {
                 // Not hypothetical: before AuthCore grew its own 400 handler, a malformed
                 // body there fell through to a second security chain and the response
                 // depended on content negotiation — 401 for a JSON client, 302 to /login for
-                // one accepting text/html. Measured, not assumed. An empty completion here
-                // propagates through the manager and reaches AuthenticationWebFilter as "no
-                // authentication", which CONTINUES the filter chain — turning a failed
-                // introspection into the exact JWT fallthrough the precedence table forbids.
-                // The guard matters for any non-2xx, so which one AuthCore picks is moot.
+                // one accepting text/html. Measured, not assumed. Worse than an empty
+                // completion: a 3xx that DOES carry a body decodes as a real answer, so a
+                // redirect would be accepted as proof the key is active. The guard matters
+                // for any non-2xx, so which one AuthCore picks is moot.
                 .onStatus(status -> !status.is2xxSuccessful(),
                         response -> Mono.error(new IntrospectionUnavailableException(
                                 "Introspection answered " + response.statusCode(), null)))
@@ -1352,11 +1351,13 @@ public class ApiKeyReactiveAuthenticationManager implements ReactiveAuthenticati
         return cache.get(keyHash)
                 .switchIfEmpty(introspectAndCache(rawKey, keyHash))
                 .flatMap(ApiKeyReactiveAuthenticationManager::toAuthentication)
-                // Defence in depth. AuthenticationWebFilter reads an empty Mono from a
-                // manager as "no authentication attempted" and CONTINUES the chain, so an
-                // empty completion anywhere above would silently become the JWT fallthrough
-                // that the precedence table forbids. IntrospectionClient already refuses to
-                // complete empty; this guarantees it regardless of what it does later.
+                // Defence in depth. AuthenticationWebFilter turns an empty manager result
+                // into IllegalStateException("No provider found for ..."), which surfaces as
+                // a 500 — verified against Spring Security 7.0.6, not assumed. Failing here
+                // instead makes the error say what actually went wrong, so it answers 503
+                // once Task 12 lands, and does not lean on the framework continuing to fail
+                // closed. IntrospectionClient already refuses to complete empty; this holds
+                // regardless of what it does later.
                 .switchIfEmpty(Mono.error(new IntrospectionUnavailableException(
                         "Introspection produced no answer", null)));
     }
