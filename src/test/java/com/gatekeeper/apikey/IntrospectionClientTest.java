@@ -93,6 +93,33 @@ class IntrospectionClientTest {
                 .verify();
     }
 
+    /**
+     * The one case only {@code onStatus} can catch: a 3xx carrying a real, decodable body.
+     * This is not about redirects being unusual — it is that without the status guard, a 3xx
+     * with a body is indistinguishable from a genuine answer. {@code retrieve()} does not
+     * error on a 3xx, the stubbed body below decodes to {@code active=true} without incident,
+     * and {@code switchIfEmpty} never fires because the pipeline never goes empty. Anything
+     * able to interpose a redirect between the gateway and AuthCore — a misconfigured proxy,
+     * a captive portal, a compromised load balancer — could mint an affirmative introspection
+     * result for a key it never validated.
+     *
+     * <p>{@link #failsOnARedirectRatherThanCompletingEmpty()} above cannot catch a regression
+     * here: its redirect has no body, so {@code switchIfEmpty} raises the same exception
+     * independently of {@code onStatus} and masks whether the status guard ran at all.
+     */
+    @Test
+    void failsOnARedirectCarryingABodyRatherThanAcceptingIt() {
+        authCore.resetAll();
+        authCore.stubFor(post(urlEqualTo(PATH)).willReturn(okJson("""
+                {"active":true,"name":"reporting","scopes":["payments:read"]}""")
+                .withStatus(302)
+                .withHeader("Location", "/login")));
+
+        StepVerifier.create(client(Duration.ofSeconds(2)).introspect("ak_good"))
+                .expectError(IntrospectionUnavailableException.class)
+                .verify();
+    }
+
     /** A 200 with no body must fail outright too, for the same completes-empty reason. */
     @Test
     void failsOnAnEmptyBodyRatherThanCompletingEmpty() {
