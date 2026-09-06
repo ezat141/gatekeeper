@@ -1,5 +1,7 @@
 package com.gatekeeper.apikey;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.authentication.ReactiveAuthenticationManager;
 import org.springframework.security.core.Authentication;
@@ -26,6 +28,8 @@ import java.util.stream.Collectors;
  */
 public class ApiKeyReactiveAuthenticationManager implements ReactiveAuthenticationManager {
 
+    private static final Logger log = LoggerFactory.getLogger(ApiKeyReactiveAuthenticationManager.class);
+
     /** A caller holding this scope would be the gateway itself. See refuseSelfIntrospection. */
     static final String INTROSPECTION_SCOPE = "apikeys:introspect";
 
@@ -46,20 +50,31 @@ public class ApiKeyReactiveAuthenticationManager implements ReactiveAuthenticati
         String keyHash = sha256(rawKey);
 
         return cache.get(keyHash)
-                .switchIfEmpty(introspectAndCache(rawKey, keyHash))
+                .switchIfEmpty(Mono.defer(() -> introspectAndCache(rawKey, keyHash)))
                 .flatMap(ApiKeyReactiveAuthenticationManager::toAuthentication)
-                // Defence in depth. AuthenticationWebFilter reads an empty Mono from a
-                // manager as "no authentication attempted" and CONTINUES the chain, so an
-                // empty completion anywhere above would silently become the JWT fallthrough
-                // that the precedence rule forbids. IntrospectionClient already refuses to
-                // complete empty; this guarantees it regardless of what it does later.
+                // Defence in depth. AuthenticationWebFilter currently turns an empty manager
+                // result into IllegalStateException("No provider found for ..."), which
+                // surfaces as a 500. This makes the failure say what it actually is, so it
+                // answers 503 once that mapping lands, and it does not depend on the
+                // framework continuing to fail closed here. IntrospectionClient already
+                // refuses to complete empty; this holds regardless of what it does later.
                 .switchIfEmpty(Mono.error(new IntrospectionUnavailableException(
                         "Introspection produced no answer", null)));
     }
 
     private Mono<ApiKeyIntrospection> introspectAndCache(String rawKey, String keyHash) {
         return client.introspect(rawKey)
-                .flatMap(result -> cache.put(keyHash, result, ttlFor(result)).thenReturn(result));
+                .flatMap(result -> {
+                    Duration ttl = ttlFor(result);
+                    // A zero TTL is not "expire immediately" to Redis — Spring Data Redis turns
+                    // it into a SET with no expiry at all, so the entry would outlive the key it
+                    // describes and never be re-introspected. An answer already past its own
+                    // expiry must not be cached.
+                    if (ttl.isZero() || ttl.isNegative()) {
+                        return Mono.just(result);
+                    }
+                    return cache.put(keyHash, result, ttl).thenReturn(result);
+                });
     }
 
     /**
@@ -87,7 +102,7 @@ public class ApiKeyReactiveAuthenticationManager implements ReactiveAuthenticati
             return Mono.error(new BadCredentialsException("API key is not valid"));
         }
         if (result.scopes().contains(INTROSPECTION_SCOPE)) {
-            return refuseSelfIntrospection();
+            return refuseSelfIntrospection(result.name());
         }
 
         Set<SimpleGrantedAuthority> authorities = result.scopes().stream()
@@ -102,9 +117,13 @@ public class ApiKeyReactiveAuthenticationManager implements ReactiveAuthenticati
      * active. Accepting it here would let anyone who obtained it authenticate <em>as the
      * gateway</em> by replaying the credential the gateway itself puts on the wire.
      * Refused with the same message as any other bad key — a caller learns nothing about
-     * why.
+     * why — but logged server-side by name, both because presenting this key is a security
+     * event worth a record and because it turns "a legitimate key was accidentally granted
+     * this scope" from an inexplicable 401 into a one-line diagnosis. Never the raw key or
+     * its hash: those are credentials, and a log is not where they belong.
      */
-    private static Mono<Authentication> refuseSelfIntrospection() {
+    private static Mono<Authentication> refuseSelfIntrospection(String name) {
+        log.warn("Refused a caller presenting the gateway's own introspection key (name={})", name);
         return Mono.error(new BadCredentialsException("API key is not valid"));
     }
 

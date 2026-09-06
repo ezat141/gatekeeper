@@ -6,6 +6,7 @@ import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.AuthenticationException;
 import org.springframework.security.core.GrantedAuthority;
+import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
@@ -35,12 +36,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * either subclassing it or introducing a seam (extracting an interface the manager would
  * depend on instead). This test subclasses it: {@link FakeIntrospectionClient} overrides
  * {@code introspect(String)} completely, so the {@code WebClient} and {@link ApiKeyProperties}
- * fields {@code IntrospectionClient} would otherwise use are never read, and passing {@code
- * null} for both in the fake's constructor is safe. Extracting an interface instead would mean
- * changing production code — the class the plan explicitly says not to touch unless
- * necessary — to serve a single test, for a class with a single implementation and a single
- * call site. That is speculative generality this milestone was not asked for, so the subclass
- * seam wins and {@link IntrospectionClient} is left exactly as Task 9 built it.
+ * fields {@code IntrospectionClient} would otherwise use are never read — the fake still
+ * passes real, if unused, instances to {@code super(...)} rather than {@code null}, so a
+ * future {@code Objects.requireNonNull} in that constructor would not break every test in
+ * this class at construction. Extracting an interface instead would mean
+ * changing production code to serve a single test, for a class with a single implementation
+ * and a single call site. That is speculative generality this milestone was not asked for,
+ * so the subclass seam wins and {@link IntrospectionClient} is left exactly as Task 9 built it.
  */
 class ApiKeyReactiveAuthenticationManagerTest {
 
@@ -151,6 +153,34 @@ class ApiKeyReactiveAuthenticationManagerTest {
                 .isLessThan(CACHE_TTL);
     }
 
+    /**
+     * The extreme case {@code ttlFor} clamps to {@link Duration#ZERO}: an answer that is
+     * {@code active: true} but whose {@code expiresAt} has already elapsed by the time this
+     * process sees it. That is a real race, not a theoretical one — AuthCore decides
+     * {@code active} and stamps {@code expiresAt} before the response crosses the network,
+     * and {@code ttlFor} computes {@code Duration.between(Instant.now(), expiresAt)} after
+     * it lands, so any key expiring inside that round trip (or under ordinary clock skew
+     * between the two hosts) arrives here already past due.
+     *
+     * <p>A zero {@link Duration} must never reach {@code cache.put}: Spring Data Redis maps
+     * a zero TTL to a persistent {@code SET} with no expiry at all, not to "expire
+     * immediately". Caching this answer would make an already-dead key authenticate from
+     * cache forever, immune to revocation — the opposite of what the clamp exists to do.
+     * The request that surfaced this must still be served; only the caching is wrong.
+     */
+    @Test
+    void expiredButActiveAnswerIsNeverCached() {
+        client.nextAnswer = new ApiKeyIntrospection(
+                true, "reporting", Set.of("payments:read"), Instant.now().minusSeconds(1));
+
+        StepVerifier.create(authenticate("ak_already_expired"))
+                .assertNext(authentication -> assertThat(authentication.getName()).isEqualTo("reporting"))
+                .verifyComplete();
+
+        assertThat(cache.store).isEmpty();
+        assertThat(cache.lastPutTtl).isNull();
+    }
+
     @Test
     void inactiveAnswerIsCachedWithTheNegativeTtl() {
         client.nextAnswer = ApiKeyIntrospection.inactive();
@@ -206,10 +236,13 @@ class ApiKeyReactiveAuthenticationManagerTest {
      * always answers with a value or an error, same as the real, contractually
      * never-empty {@link IntrospectionClient}. That guard is deliberate defence in depth
      * (see its comment in the manager), so it needs a fake capable of violating the
-     * contract on purpose to be exercised at all. Without this test, a regression
-     * deleting the guard would ship unnoticed: {@code AuthenticationWebFilter} reads an
-     * empty {@code Mono} from a manager as "no authentication attempted" and continues
-     * the filter chain, exactly the JWT fallthrough the precedence rule forbids.
+     * contract on purpose to be exercised at all. Without this test, a regression deleting
+     * the guard would ship unnoticed by every other test here, and would only be visible
+     * downstream as a worse failure shape: today, {@code AuthenticationWebFilter} turns an
+     * empty manager result into {@code IllegalStateException("No provider found for
+     * ...")}, an unhandled exception that surfaces as a 500 instead of the clean {@link
+     * IntrospectionUnavailableException} this guard produces — and the guard also does not
+     * depend on that framework behavior continuing to fail closed if it ever changes.
      */
     @Test
     void introspectionCompletingEmptyErrorsRatherThanAuthenticatingNothing() {
@@ -259,48 +292,45 @@ class ApiKeyReactiveAuthenticationManagerTest {
     /**
      * Subclasses the real {@link IntrospectionClient} rather than mocking it — see this
      * class's javadoc for why — and overrides {@code introspect} entirely, so the {@code
-     * super(null, null)} below never has either argument read.
+     * WebClient} and {@link ApiKeyProperties} passed to {@code super(...)} below are never
+     * read. Real, if unused, instances rather than {@code null}: safe today either way
+     * since the constructor only assigns them, but a future {@code Objects.requireNonNull}
+     * there would otherwise break every test in this class at construction, with a stack
+     * trace pointing at this fake rather than at whatever actually changed.
      */
     static class FakeIntrospectionClient extends IntrospectionClient {
+        private static final ApiKeyProperties UNUSED_PROPERTIES =
+                new ApiKeyProperties("unused", "unused", Duration.ZERO, Duration.ZERO, Duration.ZERO);
+
         ApiKeyIntrospection nextAnswer;
         RuntimeException nextError;
         boolean completesEmpty;
         final AtomicInteger callCount = new AtomicInteger();
 
         FakeIntrospectionClient() {
-            super(null, null);
+            super(WebClient.create(), UNUSED_PROPERTIES);
         }
 
         @Override
         public Mono<ApiKeyIntrospection> introspect(String rawKey) {
-            // Deferred, not counted eagerly: switchIfEmpty(introspectAndCache(...)) in the
-            // manager builds its fallback Mono as a plain Java method argument, so it is
-            // constructed whether or not the cache hits. The real WebClient-backed client
-            // gets away with this because building its chain performs no I/O — only
-            // subscribing does. Counting inside introspect()'s body directly, instead of
-            // inside this deferred block, would count that eager construction as a call
-            // even on a cache hit, which is exactly the false positive this fake must not
-            // produce.
-            return Mono.defer(() -> {
-                callCount.incrementAndGet();
-                // The real IntrospectionClient can never actually do this — its introspect()
-                // method is built specifically so it never completes empty, per the inline
-                // comments there and IntrospectionClientTest — but this fake can, on purpose:
-                // it is the only way to unit-test the manager's OWN redundant switchIfEmpty
-                // guard (see introspectionCompletingEmptyErrorsRatherThanAuthenticatingNothing
-                // below) without relying on the real client's contract holding.
-                if (completesEmpty) {
-                    return Mono.empty();
-                }
-                if (nextError != null) {
-                    return Mono.error(nextError);
-                }
-                if (nextAnswer != null) {
-                    return Mono.just(nextAnswer);
-                }
-                return Mono.error(new IllegalStateException(
-                        "FakeIntrospectionClient has no answer configured for this test"));
-            });
+            callCount.incrementAndGet();
+            // The real IntrospectionClient can never actually do this — its introspect()
+            // method is built specifically so it never completes empty, per the inline
+            // comments there and IntrospectionClientTest — but this fake can, on purpose:
+            // it is the only way to unit-test the manager's OWN redundant switchIfEmpty
+            // guard (see introspectionCompletingEmptyErrorsRatherThanAuthenticatingNothing
+            // below) without relying on the real client's contract holding.
+            if (completesEmpty) {
+                return Mono.empty();
+            }
+            if (nextError != null) {
+                return Mono.error(nextError);
+            }
+            if (nextAnswer != null) {
+                return Mono.just(nextAnswer);
+            }
+            return Mono.error(new IllegalStateException(
+                    "FakeIntrospectionClient has no answer configured for this test"));
         }
     }
 }
