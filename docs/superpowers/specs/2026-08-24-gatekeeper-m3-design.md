@@ -215,6 +215,20 @@ confusing "no credentials", and a caller must not be able to smuggle a bad key p
 attaching a good token. This matches `ApiKeyAuthenticationFilter`'s existing behaviour in AuthCore, and
 consistency across the two services is worth more than the marginal convenience of a fallthrough.
 
+**Filter order alone does not deliver this table, which is easy to get wrong.** Putting the API-key
+filter at the authentication position places it *ahead of* the resource server's filter, not *instead
+of* it: on success it continues the chain, and the resource server's own `AuthenticationWebFilter` then
+runs regardless — it never checks whether the context is already populated. Measured, with both
+credentials attached: a valid key plus a malformed bearer was refused `401`, and a valid key plus a
+valid bearer authenticated as the *token's* subject, stamping the JWT's `X-GK-Tenant` on the proxied
+request and silently discarding the key's principal. M4 would then have authorized the wrong identity.
+
+Row three therefore requires the resource server to decline the bearer itself. It is given a
+`bearerTokenConverter` that returns empty when `X-API-Key` carries text, so the token is genuinely never
+consulted. **The emptiness test must match `ApiKeyAuthenticationConverter`'s `hasText` exactly**: keying
+off mere header presence would let a blank `X-API-Key:` suppress bearer authentication while the
+API-key converter also declined it, turning an empty header into a way to switch authentication off.
+
 ---
 
 ## 8. Identity, tenant, and reach
