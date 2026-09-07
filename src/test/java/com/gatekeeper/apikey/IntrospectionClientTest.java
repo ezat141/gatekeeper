@@ -8,6 +8,8 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.test.StepVerifier;
 
 import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
@@ -43,13 +45,19 @@ class IntrospectionClientTest {
     @Test
     void returnsTheActiveAnswer() {
         authCore.resetAll();
+        // A non-null expiresAt, matching the shape AuthCore actually sends for an ordinary
+        // key (only the gateway's own introspection key gets expiresAt: null). A stub without
+        // it would never prove this client can parse the field at all.
+        Instant expiresAt = Instant.now().plus(1, ChronoUnit.HOURS);
         authCore.stubFor(post(urlEqualTo(PATH)).willReturn(okJson("""
-                {"active":true,"name":"reporting","scopes":["payments:read"]}""")));
+                {"active":true,"name":"reporting","scopes":["payments:read"],"expiresAt":"%s"}"""
+                .formatted(expiresAt))));
 
         StepVerifier.create(client(Duration.ofSeconds(2)).introspect("ak_good"))
                 .assertNext(result -> {
                     assertThat(result.active()).isTrue();
                     assertThat(result.scopes()).containsExactly("payments:read");
+                    assertThat(result.expiresAt()).isEqualTo(expiresAt);
                 })
                 .verifyComplete();
     }
