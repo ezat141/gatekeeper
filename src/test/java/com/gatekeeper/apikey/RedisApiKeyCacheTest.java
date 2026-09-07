@@ -6,7 +6,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import reactor.test.StepVerifier;
-import tools.jackson.databind.ObjectMapper;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -35,11 +34,20 @@ class RedisApiKeyCacheTest {
 
     RedisApiKeyCache cache;
 
+    // RedisApiKeyCache used to take an ObjectMapper constructor argument, and this test built
+    // it a bare `new ObjectMapper()` "to keep this test independent of configuration that does
+    // not exist yet" — independent enough that this whole class kept passing while production,
+    // wired to Boot's configured bean instead, silently never served a cache hit for a key
+    // with a non-null expiresAt. The two mappers were not equivalent, and nothing here ever
+    // exercised the one production actually used.
+    //
+    // RedisApiKeyCache now owns a fixed internal mapper (see its WIRE_MAPPER field) rather
+    // than accepting one from outside, precisely so this class of gap cannot recur: there is
+    // no longer an external mapper to inject, correctly or otherwise, so every test below is
+    // automatically exercising the exact serializer production uses.
     @BeforeEach
     void setUp() {
-        // Not the bean Task 11 wires up in GatewaySecurityConfig — a plain ObjectMapper keeps
-        // this test independent of configuration that does not exist yet.
-        cache = new RedisApiKeyCache(redis, new ObjectMapper());
+        cache = new RedisApiKeyCache(redis);
     }
 
     @Test

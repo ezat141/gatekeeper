@@ -300,15 +300,22 @@ class ApiKeyAuthenticationTest {
     }
 
     /** Registers a higher-priority stub answering active for one freshly generated key, and
-     * returns that key. */
+     * returns that key.
+     *
+     * <p>Carries a non-null {@code expiresAt}, matching the shape AuthCore actually sends for
+     * an ordinary key — only the gateway's own introspection key gets {@code expiresAt: null}
+     * (see {@code DataSeeder.seedGatewayApiKey} in AuthCore). A stub without it would let every
+     * test in this class pass regardless of whether the cache could read back an entry with a
+     * non-null {@code expiresAt}, which is exactly the shape that once never served a hit.
+     */
     private static String stubActiveKey(String name) {
         String rawKey = newKey();
         authCore.stubFor(post(urlEqualTo(INTROSPECT_PATH))
                 .atPriority(1)
                 .withRequestBody(equalToJson("{\"key\":\"" + rawKey + "\"}"))
                 .willReturn(okJson("""
-                        {"active":true,"name":"%s","scopes":["payments:read"]}"""
-                        .formatted(name))));
+                        {"active":true,"name":"%s","scopes":["payments:read"],"expiresAt":"%s"}"""
+                        .formatted(name, Instant.now().plus(1, ChronoUnit.HOURS)))));
         return rawKey;
     }
 }

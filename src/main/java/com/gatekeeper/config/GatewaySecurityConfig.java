@@ -23,7 +23,6 @@ import org.springframework.security.web.server.util.matcher.NegatedServerWebExch
 import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatchers;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
-import tools.jackson.databind.ObjectMapper;
 
 /**
  * Replaces Boot's default deny-all chain, which was installed simply because the OAuth2
@@ -48,8 +47,8 @@ public class GatewaySecurityConfig {
     }
 
     @Bean
-    public ApiKeyCache apiKeyCache(ReactiveStringRedisTemplate redis, ObjectMapper objectMapper) {
-        return new RedisApiKeyCache(redis, objectMapper);
+    public ApiKeyCache apiKeyCache(ReactiveStringRedisTemplate redis) {
+        return new RedisApiKeyCache(redis);
     }
 
     @Bean
