@@ -22,6 +22,7 @@ import java.util.UUID;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalToJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -131,14 +132,68 @@ class ApiKeyAuthenticationTest {
                 .expectStatus().isOk();
     }
 
+    /**
+     * A 200 alone cannot tell "authenticated as the key" apart from "authenticated as the
+     * bearer" — both credentials here are individually valid, so the status code is the
+     * same either way. This must check which principal actually won.
+     *
+     * <p>{@link com.gatekeeper.identity.IdentityStampFilter} does not yet stamp API-key
+     * callers — that is Task 13 — so today's only provable assertion is the negative one:
+     * the bearer's {@code tenant} claim must not reach downstream as {@code X-GK-Tenant}.
+     * Once Task 13 lands, tighten this to a positive assertion on {@code X-GK-Subject:
+     * apikey:<name>}.
+     */
     @Test
     void authenticatesAsTheKeyWhenAValidTokenIsAlsoPresent() {
         String rawKey = stubActiveKey("reporting");
         String token = activeKey.mint(ISSUER, "ezzat",
                 Instant.now().plus(5, ChronoUnit.MINUTES), Map.of("tenant", "acme"));
+        authCore.resetRequests();
 
         client.get().uri(LEDGER_PATH)
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus().isOk();
+
+        authCore.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
+                .withoutHeader("X-GK-Tenant"));
+    }
+
+    /**
+     * Consequence 1 of the precedence bug {@code GatewaySecurityConfig} exists to fix: a
+     * bearer that is not even well-formed used to reach the resource server's JWT decoder
+     * regardless of the key, fail there, and have that filter's own failure handler commit
+     * a 401 that overrode the API-key filter's already-successful authentication. The key
+     * decides, so a garbage bearer riding along must never be consulted at all.
+     */
+    @Test
+    void authenticatesAsTheKeyWhenTheAttachedBearerIsMalformed() {
+        String rawKey = stubActiveKey("reporting");
+
+        client.get().uri(LEDGER_PATH)
+                .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer not-a-real-jwt")
+                .exchange()
+                .expectStatus().isOk();
+    }
+
+    /**
+     * Pins the {@code StringUtils.hasText} check in {@code
+     * GatewaySecurityConfig.bearerConverterDeferringToApiKey()}. A blank {@code X-API-Key}
+     * header must not disable bearer authentication for the request: the API-key converter
+     * already declines a blank header (see {@link ApiKeyAuthenticationConverter}), and if
+     * the resource server's converter deferred on mere presence rather than actual text, an
+     * empty {@code X-API-Key:} header would silently switch off authentication entirely.
+     */
+    @Test
+    void authenticatesViaTheTokenWhenTheKeyHeaderIsBlank() {
+        String token = activeKey.mint(ISSUER, "ezzat",
+                Instant.now().plus(5, ChronoUnit.MINUTES),
+                Map.of("tenant", "acme", "permissions", List.of("payments:read")));
+
+        client.get().uri(LEDGER_PATH)
+                .header(ApiKeyAuthenticationConverter.HEADER_NAME, "")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange()
                 .expectStatus().isOk();

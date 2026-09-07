@@ -13,11 +13,15 @@ import org.springframework.security.config.annotation.web.reactive.EnableWebFlux
 import org.springframework.security.config.web.server.SecurityWebFiltersOrder;
 import org.springframework.security.config.web.server.ServerHttpSecurity;
 import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
+import org.springframework.security.oauth2.server.resource.web.server.authentication.ServerBearerTokenAuthenticationConverter;
 import org.springframework.security.web.server.ServerAuthenticationEntryPoint;
 import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.authentication.AuthenticationWebFilter;
+import org.springframework.security.web.server.authentication.ServerAuthenticationConverter;
 import org.springframework.security.web.server.authentication.ServerAuthenticationEntryPointFailureHandler;
+import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
 import tools.jackson.databind.ObjectMapper;
 
 /**
@@ -76,10 +80,37 @@ public class GatewaySecurityConfig {
                         .anyExchange().authenticated())
                 .oauth2ResourceServer(resourceServer -> resourceServer
                         .authenticationEntryPoint(authenticationEntryPoint)
+                        .bearerTokenConverter(bearerConverterDeferringToApiKey())
                         .jwt(jwt -> jwt.jwtDecoder(jwtDecoder)))
                 .addFilterAt(apiKeyAuthenticationWebFilter(apiKeyAuthenticationManager, authenticationEntryPoint),
                         SecurityWebFiltersOrder.AUTHENTICATION)
                 .build();
+    }
+
+    /**
+     * Makes "the key decides" literally true.
+     *
+     * <p>Placing the API-key filter ahead of the resource server's is not enough: on success
+     * our filter continues the chain, and the resource server's own AuthenticationWebFilter
+     * then runs regardless, without checking whether the context is already populated. That
+     * meant a valid key plus a malformed bearer was refused 401, and a valid key plus a valid
+     * bearer authenticated as the token's subject — silently overwriting the key's principal,
+     * which M4 would then authorize against.
+     *
+     * <p>Deferring only when the header actually carries text matches
+     * {@link ApiKeyAuthenticationConverter} exactly. Keying off mere presence would let a blank
+     * {@code X-API-Key:} disable bearer authentication for the whole request while the API-key
+     * converter also declined it — turning an empty header into a way to switch authentication
+     * off entirely.
+     */
+    private ServerAuthenticationConverter bearerConverterDeferringToApiKey() {
+        ServerBearerTokenAuthenticationConverter delegate =
+                new ServerBearerTokenAuthenticationConverter();
+        return exchange -> {
+            String key = exchange.getRequest().getHeaders()
+                    .getFirst(ApiKeyAuthenticationConverter.HEADER_NAME);
+            return StringUtils.hasText(key) ? Mono.empty() : delegate.convert(exchange);
+        };
     }
 
     /**
@@ -96,41 +127,23 @@ public class GatewaySecurityConfig {
      *   <tr><th>{@code X-API-Key}</th><th>{@code Authorization: Bearer}</th><th>Result</th></tr>
      *   <tr><td>absent</td><td>absent</td><td>401</td></tr>
      *   <tr><td>absent</td><td>valid JWT</td><td>JWT path, unchanged from M2</td></tr>
-     *   <tr><td>present, valid</td><td>absent</td>
-     *       <td>200, authenticated as the key</td></tr>
+     *   <tr><td>present, valid</td><td>either</td>
+     *       <td>200, authenticated as the key; the bearer token is not consulted</td></tr>
      *   <tr><td>present, invalid</td><td>either</td>
      *       <td>401 — no fallthrough to the JWT path; this filter's failure handler,
      *       above, is what guarantees it</td></tr>
      * </table>
      *
-     * <p><b>Gap, confirmed by scratch probes rather than by a committed test — the design
-     * intent below the table is not fully met when a bearer is ALSO attached to a request
-     * carrying a valid key:</b> {@link AuthenticationWebFilter}'s default success handler
-     * unconditionally continues the filter chain once this filter authenticates the key, so
-     * the resource server's own {@code AuthenticationWebFilter} — chained immediately after
-     * this one, at the same {@link SecurityWebFiltersOrder#AUTHENTICATION} position — always
-     * still runs, whether or not this filter already succeeded:
-     * <ul>
-     *   <li>Bearer present and itself valid: the JWT filter also succeeds and overwrites the
-     *   reactive {@code SecurityContext} this filter just set, so the request that reaches
-     *   the route is authenticated as the <em>bearer's</em> identity, not the key's, though
-     *   the response is still 200 (both credentials were individually good) — confirmed by
-     *   inspecting the proxied request: {@code X-GK-Subject} carried the JWT's subject, not
-     *   the key's name, i.e. {@link com.gatekeeper.identity.IdentityStampFilter} stamped
-     *   from a {@code JwtAuthenticationToken}, not this filter's {@code
-     *   ApiKeyAuthenticationToken}. "The bearer token is not consulted" is true only when no
-     *   bearer is attached at all.
-     *   <li>Bearer present and invalid (expired, malformed, wrong issuer): the JWT filter
-     *   fails, and its own failure handler commits a 401 that overrides this filter's
-     *   already-successful authentication — reproduced with a valid key plus {@code
-     *   Authorization: Bearer not-a-real-jwt}. A key that works alone stops working the
-     *   moment an unrelated stale or malformed bearer rides along with it.
-     * </ul>
-     * Left unfixed here — a fix (a success handler on this filter that short-circuits the
-     * rest of the authentication phase once the key succeeds, or a requires-authentication
-     * matcher on the JWT filter that skips an already-authenticated exchange) is a design
-     * decision outside what Task 11 specified, and deserves its own review rather than
-     * riding along inside this one.
+     * <p>The third row does not hold on this filter's position alone. Left to its defaults —
+     * no override on {@code bearerTokenConverter} — the resource server's own {@link
+     * AuthenticationWebFilter}, chained at the same {@link
+     * SecurityWebFiltersOrder#AUTHENTICATION} position, ran unconditionally once this filter
+     * succeeded, regardless of whether the context was already populated, and either
+     * overrode the key's principal with the bearer's or let a malformed bearer's own failure
+     * handler commit a 401 over an already-successful key authentication.
+     * {@link #bearerConverterDeferringToApiKey()} is what makes the row hold: it makes that
+     * filter's bearer-token converter decline to look at the token at all whenever
+     * {@code X-API-Key} carries text.
      */
     private AuthenticationWebFilter apiKeyAuthenticationWebFilter(
             ApiKeyReactiveAuthenticationManager manager,
