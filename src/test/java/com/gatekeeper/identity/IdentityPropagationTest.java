@@ -1,6 +1,7 @@
 package com.gatekeeper.identity;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
+import com.gatekeeper.apikey.ApiKeyAuthenticationConverter;
 import com.gatekeeper.support.TestKey;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -17,12 +18,15 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.equalToJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 
@@ -31,6 +35,7 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 class IdentityPropagationTest {
 
     static final String ISSUER = "http://localhost:8080";
+    static final String INTROSPECT_PATH = "/api/internal/api-keys/introspect";
 
     static WireMockServer downstream;
     static TestKey activeKey;
@@ -47,6 +52,13 @@ class IdentityPropagationTest {
                 .willReturn(okJson(TestKey.jwksDocument(activeKey))));
         downstream.stubFor(get(urlEqualTo("/ledger/entries"))
                 .willReturn(aResponse().withStatus(200).withBody("[]")));
+        // Catch-all, lower priority than the per-test stubActiveKey() stubs below: any key
+        // this class never explicitly marked active reads as inactive, matching how AuthCore
+        // answers for unknown, disabled and expired keys alike.
+        downstream.stubFor(post(urlEqualTo(INTROSPECT_PATH))
+                .atPriority(10)
+                .willReturn(okJson("""
+                        {"active":false}""")));
     }
 
     @AfterAll
@@ -60,6 +72,7 @@ class IdentityPropagationTest {
         registry.add("gatekeeper.auth.issuer", () -> ISSUER);
         registry.add("gatekeeper.downstream.ledger", () -> downstream.baseUrl());
         registry.add("gatekeeper.downstream.authcore", () -> downstream.baseUrl());
+        registry.add("gatekeeper.api-key.introspection-uri", () -> downstream.baseUrl() + INTROSPECT_PATH);
     }
 
     private static String tokenFor(String subject, String tenant, List<String> permissions) {
@@ -181,5 +194,56 @@ class IdentityPropagationTest {
                 .withHeader("X-GK-Subject", equalTo("authcore-machine"))
                 .withoutHeader("X-GK-Tenant")
                 .withoutHeader("X-GK-Permissions"));
+    }
+
+    /** An API-key caller is not a JWT principal, but must still be attributable downstream. */
+    @Test
+    void stampsTheSubjectForAnApiKeyCaller() {
+        downstream.resetRequests();
+        String rawKey = stubActiveKey("reporting");
+
+        client.get().uri("/api/ledger/entries")
+                .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
+                .exchange()
+                .expectStatus().isOk();
+
+        downstream.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
+                .withHeader("X-GK-Subject", equalTo("apikey:reporting")));
+    }
+
+    /** No tenant exists for a key, so no header — not a blank one a downstream might misread. */
+    @Test
+    void stampsNoTenantForAnApiKeyCaller() {
+        downstream.resetRequests();
+        String rawKey = stubActiveKey("reporting");
+
+        client.get().uri("/api/ledger/entries")
+                .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
+                .exchange()
+                .expectStatus().isOk();
+
+        downstream.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
+                .withoutHeader("X-GK-Tenant"));
+    }
+
+    // --- Helpers --------------------------------------------------------------------------
+
+    /** A fresh key per call. Never reused across tests, so Redis's cross-test persistence
+     * can never make one test's cached answer the reason another test passes. */
+    private static String newKey() {
+        return "ak_test_" + UUID.randomUUID();
+    }
+
+    /** Registers a higher-priority stub answering active for one freshly generated key, and
+     * returns that key. */
+    private static String stubActiveKey(String name) {
+        String rawKey = newKey();
+        downstream.stubFor(post(urlEqualTo(INTROSPECT_PATH))
+                .atPriority(1)
+                .withRequestBody(equalToJson("{\"key\":\"" + rawKey + "\"}"))
+                .willReturn(okJson("""
+                        {"active":true,"name":"%s","scopes":["payments:read"]}"""
+                        .formatted(name))));
+        return rawKey;
     }
 }

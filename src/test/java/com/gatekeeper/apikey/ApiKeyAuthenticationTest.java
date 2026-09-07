@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalToJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
@@ -137,16 +138,12 @@ class ApiKeyAuthenticationTest {
      * bearer" — both credentials here are individually valid, so the status code is the
      * same either way. This must check which principal actually won.
      *
-     * <p>{@link com.gatekeeper.identity.IdentityStampFilter} does not yet stamp API-key
-     * callers — that is Task 13 — so today's negative assertion is that the bearer's
-     * identity must not reach downstream at all: {@code X-GK-Subject}, which {@code
-     * IdentityStampFilter} sets unconditionally for a JWT principal, must be absent.
-     * ({@code X-GK-Tenant} would not do here — it is set only when the token's {@code
-     * tenant} claim is present, so that assertion would silently stop testing anything the
-     * day a token stopped carrying the claim.) The introspection-call count is the positive
-     * half: it proves the key path actually ran, not merely that the bearer's did not win.
-     * Once Task 13 lands, tighten the negative assertion to a positive one on {@code
-     * X-GK-Subject: apikey:<name>}.
+     * <p>{@link com.gatekeeper.identity.IdentityStampFilter} stamps {@code X-GK-Subject:
+     * apikey:<name>} for a key-authenticated caller, so the proxied request must carry the
+     * key's name ("reporting") rather than the token's {@code sub} claim ("ezzat"). This is
+     * the assertion that actually proves the key won, not merely that the token did not —
+     * the introspection-call count below is the complementary check that the key path
+     * actually ran in the first place.
      */
     @Test
     void authenticatesAsTheKeyWhenAValidTokenIsAlsoPresent() {
@@ -162,7 +159,7 @@ class ApiKeyAuthenticationTest {
                 .expectStatus().isOk();
 
         authCore.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
-                .withoutHeader("X-GK-Subject"));
+                .withHeader("X-GK-Subject", equalTo("apikey:reporting")));
         assertThat(authCore.findAll(postRequestedFor(urlEqualTo(INTROSPECT_PATH)))).hasSize(1);
     }
 
