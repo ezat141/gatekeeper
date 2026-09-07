@@ -1,5 +1,6 @@
 package com.gatekeeper.error;
 
+import com.gatekeeper.apikey.IntrospectionUnavailableException;
 import org.springframework.boot.autoconfigure.web.WebProperties;
 import org.springframework.boot.web.error.ErrorAttributeOptions;
 import org.springframework.boot.webflux.autoconfigure.error.AbstractErrorWebExceptionHandler;
@@ -74,12 +75,18 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
             builder = builder.header(HttpHeaders.WWW_AUTHENTICATE, "Bearer");
         }
 
+        if (status == HttpStatus.SERVICE_UNAVAILABLE) {
+            // Tells the caller this is worth retrying, which is the whole reason this path is a
+            // 503 and not a 401 — their credential may be perfectly good.
+            builder = builder.header(HttpHeaders.RETRY_AFTER, "5");
+        }
+
         return builder.bodyValue(ErrorBody.of(status, request.path()));
     }
 
     /**
-     * Two failures reach here as raw runtime exceptions rather than anything Spring
-     * Security recognises, and both would otherwise read as a server fault.
+     * Three failures reach here as raw runtime exceptions rather than anything Spring
+     * Security recognises, and all three would otherwise read as a server fault.
      *
      * <p>An unreachable JWKS arrives as {@code IllegalStateException("Could not obtain the
      * keys", ...)} from the remote key source — {@code JwtReactiveAuthenticationManager}
@@ -92,19 +99,31 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
      * cannot establish who they are, so it refuses the credential. Answering 401 also
      * avoids advertising that the identity provider is unreachable.
      *
-     * <p>The match is on exception type <em>and</em> the fixed part of the message each
-     * library uses for exactly this condition, deliberately narrower than "any {@code
-     * IllegalStateException} or {@code IllegalArgumentException}". Those two types are
+     * <p>The match on those two is on exception type <em>and</em> the fixed part of the
+     * message each library uses for exactly this condition, deliberately narrower than "any
+     * {@code IllegalStateException} or {@code IllegalArgumentException}". Those two types are
      * common enough that a genuine bug elsewhere in the gateway could easily throw one for
      * an unrelated reason — bad internal state, a rejected argument in code M4 adds later —
      * and a blanket catch here would relabel that bug as an authentication failure. A 401
      * is not paged on the way a 500 is, so a masked bug could sit unnoticed for a long
      * time. Both messages are confirmed against the actual stack traces this failure
      * produces (see the two exception-shape tests), not assumed from the description.
+     *
+     * <p>{@link IntrospectionUnavailableException} gets a bare type match instead, with no
+     * message narrowing. The reasoning above for the other two does not transfer: it is a
+     * type this gateway declares for itself and throws from exactly one place ({@code
+     * IntrospectionClient.introspect}), for exactly one reason — AuthCore's introspection
+     * call could not be completed. Unlike a JDK exception type, there is no ambient,
+     * everyday use of it that an unrelated bug elsewhere could collide with, so narrowing
+     * on message text as well would add ceremony without removing any real risk of
+     * mislabelling something else. It maps to 503, not 401 — see its own Javadoc for why.
      */
     private HttpStatus statusFor(ServerRequest request, Throwable error) {
         if (isUnreachableJwks(error) || isRejectedOutboundHeader(error)) {
             return HttpStatus.UNAUTHORIZED;
+        }
+        if (error instanceof IntrospectionUnavailableException) {
+            return HttpStatus.SERVICE_UNAVAILABLE;
         }
 
         int code = (int) getErrorAttributes(request, ErrorAttributeOptions.defaults())
