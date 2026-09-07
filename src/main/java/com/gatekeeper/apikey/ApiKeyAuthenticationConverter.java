@@ -17,10 +17,19 @@ public class ApiKeyAuthenticationConverter implements ServerAuthenticationConver
 
     @Override
     public Mono<Authentication> convert(ServerWebExchange exchange) {
-        String rawKey = exchange.getRequest().getHeaders().getFirst(HEADER_NAME);
-        if (!StringUtils.hasText(rawKey)) {
+        if (!carriesKey(exchange)) {
             return Mono.empty();
         }
+        String rawKey = exchange.getRequest().getHeaders().getFirst(HEADER_NAME);
         return Mono.just(new ApiKeyAuthenticationToken(rawKey));
+    }
+
+    /**
+     * Whether this request carries an API key at all. Shared so the resource server's
+     * deferral in GatewaySecurityConfig cannot drift from what this converter actually
+     * accepts — if the two disagree, a request can be declined by both paths.
+     */
+    public static boolean carriesKey(ServerWebExchange exchange) {
+        return StringUtils.hasText(exchange.getRequest().getHeaders().getFirst(HEADER_NAME));
     }
 }

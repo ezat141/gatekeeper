@@ -138,10 +138,15 @@ class ApiKeyAuthenticationTest {
      * same either way. This must check which principal actually won.
      *
      * <p>{@link com.gatekeeper.identity.IdentityStampFilter} does not yet stamp API-key
-     * callers — that is Task 13 — so today's only provable assertion is the negative one:
-     * the bearer's {@code tenant} claim must not reach downstream as {@code X-GK-Tenant}.
-     * Once Task 13 lands, tighten this to a positive assertion on {@code X-GK-Subject:
-     * apikey:<name>}.
+     * callers — that is Task 13 — so today's negative assertion is that the bearer's
+     * identity must not reach downstream at all: {@code X-GK-Subject}, which {@code
+     * IdentityStampFilter} sets unconditionally for a JWT principal, must be absent.
+     * ({@code X-GK-Tenant} would not do here — it is set only when the token's {@code
+     * tenant} claim is present, so that assertion would silently stop testing anything the
+     * day a token stopped carrying the claim.) The introspection-call count is the positive
+     * half: it proves the key path actually ran, not merely that the bearer's did not win.
+     * Once Task 13 lands, tighten the negative assertion to a positive one on {@code
+     * X-GK-Subject: apikey:<name>}.
      */
     @Test
     void authenticatesAsTheKeyWhenAValidTokenIsAlsoPresent() {
@@ -157,7 +162,8 @@ class ApiKeyAuthenticationTest {
                 .expectStatus().isOk();
 
         authCore.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
-                .withoutHeader("X-GK-Tenant"));
+                .withoutHeader("X-GK-Subject"));
+        assertThat(authCore.findAll(postRequestedFor(urlEqualTo(INTROSPECT_PATH)))).hasSize(1);
     }
 
     /**
@@ -179,12 +185,15 @@ class ApiKeyAuthenticationTest {
     }
 
     /**
-     * Pins the {@code StringUtils.hasText} check in {@code
-     * GatewaySecurityConfig.bearerConverterDeferringToApiKey()}. A blank {@code X-API-Key}
-     * header must not disable bearer authentication for the request: the API-key converter
-     * already declines a blank header (see {@link ApiKeyAuthenticationConverter}), and if
-     * the resource server's converter deferred on mere presence rather than actual text, an
-     * empty {@code X-API-Key:} header would silently switch off authentication entirely.
+     * Pins the shared {@code ApiKeyAuthenticationConverter.carriesKey} check that {@code
+     * GatewaySecurityConfig.bearerConverterDeferringToApiKey()} defers to. A blank {@code
+     * X-API-Key} header must not suppress bearer authentication for the request: the
+     * API-key converter already declines a blank header (see {@link
+     * ApiKeyAuthenticationConverter}), and if the resource server's converter deferred on
+     * mere presence rather than actual text, an empty {@code X-API-Key:} header would
+     * suppress bearer authentication while the API-key converter also declined it, so a
+     * request carrying a perfectly good token would be refused 401 — a kill switch for the
+     * bearer path, not a way to bypass authentication.
      */
     @Test
     void authenticatesViaTheTokenWhenTheKeyHeaderIsBlank() {
@@ -233,6 +242,30 @@ class ApiKeyAuthenticationTest {
                 .jsonPath("$.error").isEqualTo("unauthorized")
                 .jsonPath("$.status").isEqualTo(401)
                 .jsonPath("$.path").isEqualTo(LEDGER_PATH);
+    }
+
+    // --- Health probe -------------------------------------------------------------------
+
+    /**
+     * {@code /actuator/health} is {@code permitAll()} in {@code securityWebFilterChain}, so
+     * it must stay reachable with no credential at all. {@code AuthenticationWebFilter}'s
+     * default {@code requiresAuthenticationMatcher} is {@code anyExchange()}, though, and
+     * this filter is never given one of its own — so absent an explicit exclusion, an
+     * unauthenticated caller could attach an arbitrary {@code X-API-Key} to this one route
+     * and still drive an introspection call (and a Redis write) to AuthCore for a key value
+     * the caller alone picks. The negative cache does not dampen this: each distinct key
+     * value is a fresh cache entry, so the attacker's choice of key defeats it entirely.
+     */
+    @Test
+    void healthProbeWithAnArbitraryKeyNeverReachesIntrospection() {
+        authCore.resetRequests();
+
+        client.get().uri("/actuator/health")
+                .header(ApiKeyAuthenticationConverter.HEADER_NAME, newKey())
+                .exchange()
+                .expectStatus().isOk();
+
+        assertThat(authCore.findAll(postRequestedFor(urlEqualTo(INTROSPECT_PATH)))).isEmpty();
     }
 
     // --- Caching ------------------------------------------------------------------------

@@ -19,7 +19,8 @@ import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.authentication.AuthenticationWebFilter;
 import org.springframework.security.web.server.authentication.ServerAuthenticationConverter;
 import org.springframework.security.web.server.authentication.ServerAuthenticationEntryPointFailureHandler;
-import org.springframework.util.StringUtils;
+import org.springframework.security.web.server.util.matcher.NegatedServerWebExchangeMatcher;
+import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatchers;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 import tools.jackson.databind.ObjectMapper;
@@ -98,24 +99,31 @@ public class GatewaySecurityConfig {
      * which M4 would then authorize against.
      *
      * <p>Deferring only when the header actually carries text matches
-     * {@link ApiKeyAuthenticationConverter} exactly. Keying off mere presence would let a blank
-     * {@code X-API-Key:} disable bearer authentication for the whole request while the API-key
-     * converter also declined it — turning an empty header into a way to switch authentication
-     * off entirely.
+     * {@link ApiKeyAuthenticationConverter} exactly — both sides call {@link
+     * ApiKeyAuthenticationConverter#carriesKey} so they cannot drift apart. Keying off mere
+     * presence would let a blank {@code X-API-Key:} suppress bearer
+     * authentication for the whole request while the API-key converter also declined it, so
+     * a request carrying a perfectly good token would be refused 401. An empty header would
+     * become a kill switch for the bearer path, not a way to bypass authentication.
      */
     private ServerAuthenticationConverter bearerConverterDeferringToApiKey() {
         ServerBearerTokenAuthenticationConverter delegate =
                 new ServerBearerTokenAuthenticationConverter();
-        return exchange -> {
-            String key = exchange.getRequest().getHeaders()
-                    .getFirst(ApiKeyAuthenticationConverter.HEADER_NAME);
-            return StringUtils.hasText(key) ? Mono.empty() : delegate.convert(exchange);
-        };
+        return exchange -> ApiKeyAuthenticationConverter.carriesKey(exchange)
+                ? Mono.empty()
+                : delegate.convert(exchange);
     }
 
     /**
-     * Runs at the authentication position, ahead of the resource server's own filter, so
-     * X-API-Key decides the outcome whenever it is present.
+     * Runs at the authentication position. What that buys: it runs before {@code
+     * AuthorizationWebFilter}, so a key-authenticated request satisfies {@code anyExchange()
+     * .authenticated()} — moving it after {@link SecurityWebFiltersOrder#AUTHORIZATION} fails
+     * every key-authenticated route. Its position relative to the resource server's own
+     * {@link AuthenticationWebFilter}, chained at the same {@link
+     * SecurityWebFiltersOrder#AUTHENTICATION} position, is <strong>not</strong> load-bearing:
+     * the two filters' converters are mutually exclusive (see {@link
+     * #bearerConverterDeferringToApiKey()}), so which of them runs first cannot matter. What
+     * makes the key decide is that deferral, not this filter's position.
      *
      * <p>A present-but-invalid key fails here rather than falling through to the JWT path.
      * A typo'd key should read as "bad credentials", not as a confusing "no credentials", and
@@ -131,19 +139,9 @@ public class GatewaySecurityConfig {
      *       <td>200, authenticated as the key; the bearer token is not consulted</td></tr>
      *   <tr><td>present, invalid</td><td>either</td>
      *       <td>401 — no fallthrough to the JWT path; this filter's failure handler,
-     *       above, is what guarantees it</td></tr>
+     *       above, gives the refusal the platform's JSON error shape (the 401 itself is
+     *       {@link AuthenticationWebFilter}'s own default)</td></tr>
      * </table>
-     *
-     * <p>The third row does not hold on this filter's position alone. Left to its defaults —
-     * no override on {@code bearerTokenConverter} — the resource server's own {@link
-     * AuthenticationWebFilter}, chained at the same {@link
-     * SecurityWebFiltersOrder#AUTHENTICATION} position, ran unconditionally once this filter
-     * succeeded, regardless of whether the context was already populated, and either
-     * overrode the key's principal with the bearer's or let a malformed bearer's own failure
-     * handler commit a 401 over an already-successful key authentication.
-     * {@link #bearerConverterDeferringToApiKey()} is what makes the row hold: it makes that
-     * filter's bearer-token converter decline to look at the token at all whenever
-     * {@code X-API-Key} carries text.
      */
     private AuthenticationWebFilter apiKeyAuthenticationWebFilter(
             ApiKeyReactiveAuthenticationManager manager,
@@ -153,6 +151,16 @@ public class GatewaySecurityConfig {
         filter.setServerAuthenticationConverter(new ApiKeyAuthenticationConverter());
         filter.setAuthenticationFailureHandler(
                 new ServerAuthenticationEntryPointFailureHandler(entryPoint));
+        // AuthenticationWebFilter's default requiresAuthenticationMatcher is anyExchange(),
+        // so without this, an unauthenticated caller could attach an arbitrary X-API-Key to
+        // the one route that needs no credential and still drive an introspection call (and
+        // a Redis write) to AuthCore for a key value the caller alone picks — the negative
+        // cache does not dampen this, since each distinct key value is a fresh cache entry.
+        // Must track the pathMatchers(...).permitAll() list in securityWebFilterChain above
+        // exactly: any path permitted there but not excluded here reopens this hole.
+        filter.setRequiresAuthenticationMatcher(new NegatedServerWebExchangeMatcher(
+                ServerWebExchangeMatchers.pathMatchers(
+                        "/actuator/health", "/actuator/health/**")));
         return filter;
     }
 }
