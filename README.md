@@ -56,9 +56,10 @@ curl -i http://localhost:8081/api/ledger/entries
 
 To exercise the proxy for real you need the other two services on `:8080` and `:8082`, and a token from AuthCore's authorization-code flow. **Obtain it through `localhost`, not `127.0.0.1`** — see [Issuer pinning](#issuer-pinning-and-the-trap-it-exists-to-catch), which is the single most likely reason a valid-looking token gets a `401` here.
 
-Run the suite — no Docker required, since WireMock stands in for both AuthCore and the downstreams:
+Run the suite. WireMock stands in for AuthCore and the downstreams, but the API-key tests need a real Redis — this repo has no compose file of its own and shares AuthCore's container:
 
 ```bash
+docker compose up -d redis   # from the authcore repo
 ./mvnw test
 ```
 
@@ -255,16 +256,44 @@ The failure mode these share is what makes them dangerous: **a blocking call ins
 ./mvnw test
 ```
 
-**18 tests, no Docker.** WireMock stands in for both AuthCore's JWKS endpoint and the downstream services, so the suite runs offline in under ten seconds. Testcontainers arrives when Redis does, at M5.
+**70 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services, so most of the suite runs offline. The API-key tests are the exception: they need a real Redis, started as shown in the [Quickstart](#quickstart). Without it, 19 tests fail on `RedisConnectionFailureException` — a missing container, not a defect in this repo.
+
+**Routing and startup**
 
 | Class | Tests | Covers |
 |---|---|---|
 | `GateKeeperApplicationTests` | 2 | The app is reactive rather than servlet; exactly one security chain is in play |
 | `RoutingTest` | 4 | `StripPrefix=1` applied to the ledger route and *not* to either AuthCore route; an unmatched path reaches no downstream |
-| `JwtAuthenticationTest` | 7 | No token, valid token, expired token, wrong issuer, bad signature, unknown `kid`, public health |
-| `IdentityPropagationTest` | 5 | Verified claims stamped downstream; forged headers overwritten; casing variants stripped; absent claims produce no header; the spoof stamping cannot mask |
 
-Current run: `Tests run: 18, Failures: 0, Errors: 0, Skipped: 0`.
+**Token authentication**
+
+| Class | Tests | Covers |
+|---|---|---|
+| `JwtAuthenticationTest` | 7 | No token, valid token, expired token, wrong issuer, bad signature, unknown `kid`, public health |
+| `KeyRotationTest` | 3 | A token minted before a rotation still validates while the retiring key is published — the property that makes rotation zero-downtime |
+| `IdentityPropagationTest` | 7 | Verified claims stamped downstream; forged headers overwritten; casing variants stripped; absent claims produce no header; the spoof stamping cannot mask |
+
+**API keys**
+
+| Class | Tests | Covers |
+|---|---|---|
+| `ApiKeyAuthenticationTest` | 10 | The request shape M2 never had to consider: an `X-API-Key` and an `Authorization` header on the same request, and which one wins |
+| `ApiKeyReactiveAuthenticationManagerTest` | 11 | The manager against fakes rather than mocks, including TTL clamping and negative TTLs |
+| `IntrospectionClientTest` | 7 | The introspection client against a fake AuthCore, each test varying the timeout and resetting stubs so none can see another's state |
+| `IntrospectionUnavailableTest` | 4 | An unreachable AuthCore raises a non-`AuthenticationException`, so the filter cannot quietly turn an outage into a `401` |
+| `RedisApiKeyCacheTest` | 5 | The cache against **real Redis** — random keys per test, deleted afterwards, so a shared instance is never polluted |
+| `ApiKeyAuthenticationConverterTest` | 5 | Header parsing into a credential |
+| `ApiKeyIntrospectionTest` | 1 | What the record's constructor does with a specific wire shape — needs neither Spring nor Redis |
+| `ApiKeyPropertiesTest` | 1 | `gatekeeper.api-key.*` actually binds. Relaxed binding leaves a mistyped key silently `null`, so a context that starts does not prove the values arrived |
+
+**Error contract**
+
+| Class | Tests | Covers |
+|---|---|---|
+| `ErrorShapeTest` | 2 | One JSON shape — `error`, `status`, `path` — whichever layer refused the request |
+| `UnreachableJwksErrorShapeTest` | 1 | An unreachable JWKS reads as a `401`, not the `500` it used to. Separate from `ErrorShapeTest` because one class cannot register two values for `jwk-set-uri` |
+
+Current run, with Redis up: `Tests run: 70, Failures: 0, Errors: 0, Skipped: 0`.
 
 Five of these are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
 
@@ -297,9 +326,9 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 
 - **No route-level authorization.** `anyExchange().authenticated()` is the entire model. Any valid AuthCore token reaches any route, and the downstream is what stops it going further. A client-credentials token with no `tenant` claim can reach `/api/ledger/**` through this gateway; ledger-service is what returns it an empty list.
 
-- **A JWKS fetch failure returns `500`, not the `401` it should.** The cause is known and traced: `ReactiveRemoteJWKSource.getJWKSet()`'s `WebClientRequestException` is wrapped as `IllegalStateException("Could not obtain the keys", ...)` inside `NimbusReactiveJwtDecoder`, and `JwtReactiveAuthenticationManager.authenticate()` maps only `JwtException` to a `401` via `onErrorMap`. The `IllegalStateException` passes through unmapped to Boot's default handler. **No bypass occurs** — the request is still refused and the body carries no stack trace — but the status misreports an authentication failure as a server fault, which sends anyone debugging an unreachable AuthCore in the wrong direction.
+- ~~**A JWKS fetch failure returns `500`, not the `401` it should.**~~ **Fixed.** `ReactiveRemoteJWKSource.getJWKSet()`'s `WebClientRequestException` is wrapped as `IllegalStateException("Could not obtain the keys", ...)` inside `NimbusReactiveJwtDecoder`, and `JwtReactiveAuthenticationManager.authenticate()` maps only `JwtException` to a `401`, so the `IllegalStateException` used to reach Boot's default handler unmapped and misreport an authentication failure as a server fault. `GlobalErrorWebExceptionHandler` now recognises it, and `UnreachableJwksErrorShapeTest` stops the `500` returning.
 
-- **No unified error shape.** Errors are whatever Spring Security and Boot's defaults produce, rather than JSON matching AuthCore's existing error format. A client currently sees more than one error shape across the platform.
+- ~~**No unified error shape.**~~ **Fixed.** `GlobalErrorWebExceptionHandler` renders one JSON shape — `error`, `status`, `path` — whichever layer refused the request, and ledger-service matches it one hop downstream. `ErrorShapeTest` pins it.
 
 - **Audience is not validated**, as described under [Authentication](#authentication). Safe for a pass-through; not safe for a gateway that makes per-client decisions.
 
@@ -322,8 +351,8 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 | M0 | Skeleton on Netty, health endpoint | ✅ |
 | M1 | Routing to AuthCore and ledger-service, prefix rewriting | ✅ |
 | M2 | JWT authentication against JWKS, issuer pinning | ✅ |
-| M3 | Identity propagation and inbound `X-GK-*` stripping | **done** |
-| M3 | API-key authentication | planned |
+| M3 | Identity propagation and inbound `X-GK-*` stripping | ✅ |
+| M3 | API-key authentication, with Redis-cached introspection | ✅ |
 | M4 | Route → scope authorization, tenant enforcement at the edge | planned |
 | M5 | Distributed rate limiting and per-plan quotas (Redis) | planned |
 | M6 | Revocation check against AuthCore's deny-list | planned |
