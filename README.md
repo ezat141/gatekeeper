@@ -444,7 +444,7 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 
 - ~~**No unified error shape.**~~ **Fixed.** `GlobalErrorWebExceptionHandler` renders one JSON shape — `error`, `status`, `path` — whichever layer refused the request, and ledger-service matches it one hop downstream. `ErrorShapeTest` pins it.
 
-- **Audience is not validated**, as described under [Authentication](#authentication). Safe while the gateway's decisions read only the scopes a client was granted; not safe for a gateway that admits or refuses clients by identity.
+- **Audience is not validated**, as described under [Authentication](#authentication). Safe while the gateway's decisions read only the scopes a client was granted; not safe for a gateway that admits, refuses or rate-limits clients by identity, or once AuthCore issues the same scope names for another resource server.
 
 - **Downstream URIs are static configuration.** Two hardcoded `localhost` URLs, no service discovery, no health-aware load balancing. Fine for a single-instance local platform, insufficient for more than one instance of anything.
 
