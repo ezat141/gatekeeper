@@ -6,6 +6,8 @@ import com.gatekeeper.apikey.ApiKeyProperties;
 import com.gatekeeper.apikey.ApiKeyReactiveAuthenticationManager;
 import com.gatekeeper.apikey.IntrospectionClient;
 import com.gatekeeper.apikey.RedisApiKeyCache;
+import com.gatekeeper.authz.RouteScopeAuthorizationManager;
+import com.gatekeeper.authz.TenantAuthorizationManager;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
@@ -19,6 +21,7 @@ import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.authentication.AuthenticationWebFilter;
 import org.springframework.security.web.server.authentication.ServerAuthenticationConverter;
 import org.springframework.security.web.server.authentication.ServerAuthenticationEntryPointFailureHandler;
+import org.springframework.security.web.server.authorization.ServerAccessDeniedHandler;
 import org.springframework.security.web.server.util.matcher.NegatedServerWebExchangeMatcher;
 import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatchers;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -28,8 +31,16 @@ import reactor.core.publisher.Mono;
  * Replaces Boot's default deny-all chain, which was installed simply because the OAuth2
  * resource-server starter is on the classpath.
  *
- * <p>Only authentication is decided here. Route-level authorization is M4; mixing the two
- * now would bury the route rules inside this method later.
+ * <p>Authentication is decided by the two filters configured below. Authorization is
+ * decided by {@link RouteScopeAuthorizationManager}, wrapped in {@link
+ * TenantAuthorizationManager} — in {@code com.gatekeeper.authz}, so the route rules live in a
+ * class of their own rather than inside this method.
+ *
+ * <p>The access-denied handler is set once, on {@code exceptionHandling}, and that one
+ * setting covers bearer and key callers alike: {@code ServerHttpSecurity} consults the
+ * resource server's own bearer handler only when no explicit handler is configured (verified
+ * in the 7.0.6 bytecode). Setting it on {@code oauth2ResourceServer} as well would be dead
+ * configuration.
  *
  * <p>The entry point is overridden because Spring Security's default writes the 401
  * response body directly and completes it before this class's own {@code
@@ -67,6 +78,7 @@ public class GatewaySecurityConfig {
     public SecurityWebFilterChain securityWebFilterChain(
             ServerHttpSecurity http, ReactiveJwtDecoder jwtDecoder,
             ServerAuthenticationEntryPoint authenticationEntryPoint,
+            ServerAccessDeniedHandler accessDeniedHandler,
             ApiKeyReactiveAuthenticationManager apiKeyAuthenticationManager) {
 
         return http
@@ -77,7 +89,9 @@ public class GatewaySecurityConfig {
                 .formLogin(ServerHttpSecurity.FormLoginSpec::disable)
                 .authorizeExchange(exchange -> exchange
                         .pathMatchers("/actuator/health", "/actuator/health/**").permitAll()
-                        .anyExchange().authenticated())
+                        .anyExchange().access(
+                                new TenantAuthorizationManager(new RouteScopeAuthorizationManager())))
+                .exceptionHandling(handling -> handling.accessDeniedHandler(accessDeniedHandler))
                 .oauth2ResourceServer(resourceServer -> resourceServer
                         .authenticationEntryPoint(authenticationEntryPoint)
                         .bearerTokenConverter(bearerConverterDeferringToApiKey())
@@ -115,8 +129,8 @@ public class GatewaySecurityConfig {
 
     /**
      * Runs at the authentication position. What that buys: it runs before {@code
-     * AuthorizationWebFilter}, so a key-authenticated request satisfies {@code anyExchange()
-     * .authenticated()} — moving it after {@link SecurityWebFiltersOrder#AUTHORIZATION} fails
+     * AuthorizationWebFilter}, so a key-authenticated request is authenticated by the time the
+     * rule table runs — moving it after {@link SecurityWebFiltersOrder#AUTHORIZATION} fails
      * every key-authenticated route. Its position relative to the resource server's own
      * {@link AuthenticationWebFilter}, chained at the same {@link
      * SecurityWebFiltersOrder#AUTHENTICATION} position, is <strong>not</strong> load-bearing:

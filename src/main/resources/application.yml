@@ -28,6 +28,12 @@ spring:
                 - Path=/api/ledger/**
               filters:
                 - StripPrefix=1
+                # ledger-service is JWT-only, and a key caller is refused before reaching it
+                # (RouteScopeAuthorizationManager). What remains is a JWT caller sending a
+                # blank X-API-Key, which would otherwise be forwarded to a service that can do
+                # nothing with it. The AuthCore routes keep the header: AuthCore
+                # re-authenticates the key itself.
+                - RemoveRequestHeader=X-API-Key
   data:
     redis:
       host: localhost
@@ -63,7 +69,8 @@ management:
         # Gateway annotates its endpoint @RestControllerEndpoint(defaultAccess = NONE),
         # and the access check short-circuits before exposure is ever consulted, so the
         # endpoint would still never register. Turning it on needs
-        # management.endpoint.gateway.access: read-only — deferred until there is an
-        # authorization model to decide who may read it, since after M2 it would fall
-        # under anyExchange().authenticated() and be readable by any caller at all.
+        # management.endpoint.gateway.access: read-only — and then a rule of its own in
+        # RouteScopeAuthorizationManager, which today refuses every /actuator path but
+        # health and info (NO_RULE). Who may read the route table is a decision still to
+        # be made.
         include: health,info

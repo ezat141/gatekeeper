@@ -27,9 +27,10 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * M2 answers exactly one question: is this a valid, unexpired token from AuthCore. Whether
- * the caller may reach a particular route is M4 — keeping them apart means the route rules
- * stay visible in the security config later rather than being tangled into authentication.
+ * Answers exactly one question: is this a valid, unexpired token from AuthCore. Whether the
+ * caller may reach a particular route is {@code AuthorizationTest}'s; the one success case
+ * here carries the scope the ledger route requires so that it can keep asserting only
+ * authentication.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @AutoConfigureWebTestClient
@@ -79,7 +80,8 @@ class JwtAuthenticationTest {
     void proxiesARequestWithAValidToken() {
         String token = activeKey.mint(ISSUER, "ezzat",
                 Instant.now().plus(5, ChronoUnit.MINUTES),
-                Map.of("tenant", "acme", "permissions", List.of("payments:read")));
+                Map.of("tenant", "acme", "permissions", List.of("payments:read"),
+                        "scope", List.of("payments:read")));
 
         client.get().uri("/api/ledger/entries")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)

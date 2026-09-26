@@ -45,9 +45,11 @@ public class IdentityStampFilter implements GlobalFilter, Ordered {
         // right here: Mono::map rejects a null return before stamp() ever sees it (confirmed
         // by driving this method directly with such a context). Unreached today: Spring
         // Security's own filters never publish one (an anonymous caller gets a concrete
-        // token, never a null), and every route this filter sees requires
-        // anyExchange().authenticated(), which rejects an anonymous caller before routing
-        // runs. Pre-existing and unchanged from the JWT-only pipeline this replaces.
+        // token, never a null), and every routed path passes through
+        // RouteScopeAuthorizationManager, which gives a caller with no (or only anonymous)
+        // authentication a plain denial that ExceptionTranslationWebFilter turns into a 401
+        // before routing runs. Pre-existing and unchanged from the JWT-only pipeline this
+        // replaces.
         return ReactiveSecurityContextHolder.getContext()
                 .map(SecurityContext::getAuthentication)
                 .map(authentication -> stamp(exchange, authentication))

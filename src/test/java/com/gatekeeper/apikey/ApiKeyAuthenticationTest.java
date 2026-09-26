@@ -38,9 +38,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code apiKeyAuthenticationWebFilter}.
  *
  * <p>Every proxied ("OK") case below reaches the same WireMock stub that answers 200
- * unconditionally — route-level authorization is still M4 — so a 200 here means only "the
- * gateway's own security chain let the request through," never "the credential was
- * appropriate for the route."
+ * unconditionally — every credential that should win carries payments:read, which is what
+ * GET on the machine route requires — so a 200 means the gateway authenticated the caller as
+ * the credential the precedence table says should win.
  *
  * <p>Every test that touches introspection uses a freshly random key from {@link #newKey()}
  * rather than a fixed literal. Redis is the same instance AuthCore uses and persists between
@@ -55,7 +55,7 @@ class ApiKeyAuthenticationTest {
 
     static final String ISSUER = "http://localhost:8080";
     static final String INTROSPECT_PATH = "/api/internal/api-keys/introspect";
-    static final String LEDGER_PATH = "/api/ledger/entries";
+    static final String MACHINE_PATH = "/api/machine/payments";
 
     static WireMockServer authCore;
     static TestKey activeKey;
@@ -70,7 +70,7 @@ class ApiKeyAuthenticationTest {
         authCore.start();
         authCore.stubFor(get(urlEqualTo("/oauth2/jwks"))
                 .willReturn(okJson(TestKey.jwksDocument(activeKey))));
-        authCore.stubFor(get(urlEqualTo("/ledger/entries"))
+        authCore.stubFor(get(urlEqualTo(MACHINE_PATH))
                 .willReturn(aResponse().withStatus(200).withBody("[]")));
         // Catch-all, lower priority than the per-test stubs stubActiveKey() registers below:
         // any key this class never explicitly marked active reads as inactive, exactly how
@@ -99,14 +99,14 @@ class ApiKeyAuthenticationTest {
 
     @Test
     void refusesARequestWithNeitherCredential() {
-        client.get().uri(LEDGER_PATH)
+        client.get().uri(MACHINE_PATH)
                 .exchange()
                 .expectStatus().isUnauthorized()
                 .expectHeader().valueMatches(HttpHeaders.WWW_AUTHENTICATE, "Bearer.*")
                 .expectBody()
                 .jsonPath("$.error").isEqualTo("unauthorized")
                 .jsonPath("$.status").isEqualTo(401)
-                .jsonPath("$.path").isEqualTo(LEDGER_PATH);
+                .jsonPath("$.path").isEqualTo(MACHINE_PATH);
     }
 
     /** No {@code X-API-Key} at all: the converter returns empty, so this must behave exactly
@@ -115,9 +115,10 @@ class ApiKeyAuthenticationTest {
     void proxiesARequestWithOnlyAValidToken() {
         String token = activeKey.mint(ISSUER, "ezzat",
                 Instant.now().plus(5, ChronoUnit.MINUTES),
-                Map.of("tenant", "acme", "permissions", List.of("payments:read")));
+                Map.of("tenant", "acme", "permissions", List.of("payments:read"),
+                        "scope", List.of("payments:read")));
 
-        client.get().uri(LEDGER_PATH)
+        client.get().uri(MACHINE_PATH)
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange()
                 .expectStatus().isOk();
@@ -127,7 +128,7 @@ class ApiKeyAuthenticationTest {
     void proxiesARequestWithOnlyAValidKey() {
         String rawKey = stubActiveKey("reporting");
 
-        client.get().uri(LEDGER_PATH)
+        client.get().uri(MACHINE_PATH)
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
                 .exchange()
                 .expectStatus().isOk();
@@ -152,13 +153,13 @@ class ApiKeyAuthenticationTest {
                 Instant.now().plus(5, ChronoUnit.MINUTES), Map.of("tenant", "acme"));
         authCore.resetRequests();
 
-        client.get().uri(LEDGER_PATH)
+        client.get().uri(MACHINE_PATH)
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange()
                 .expectStatus().isOk();
 
-        authCore.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
+        authCore.verify(getRequestedFor(urlEqualTo(MACHINE_PATH))
                 .withHeader("X-GK-Subject", equalTo("apikey:reporting")));
         assertThat(authCore.findAll(postRequestedFor(urlEqualTo(INTROSPECT_PATH)))).hasSize(1);
     }
@@ -174,7 +175,7 @@ class ApiKeyAuthenticationTest {
     void authenticatesAsTheKeyWhenTheAttachedBearerIsMalformed() {
         String rawKey = stubActiveKey("reporting");
 
-        client.get().uri(LEDGER_PATH)
+        client.get().uri(MACHINE_PATH)
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
                 .header(HttpHeaders.AUTHORIZATION, "Bearer not-a-real-jwt")
                 .exchange()
@@ -196,9 +197,10 @@ class ApiKeyAuthenticationTest {
     void authenticatesViaTheTokenWhenTheKeyHeaderIsBlank() {
         String token = activeKey.mint(ISSUER, "ezzat",
                 Instant.now().plus(5, ChronoUnit.MINUTES),
-                Map.of("tenant", "acme", "permissions", List.of("payments:read")));
+                Map.of("tenant", "acme", "permissions", List.of("payments:read"),
+                        "scope", List.of("payments:read")));
 
-        client.get().uri(LEDGER_PATH)
+        client.get().uri(MACHINE_PATH)
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, "")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange()
@@ -216,7 +218,7 @@ class ApiKeyAuthenticationTest {
         String token = activeKey.mint(ISSUER, "ezzat",
                 Instant.now().plus(5, ChronoUnit.MINUTES), Map.of("tenant", "acme"));
 
-        client.get().uri(LEDGER_PATH)
+        client.get().uri(MACHINE_PATH)
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, badKey)
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange()
@@ -224,21 +226,21 @@ class ApiKeyAuthenticationTest {
                 .expectBody()
                 .jsonPath("$.error").isEqualTo("unauthorized")
                 .jsonPath("$.status").isEqualTo(401)
-                .jsonPath("$.path").isEqualTo(LEDGER_PATH);
+                .jsonPath("$.path").isEqualTo(MACHINE_PATH);
     }
 
     @Test
     void refusesAnInvalidKeyWithNoTokenAttached() {
         String badKey = newKey();
 
-        client.get().uri(LEDGER_PATH)
+        client.get().uri(MACHINE_PATH)
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, badKey)
                 .exchange()
                 .expectStatus().isUnauthorized()
                 .expectBody()
                 .jsonPath("$.error").isEqualTo("unauthorized")
                 .jsonPath("$.status").isEqualTo(401)
-                .jsonPath("$.path").isEqualTo(LEDGER_PATH);
+                .jsonPath("$.path").isEqualTo(MACHINE_PATH);
     }
 
     // --- Health probe -------------------------------------------------------------------
@@ -282,7 +284,7 @@ class ApiKeyAuthenticationTest {
         authCore.resetRequests();
 
         for (int i = 0; i < 2; i++) {
-            client.get().uri(LEDGER_PATH)
+            client.get().uri(MACHINE_PATH)
                     .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
                     .exchange()
                     .expectStatus().isOk();
