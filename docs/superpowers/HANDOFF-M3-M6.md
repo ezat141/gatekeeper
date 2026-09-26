@@ -12,7 +12,7 @@ landed across AuthCore and GateKeeper with its own spec and plan, dated 2026-08-
 
 | Repo | `master` | Tests | Visibility |
 |---|---|---|---|
-| [authcore](https://github.com/ezat141/authcore) | `fa1b9d0` | 78 | public |
+| [authcore](https://github.com/ezat141/authcore) | `4f0a228` | 78 | public |
 | [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
 | [gatekeeper](https://github.com/ezat141/gatekeeper) | `27b988d` | 70 | public |
 
