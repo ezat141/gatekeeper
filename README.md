@@ -145,7 +145,7 @@ Two things in that diagram are load-bearing.
 
 **The strip and the stamp sit on opposite sides of the security chain**, which is why they are two classes rather than one. Stripping has to happen before authentication, on the untouched request, so that no forged header survives into an error path. Stamping cannot happen until after, because the verified `Jwt` does not exist any earlier. No single filter position satisfies both.
 
-**The dashed line from the client straight to ledger-service is a supported path, not a gap.** ledger-service verifies tokens against AuthCore's JWKS on its own and enforces its own tenant and permission rules, so bypassing this gateway gets a caller past none of them. What it does skip is the edge's scope check, which ledger-service does not repeat: a user whose client was granted only `payments:read` is refused a ledger write here and not there. That is the edge adding a check, not the downstream missing one — see [Authorization at the edge](#authorization-at-the-edge).
+**The dashed line from the client straight to ledger-service is a supported path, not a gap.** ledger-service verifies tokens against AuthCore's JWKS on its own and enforces its own tenant and permission rules, so bypassing this gateway gets a caller past none of them. It does skip one check: ledger-service enforces the user's permission but not the client's scope, so a user who holds `payments:write` but signed in through a client granted only `payments:read` — the seeded `authcore-spa` — is refused a ledger write at the gateway and not when calling ledger-service directly. Whether ledger-service should also enforce scope is an open decision, recorded in the handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5). See [Authorization at the edge](#authorization-at-the-edge).
 
 ---
 
@@ -199,7 +199,7 @@ Trust is anchored on AuthCore's JWKS rather than a public key copied into config
 
 **Audience is not validated.** AuthCore emits `aud`, and nothing here checks it, so a token minted for one client is accepted by the gateway on behalf of any other.
 
-That is acceptable *only* because of what this service is. The gateway is not the party a token is addressed to — it is a pass-through, and the downstream resource server re-verifies independently. It would stop being acceptable the moment GateKeeper made any decision that depended on which client a token was issued to. The M4 rules do not: they read the scopes a token was granted, never the client it was granted to. Recorded here so that if it changes, it changes deliberately rather than by inheritance.
+That is acceptable *only* because of what the gateway decides and what it leaves downstream. AuthCore leaves `aud` at Spring Authorization Server's default, the id of the client the token was issued to, so it names a client rather than this service. The downstream resource server still re-verifies the signature, issuer and expiry independently, and checks the user's permissions itself. The gateway's own decisions — the M4 scope rules — read the scopes AuthCore granted to the token, and AuthCore grants scopes per client: a token can only carry what its *client application* was granted. Checking which client that was would add nothing to those rules. It would stop being acceptable the moment GateKeeper made a decision that depended on the client's identity itself — admitting some clients and not others — rather than on what the client was granted. Recorded here so that if it changes, it changes deliberately rather than by inheritance.
 
 ---
 
@@ -222,7 +222,7 @@ Each row is there for a reason.
 - **Accounts is authenticated only, deliberately.** AuthCore's real checks there depend on the request's arguments — `@PreAuthorize` against the owner in the path, `hasRole('ADMIN')` — which a route rule cannot see, so AuthCore decides per endpoint. This is why `/api/accounts/**` and `/api/machine/**` are separate routes: a scope rule attaches to the machine route without forcing a hollow one onto accounts.
 - **Machine mirrors AuthCore's own two URL rules.** The edge refuses one hop earlier what AuthCore would refuse anyway. One `SCOPE_*` authority covers a client-credentials token and an API key alike, with no branching on the mechanism.
 - **Ledger requires a JWT.** ledger-service is a JWT-only resource server, so an API key could only ever get its `401`. The gateway refuses the key with a `403` instead, and strips `X-API-Key` from everything it forwards to ledger.
-- **HEAD, PUT, DELETE and OPTIONS on machine and ledger are refused**, because no downstream serves them there. No CORS is configured, so a browser client would need a preflight rule of its own.
+- **HEAD, PUT, PATCH, DELETE and OPTIONS on machine and ledger are refused**, because no downstream serves them there. No CORS is configured, so a browser client would need a preflight rule of its own.
 - **`GET /api/ledger/whoami` needs `payments:read`** like any other ledger read. A token with only `openid profile` is refused there.
 
 ### The edge checks scope, the downstream checks permission
@@ -231,7 +231,7 @@ Two vocabularies are in play. A **scope** — the token's `scope` claim, or an A
 
 Two consequences follow, and both are intended:
 
-- **Users signed in through `authcore-spa` are read-only on ledger through the gateway.** That client can only ever be granted `payments:read`. Before M4 an ADMIN signed in through it could write ledger entries, because ledger-service checks only the user's permission. The edge now enforces what the client was actually granted — and this is the one check with no counterpart downstream.
+- **Users signed in through `authcore-spa` are read-only on ledger through the gateway.** That client can only ever be granted `payments:read`. ledger-service enforces the user's permission but not the client's scope, so before M4 a user holding `payments:write` — an `acme` ADMIN, say — could write ledger entries through the gateway from that client, and still can by calling ledger-service directly. The gateway now refuses that write with `MISSING_SCOPE`. Whether ledger-service should also enforce scope is an open decision, recorded in the handoff (§5).
 - **A client-credentials token with `payments:write` passes the edge on a ledger `POST`, and ledger-service then refuses it**, because the token carries no permissions. The edge checked the client's grant; ledger checked the user's, and there is no user.
 
 ### The tenant check
@@ -386,7 +386,7 @@ The failure mode these share is what makes them dangerous: **a blocking call ins
 
 | Class | Tests | Covers |
 |---|---|---|
-| `RouteScopeAuthorizationManagerTest` | 40 | Every row of the rule table against a JWT and an API key, with and without the scope; PUT, PATCH, DELETE, HEAD and OPTIONS on machine and ledger; unknown paths. Each case asserts the specific reason, not merely "denied". A permission never stands in for a scope; an anonymous or unverified caller is denied without a reason |
+| `RouteScopeAuthorizationManagerTest` | 40 | Every row of the rule table against a JWT and an API key, with and without the scope; PUT, DELETE, HEAD and OPTIONS on both, and PATCH on ledger; unknown paths. Each case asserts the specific reason, not merely "denied". A permission never stands in for a scope; an anonymous or unverified caller is denied without a reason |
 | `TenantAuthorizationManagerTest` | 19 | Header and query, matching and mismatched; two headers, a comma-joined value, a blank, the wrong case, an encoded value; tenant-less tokens and API keys never checked; a missing scope *and* a wrong tenant reports the scope |
 | `AuthorizationTest` | 15 | End to end through WireMock: the acceptance criteria, API keys on ledger (`403`, or `401` when the key is invalid) and on machine, `X-API-Key` stripped from ledger, deny by default, a traversal path refused by the firewall, an anonymous caller still `401`. Every `403` also asserts the downstream received nothing |
 
@@ -400,7 +400,7 @@ The failure mode these share is what makes them dangerous: **a blocking call ins
 
 Current run, with Redis up: `Tests run: 151, Failures: 0, Errors: 0, Skipped: 0`.
 
-The M4 tests were checked by mutation — each change below was made on purpose, and each made its named tests fail: removing the tenant wrapper fails both cross-tenant tests; letting API keys onto the ledger rule fails the key-on-ledger test; replacing deny-by-default with `authenticated()` fails the three unknown-path tests; removing the `exceptionHandling` wiring fails every `403`-shape test for JWT and key callers alike; removing `RemoveRequestHeader` fails the header test; reading only the header for the tenant fails the query tests.
+The M4 tests were checked by mutation — each change below was made on purpose, and each made its named tests fail: removing the tenant wrapper fails both cross-tenant tests; letting API keys onto the ledger rule fails the key-on-ledger test; replacing deny-by-default with `authenticated()` fails the three deny-by-default tests; removing the `exceptionHandling` wiring fails every `403`-shape test for JWT and key callers alike; removing `RemoveRequestHeader` fails the header test; reading only the header for the tenant fails the query tests.
 
 Five of these are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
 
@@ -444,7 +444,7 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 
 - ~~**No unified error shape.**~~ **Fixed.** `GlobalErrorWebExceptionHandler` renders one JSON shape — `error`, `status`, `path` — whichever layer refused the request, and ledger-service matches it one hop downstream. `ErrorShapeTest` pins it.
 
-- **Audience is not validated**, as described under [Authentication](#authentication). Safe for a pass-through; not safe for a gateway that makes per-client decisions.
+- **Audience is not validated**, as described under [Authentication](#authentication). Safe while the gateway's decisions read only the scopes a client was granted; not safe for a gateway that admits or refuses clients by identity.
 
 - **Downstream URIs are static configuration.** Two hardcoded `localhost` URLs, no service discovery, no health-aware load balancing. Fine for a single-instance local platform, insufficient for more than one instance of anything.
 

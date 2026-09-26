@@ -19,9 +19,9 @@ verified by mutation and against the three live services.
 | [gatekeeper](https://github.com/ezat141/gatekeeper) | `106c3db` — M4's last code merge; the documentation merge follows it | 151 | public |
 
 All three clean, and all three counts confirmed by running the suites. AuthCore and ledger-service
-were not changed by M4. AuthCore's run takes over ten
-minutes — every test class starts its own Spring context against Testcontainers, at roughly 45 seconds
-each — so give it a generous timeout or run it in the background rather than assume it has hung.
+were not changed by M4. AuthCore's run takes over ten minutes — every test class starts its own
+Spring context against Testcontainers, at roughly 45 seconds each — so give it a generous timeout or
+run it in the background rather than assume it has hung.
 
 **GateKeeper's suite requires Redis.** Without it, 19 tests fail and 4 error on Redis connection
 failures, which reads like a regression and is not one. Start it first: `docker compose up -d redis`
@@ -218,6 +218,13 @@ has none.
   none. The gateway forwards cookies and AuthCore refuses the mismatch itself, so it is not an
   escalation. Stripping `Cookie` on the two AuthCore routes would close it at the edge — a behaviour
   change left undecided (M4 design, section 5).
+- **ledger-service, the repo owner to decide which way — it does not enforce client scope.** Its `AuthCoreAuthoritiesConverter` Javadoc
+  (`ledger-service/src/main/java/com/ledger/config/AuthCoreAuthoritiesConverter.java`) says "scope
+  stays the client's delegated ceiling, while roles and permissions describe the user. A request is
+  only permitted when both agree", but no ledger rule reads a `SCOPE_*` authority —
+  `POST /ledger/entries` checks only the `payments:write` permission. Since M4 the gateway enforces the
+  scope on ledger routes, so a direct call to ledger is the one path where a client's grant is not
+  enforced. Either ledger should enforce scope too, or that Javadoc is wrong.
 - **Whoever configures trusted proxies — the subdomain stays out of reach only while
   `spring.cloud.gateway.server.webflux.trusted-proxies` is unset.** With it set, the client's host
   travels on as `X-Forwarded-Host`, and if AuthCore ever runs with a forward-headers strategy the
