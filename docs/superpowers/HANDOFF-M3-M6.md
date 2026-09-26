@@ -16,7 +16,7 @@ verified by mutation and against the three live services.
 |---|---|---|---|
 | [authcore](https://github.com/ezat141/authcore) | `4f0a228` | 78 | public |
 | [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
-| [gatekeeper](https://github.com/ezat141/gatekeeper) | `106c3db` is the last code merge; M4's documentation was merged after it | 151 | public |
+| [gatekeeper](https://github.com/ezat141/gatekeeper) | `003583c` — M4 complete, its final-review cleanup included | 151 | public |
 
 All three clean, and all three counts confirmed by running the suites. AuthCore and ledger-service
 were not changed by M4. AuthCore's run takes over ten minutes — every test class starts its own
