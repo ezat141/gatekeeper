@@ -1,10 +1,10 @@
 # GateKeeper
 
-A reactive API gateway on Spring Cloud Gateway 5 and Netty, sitting in front of the AuthCore platform. It terminates unauthenticated traffic at the edge and routes what survives to the service that owns the data.
+A reactive API gateway on Spring Cloud Gateway 5 and Netty, sitting in front of the AuthCore platform. It terminates unauthenticated and out-of-scope traffic at the edge and routes what survives to the service that owns the data.
 
 GateKeeper is the middle service of three. **AuthCore** (`:8080`) authenticates users and issues RS256-signed JWTs. **ledger-service** (`:8082`) owns ledger data and decides, per request, who may read or change it. This service (`:8081`) is the front door: it verifies that a request carries a genuine credential from AuthCore — an unexpired token or an API key — checks that the credential was granted the scope the route requires, and forwards it to the right downstream at the right path.
 
-The thing worth understanding before anything else: **the gateway is a coarse first layer, not the security boundary.** It refuses traffic that obviously does not belong, which keeps unauthenticated and out-of-scope load off the services behind it. It decides which routes a caller may reach and with which scope, never what the caller may do with the data behind them, and nothing downstream takes its word for anything — ledger-service re-verifies every token against AuthCore's JWKS itself and enforces its own tenant and permission rules whether or not the gateway is in the path.
+The thing worth understanding before anything else: **the gateway is a coarse first layer, not the security boundary.** It refuses traffic that obviously does not belong, which keeps unauthenticated and out-of-scope load off the services behind it. Nothing downstream takes its word for anything — ledger-service re-verifies every token against AuthCore's JWKS itself and enforces its own tenant and permission rules whether or not the gateway is in the path.
 
 That division is the whole design. A gateway that owns authorization becomes a single point of failure whose compromise unlocks everything behind it. This one enforces coarse, route-level authorization as defence in depth — **scope at the edge, permission and data ownership downstream** — and owns none of the decisions that matter to the data. Removing it costs a layer, not the boundary: the one check that exists only here is whether the *client application* was granted the scope for a ledger call, described under [Authorization at the edge](#authorization-at-the-edge).
 
@@ -145,7 +145,7 @@ Two things in that diagram are load-bearing.
 
 **The strip and the stamp sit on opposite sides of the security chain**, which is why they are two classes rather than one. Stripping has to happen before authentication, on the untouched request, so that no forged header survives into an error path. Stamping cannot happen until after, because the verified `Jwt` does not exist any earlier. No single filter position satisfies both.
 
-**The dashed line from the client straight to ledger-service is a supported path, not a gap.** ledger-service verifies tokens against AuthCore's JWKS on its own and enforces its own tenant and permission rules, so bypassing this gateway gets a caller past none of them. It does skip one check: ledger-service enforces the user's permission but not the client's scope, so a user who holds `payments:write` but signed in through a client granted only `payments:read` — the seeded `authcore-spa` — is refused a ledger write at the gateway and not when calling ledger-service directly. Whether ledger-service should also enforce scope is an open decision, recorded in the handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5). See [Authorization at the edge](#authorization-at-the-edge).
+**The dashed line from the client straight to ledger-service is a supported path.** Bypassing the gateway gets a caller past none of ledger-service's tenant and permission rules, but it does skip the edge's client-scope check — see [below](#scope-and-permission-who-checks-which).
 
 ---
 
@@ -163,7 +163,7 @@ The asymmetry is the interesting part, and it is deliberate. The gateway namespa
 
 Getting this backwards fails in a way that is annoying to diagnose: a stripped AuthCore route produces a `404` from AuthCore rather than an error from the gateway, so the gateway looks fine and the downstream looks broken. Three of the four routing tests exist to pin exactly this — `StripPrefix` must apply to the ledger route and must not apply to the other two.
 
-A path matching no predicate is not forwarded anywhere, and since M4 it never reaches routing: no rule in the [authorization table](#authorization-at-the-edge) covers it, so an authenticated caller gets `403` and an anonymous one `401`. It used to be a `404` from the gateway itself.
+An unmatched path never reaches routing; see [Deny by default](#deny-by-default).
 
 ---
 
@@ -197,9 +197,9 @@ Trust is anchored on AuthCore's JWKS rather than a public key copied into config
 
 `JwtValidators.createDefaultWithIssuer(issuer)` composes `X509CertificateThumbprintValidator`, `JwtTimestampValidator` (so `exp`, and `nbf` when present), `JwtTypeValidator`, and a `JwtIssuerValidator` built from the pinned issuer.
 
-**Audience is not validated.** AuthCore emits `aud`, and nothing here checks it, so a token minted for one client is accepted by the gateway on behalf of any other.
+**Audience is not validated.** AuthCore emits `aud`, and nothing here checks it, so a token issued to any AuthCore client is accepted here.
 
-That is acceptable *only* because of what the gateway decides and what it leaves downstream. AuthCore leaves `aud` at Spring Authorization Server's default, the id of the client the token was issued to, so it names a client rather than this service. The downstream resource server still re-verifies the signature, issuer and expiry independently, and checks the user's permissions itself. The gateway's own decisions — the M4 scope rules — read the scopes AuthCore granted to the token, and AuthCore grants scopes per client: a token can only carry what its *client application* was granted. Checking which client that was would add nothing to those rules. It would stop being acceptable the moment GateKeeper made a decision that depended on the client's identity itself — admitting some clients and not others — rather than on what the client was granted. Recorded here so that if it changes, it changes deliberately rather than by inheritance.
+That is acceptable *only* because of what the gateway decides and what it leaves downstream. AuthCore leaves `aud` at Spring Authorization Server's default, the id of the client the token was issued to, so it names a client rather than this service. The downstream resource server still re-verifies the signature, issuer and expiry independently, and checks the user's permissions itself. The gateway's own decisions — the M4 scope rules — read the scopes AuthCore granted to the token, and AuthCore grants scopes per client: a token can only carry what its *client application* was granted. Checking which client that was would add nothing to those rules. It would stop being acceptable the moment GateKeeper admitted or limited clients by their identity rather than by what they were granted — per-client rate limiting would be exactly that — or if AuthCore began issuing the same scope names for another resource server, so that a scope granted for one audience would pass here. Recorded here so that if it changes, it changes deliberately rather than by inheritance.
 
 ---
 
@@ -225,13 +225,13 @@ Each row is there for a reason.
 - **HEAD, PUT, PATCH, DELETE and OPTIONS on machine and ledger are refused**, because no downstream serves them there. No CORS is configured, so a browser client would need a preflight rule of its own.
 - **`GET /api/ledger/whoami` needs `payments:read`** like any other ledger read. A token with only `openid profile` is refused there.
 
-### The edge checks scope, the downstream checks permission
+### Scope and permission: who checks which
 
-Two vocabularies are in play. A **scope** — the token's `scope` claim, or an API key's scopes — is what the *client application* was granted on the user's behalf. A **permission** — the `permissions` claim — is what the *user* may do, derived from their roles and present only on user tokens. The gateway reads scopes only; AuthCore and ledger-service check permissions. Each check is made where the information that justifies it lives.
+Two vocabularies are in play. A **scope** — the token's `scope` claim, or an API key's scopes — is what the *client application* was granted on the user's behalf. A **permission** — the `permissions` claim — is what the *user* may do, derived from their roles and present only on user tokens. The gateway reads scopes only. ledger-service checks permissions only. AuthCore checks both: scopes on its machine routes, permissions and roles on its accounts endpoints. Each check is made where the information that justifies it lives.
 
-Two consequences follow, and both are intended:
+Two consequences follow:
 
-- **Users signed in through `authcore-spa` are read-only on ledger through the gateway.** That client can only ever be granted `payments:read`. ledger-service enforces the user's permission but not the client's scope, so before M4 a user holding `payments:write` — an `acme` ADMIN, say — could write ledger entries through the gateway from that client, and still can by calling ledger-service directly. The gateway now refuses that write with `MISSING_SCOPE`. Whether ledger-service should also enforce scope is an open decision, recorded in the handoff (§5).
+- **Users signed in through `authcore-spa` are read-only on ledger through the gateway, as intended.** That client can only ever be granted `payments:read`. ledger-service enforces the user's permission but not the client's scope, so before M4 a user holding `payments:write` — an `acme` ADMIN, say — could write ledger entries through the gateway from that client, and still can by calling ledger-service directly. The gateway now refuses that write with `MISSING_SCOPE`. Whether ledger-service should also enforce scope is an open decision, recorded in the handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5).
 - **A client-credentials token with `payments:write` passes the edge on a ledger `POST`, and ledger-service then refuses it**, because the token carries no permissions. The edge checked the client's grant; ledger checked the user's, and there is no user.
 
 ### The tenant check
@@ -279,7 +279,7 @@ When a `403` comes back, the body says who answered. The gateway's carries one o
 
 ### Deny by default
 
-The table's last rule matches every request and refuses it with `NO_RULE`. A route added later without a rule of its own therefore fails closed, rather than open to every authenticated caller. The price is that **an authenticated caller's typo now reads `403`, not `404`** — less helpful, and deliberate. An anonymous caller on the same path still gets `401`.
+The table's last rule matches every request and refuses it with `NO_RULE`. A route added later without a rule of its own therefore fails closed, rather than open to every authenticated caller. The price is that **an authenticated caller's typo now reads `403`, not `404`** — less helpful, and deliberate.
 
 Order is load-bearing: a rule inserted above an overlapping one silently shadows it. `RouteScopeAuthorizationManagerTest` pins the whole table, row by row, so a reordering that changes an outcome fails.
 
@@ -400,9 +400,7 @@ The failure mode these share is what makes them dangerous: **a blocking call ins
 
 Current run, with Redis up: `Tests run: 151, Failures: 0, Errors: 0, Skipped: 0`.
 
-The M4 tests were checked by mutation — each change below was made on purpose, and each made its named tests fail: removing the tenant wrapper fails both cross-tenant tests; letting API keys onto the ledger rule fails the key-on-ledger test; replacing deny-by-default with `authenticated()` fails the three deny-by-default tests; removing the `exceptionHandling` wiring fails every `403`-shape test for JWT and key callers alike; removing `RemoveRequestHeader` fails the header test; reading only the header for the tenant fails the query tests.
-
-Five of these are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
+Five earlier tests are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
 
 **`onlyOneSecurityChainIsInPlay`** asserts there is exactly one `SecurityWebFilterChain` bean. Two chains do not conflict loudly — Spring starts cleanly and `WebFilterChainProxy` silently takes the first that matches. A leftover test-scoped permit-all chain would therefore never announce itself; it would just quietly disable authentication for the whole suite. This test says out loud what would otherwise be invisible.
 
@@ -422,6 +420,8 @@ assertThat(authCore.findAll(getRequestedFor(urlEqualTo("/oauth2/jwks"))))
 Nimbus throws on an empty candidate-key list whether or not a refetch was attempted, so asserting only the status code would pass just as happily against an implementation with refresh-on-miss removed — and removing it would silently break key rotation, which is the entire reason this service trusts a JWKS URL instead of a copied key. The test has to watch for the refetch rather than infer it from the outcome.
 
 **`stripsASpoofedHeaderTheStampFilterWouldNotOverwrite`** exists because the four obvious anti-spoofing tests are all blind. Delete `InboundHeaderStripFilter` entirely and they keep passing — `IdentityStampFilter` calls `headers.set(...)`, which replaces a forged value case-insensitively whether or not anything stripped it first. The one case stamping cannot mask is a claim the token does not carry: a client-credentials token has no `tenant`, so the stamp filter's `if (tenant != null)` guard skips that header and leaves whatever the client sent. That is the only scenario where a spoofed header would actually reach a downstream, and it is therefore the only test that fails when the strip filter is removed — verified by deleting the file and watching precisely one of the five go red.
+
+The M4 tests were checked the same way — each change below was made on purpose, and each made its named tests fail: removing the tenant wrapper fails both cross-tenant tests; letting API keys onto the ledger rule fails the key-on-ledger test; replacing deny-by-default with `authenticated()` fails the three deny-by-default tests; removing the `exceptionHandling` wiring fails every `403`-shape test for JWT and key callers alike; removing `RemoveRequestHeader` fails the header test; reading only the header for the tenant fails the query tests.
 
 ---
 

@@ -53,6 +53,14 @@ The gateway today derives only `SCOPE_*` authorities from a JWT (Spring's defaul
 made API-key scopes the same `SCOPE_*` shape. M4 keeps it that way: **the edge checks scope, the
 downstream checks permission.** Each check is made where the information that justifies it lives.
 
+**This revisits the audience rationale.** The M0–M2 design (section 9, "What the default validator
+does and does not check") accepted an unvalidated `aud` because the gateway was a pass-through and
+the downstream re-verified. M4 ended that: the edge now makes a decision ledger-service does not
+repeat — the client's scope. Audience stays unvalidated for a different reason: the edge's decisions
+read only scopes, and AuthCore grants scopes per client, so the client a token was issued to adds
+nothing to them. M5 must revisit this if it keys rate limits by client, because that is a decision
+by client identity.
+
 ---
 
 ## 3. Decision: no path carries a tenant

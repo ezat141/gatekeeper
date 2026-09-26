@@ -16,7 +16,7 @@ verified by mutation and against the three live services.
 |---|---|---|---|
 | [authcore](https://github.com/ezat141/authcore) | `4f0a228` | 78 | public |
 | [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
-| [gatekeeper](https://github.com/ezat141/gatekeeper) | `106c3db` — M4's last code merge; the documentation merge follows it | 151 | public |
+| [gatekeeper](https://github.com/ezat141/gatekeeper) | `106c3db` is the last code merge; M4's documentation was merged after it | 151 | public |
 
 All three clean, and all three counts confirmed by running the suites. AuthCore and ledger-service
 were not changed by M4. AuthCore's run takes over ten minutes — every test class starts its own
@@ -37,7 +37,8 @@ subject of a key caller.
 
 Authorization is an ordered rule table (`RouteScopeAuthorizationManager`): accounts authenticated
 only, machine `SCOPE_payments:read` / `:write` by method, ledger a JWT *and* the scope, anything else
-refused. The edge checks scope; the downstreams check permission. `TenantAuthorizationManager` wraps
+refused. The gateway reads scopes only; ledger-service checks permissions only; AuthCore checks both
+(scopes on its machine routes, permissions and roles on accounts). `TenantAuthorizationManager` wraps
 the table: every `X-Tenant` value and every `tenant` query value must equal the JWT's `tenant` claim
 exactly, and tenant-less callers — client-credentials tokens and all API keys — are never checked. A
 refusal is a 403 in the platform shape plus one of four fixed `detail` strings, with no
@@ -47,7 +48,12 @@ design (`specs/2026-09-26-gatekeeper-m4-design.md`) is the reference for all of 
 **Next: M5.** Read the M4 design before designing it, sections 4 and 5 especially. Rate limiting keyed
 by tenant or client inherits M4's picture of who carries what: a user token has a `tenant`, while a
 client-credentials token and every API key have none, so a tenant key needs a rule for tenant-less
-callers — the same question M4 had to answer for its tenant check.
+callers — the same question M4 had to answer for its tenant check. Keying by client means reading the
+token's `aud` (Spring Authorization Server's default: the client id; access tokens carry no
+`client_id` claim). The README's audience rationale is safe only while the gateway never decides by
+client identity — per-client rate limiting is exactly that, so decide audience validation in the M5
+design. Any endpoint M5 adds needs its own row in `RouteScopeAuthorizationManager`, or it is refused
+`NO_RULE`.
 
 Design and plan documents are in `docs/superpowers/specs/` and `docs/superpowers/plans/`. Milestone
 scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up.
@@ -218,13 +224,24 @@ has none.
   none. The gateway forwards cookies and AuthCore refuses the mismatch itself, so it is not an
   escalation. Stripping `Cookie` on the two AuthCore routes would close it at the edge — a behaviour
   change left undecided (M4 design, section 5).
-- **ledger-service, the repo owner to decide which way — it does not enforce client scope.** Its `AuthCoreAuthoritiesConverter` Javadoc
+- **ledger-service, the repo owner to decide which way — it does not enforce client scope.** Its
+  `AuthCoreAuthoritiesConverter` Javadoc
   (`ledger-service/src/main/java/com/ledger/config/AuthCoreAuthoritiesConverter.java`) says "scope
   stays the client's delegated ceiling, while roles and permissions describe the user. A request is
   only permitted when both agree", but no ledger rule reads a `SCOPE_*` authority —
-  `POST /ledger/entries` checks only the `payments:write` permission. Since M4 the gateway enforces the
-  scope on ledger routes, so a direct call to ledger is the one path where a client's grant is not
+  `POST /ledger/entries` checks only the `payments:write` permission. Since M4 the gateway enforces
+  the scope on ledger routes, so a direct call to ledger is the one path where a client's grant is not
   enforced. Either ledger should enforce scope too, or that Javadoc is wrong.
+- **AuthCore (token typing), with the gateway able to act — OIDC ID tokens may authenticate as bearer
+  tokens. Not verified live.** Spring Authorization Server issues ID and access tokens with the same
+  issuer, key and `aud` (the client id), and sets no distinct `typ` such as `at+jwt`; the gateway's
+  default `JwtTypeValidator` accepts `JWT` or no `typ` at all. So an ID token would pass the gateway's
+  decoder. It carries no `scope`, so every scope rule refuses it, and no `tenant` (AuthCore's
+  customizer writes that to access tokens only), so the tenant check never applies — but the
+  authenticated-only rules (`/api/accounts/**`, `/actuator/info`) would admit it. Read from the
+  Spring Authorization Server 7.1.0 and Spring Security 7.0.6 bytecode and AuthCore's
+  `AuthCoreTokenCustomizer`, not by sending an ID token. The fix belongs in AuthCore's token typing;
+  the gateway could also refuse tokens that carry no `scope`, if wanted.
 - **Whoever configures trusted proxies — the subdomain stays out of reach only while
   `spring.cloud.gateway.server.webflux.trusted-proxies` is unset.** With it set, the client's host
   travels on as `X-Forwarded-Host`, and if AuthCore ever runs with a forward-headers strategy the
@@ -250,7 +267,8 @@ has none.
 Every task got a `feature/task-N` branch off `master`, merged back with `git merge --no-ff` so the
 topology stays visible on GitHub. Two reviews per task — spec compliance first, then code quality —
 each by an independent agent explicitly told **not to trust the implementer's report**, followed by
-fix-and-re-review loops until clean.
+fix-and-re-review loops until clean. M4 used `feature/m4-task-N` because the `feature/task-N` names
+from M0–M3 still exist; M5 should use `feature/m5-task-N`.
 
 Roughly a dozen genuine defects surfaced this way, and **almost every one originated in the plan
 rather than in the implementation.** Two techniques did most of the work:

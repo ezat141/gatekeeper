@@ -252,7 +252,7 @@ before authentication, so none of this is spoofable.
 | `/api/accounts/**` | AuthCore | Authenticates; individual endpoints may still refuse on their own `@PreAuthorize` |
 | `/api/ledger/**` | ledger-service | **403 at the gateway** since M4 — see the M4 design, section 4 |
 
-The ledger 401 is the honest cost of not exchanging credentials (§3). API keys exist for machine callers
+The ledger refusal was the honest cost of not exchanging credentials (§3). API keys exist for machine callers
 hitting the machine route; this is documented, not defective. M4 moved this refusal to the edge, where
 it is a 403 naming the reason, and stopped forwarding the key to ledger at all.
 
