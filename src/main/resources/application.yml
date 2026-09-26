@@ -28,6 +28,12 @@ spring:
                 - Path=/api/ledger/**
               filters:
                 - StripPrefix=1
+                # ledger-service is JWT-only, and a key caller is refused before reaching it
+                # (RouteScopeAuthorizationManager). What remains is a JWT caller sending a
+                # blank X-API-Key, which would otherwise be forwarded to a service that can do
+                # nothing with it. The AuthCore routes keep the header: AuthCore
+                # re-authenticates the key itself.
+                - RemoveRequestHeader=X-API-Key
   data:
     redis:
       host: localhost

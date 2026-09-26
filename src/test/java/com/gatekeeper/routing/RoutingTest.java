@@ -15,9 +15,11 @@ import org.springframework.test.web.reactive.server.WebTestClient;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Map;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
@@ -25,9 +27,9 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 
 /**
- * The gateway authenticates every request now (Task 9), so these assertions carry a valid
- * bearer token throughout and are purely about whether an authenticated request reaches the
- * right downstream at the right path.
+ * The gateway authenticates and authorizes every request, so these assertions carry a valid
+ * bearer token with the scope each route requires, and are purely about whether a permitted
+ * request reaches the right downstream at the right path.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @AutoConfigureWebTestClient
@@ -69,7 +71,8 @@ class RoutingTest {
 
     private static String bearerToken() {
         return "Bearer " + key.mint("http://localhost:8080", "ezzat",
-                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of("tenant", "acme"));
+                Instant.now().plus(5, ChronoUnit.MINUTES),
+                Map.of("tenant", "acme", "scope", List.of("payments:read")));
     }
 
     /**
@@ -102,11 +105,15 @@ class RoutingTest {
         downstream.verify(getRequestedFor(urlEqualTo("/api/machine/payments")));
     }
 
-    /** A path matching no route predicate must not reach any downstream. */
+    /**
+     * A path matching no route is refused before routing ever runs: the rule table denies by
+     * default (M4). It used to reach routing and answer 404; either way, no downstream sees it.
+     */
     @Test
-    void doesNotRouteAnUnmatchedPath() {
+    void refusesAnUnmatchedPathBeforeRouting() {
         client.get().uri("/api/unknown/thing")
                 .header(HttpHeaders.AUTHORIZATION, bearerToken())
-                .exchange().expectStatus().isNotFound();
+                .exchange().expectStatus().isForbidden();
+        downstream.verify(0, anyRequestedFor(urlEqualTo("/api/unknown/thing")));
     }
 }

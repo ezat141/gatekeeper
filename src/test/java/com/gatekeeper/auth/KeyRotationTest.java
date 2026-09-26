@@ -15,6 +15,7 @@ import org.springframework.test.web.reactive.server.WebTestClient;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Map;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
@@ -72,7 +73,8 @@ class KeyRotationTest {
 
     private WebTestClient.ResponseSpec callWith(TestKey key) {
         String token = key.mint(ISSUER, "ezzat",
-                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of("tenant", "acme"));
+                Instant.now().plus(5, ChronoUnit.MINUTES),
+                Map.of("tenant", "acme", "scope", List.of("payments:read")));
         return client.get().uri("/api/ledger/entries")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange();

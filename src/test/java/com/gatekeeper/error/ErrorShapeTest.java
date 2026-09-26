@@ -95,7 +95,8 @@ class ErrorShapeTest {
     void rendersAClaimWithAControlCharacterAsUnauthorizedNotServerError() {
         String token = activeKey.mint(ISSUER, "ezzat",
                 Instant.now().plus(5, ChronoUnit.MINUTES),
-                Map.of("tenant", "acme", "permissions", List.of("evil\r\nX-Injected: yes")));
+                Map.of("tenant", "acme", "scope", List.of("payments:read"),
+                        "permissions", List.of("evil\r\nX-Injected: yes")));
 
         client.get().uri("/api/ledger/entries")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)

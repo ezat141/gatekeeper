@@ -52,6 +52,8 @@ class IdentityPropagationTest {
                 .willReturn(okJson(TestKey.jwksDocument(activeKey))));
         downstream.stubFor(get(urlEqualTo("/ledger/entries"))
                 .willReturn(aResponse().withStatus(200).withBody("[]")));
+        downstream.stubFor(get(urlEqualTo("/api/machine/payments"))
+                .willReturn(aResponse().withStatus(200).withBody("[]")));
         // Catch-all, lower priority than the per-test stubActiveKey() stubs below: any key
         // this class never explicitly marked active reads as inactive, matching how AuthCore
         // answers for unknown, disabled and expired keys alike.
@@ -77,7 +79,7 @@ class IdentityPropagationTest {
 
     private static String tokenFor(String subject, String tenant, List<String> permissions) {
         return activeKey.mint(ISSUER, subject, Instant.now().plus(5, ChronoUnit.MINUTES),
-                Map.of("tenant", tenant, "permissions", permissions));
+                Map.of("tenant", tenant, "permissions", permissions, "scope", List.of("payments:read")));
     }
 
     /** The ordinary case: verified claims arrive downstream as headers. */
@@ -153,7 +155,7 @@ class IdentityPropagationTest {
         downstream.resetRequests();
 
         String machineToken = activeKey.mint(ISSUER, "authcore-machine",
-                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of());
+                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of("scope", List.of("payments:read")));
 
         client.get().uri("/api/ledger/entries")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken)
@@ -181,7 +183,7 @@ class IdentityPropagationTest {
         downstream.resetRequests();
 
         String machineToken = activeKey.mint(ISSUER, "authcore-machine",
-                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of());
+                Instant.now().plus(5, ChronoUnit.MINUTES), Map.of("scope", List.of("payments:read")));
 
         client.get().uri("/api/ledger/entries")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken)
@@ -202,12 +204,12 @@ class IdentityPropagationTest {
         downstream.resetRequests();
         String rawKey = stubActiveKey("reporting");
 
-        client.get().uri("/api/ledger/entries")
+        client.get().uri("/api/machine/payments")
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
                 .exchange()
                 .expectStatus().isOk();
 
-        downstream.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
+        downstream.verify(getRequestedFor(urlEqualTo("/api/machine/payments"))
                 .withHeader("X-GK-Subject", equalTo("apikey:reporting")));
     }
 
@@ -217,12 +219,12 @@ class IdentityPropagationTest {
         downstream.resetRequests();
         String rawKey = stubActiveKey("reporting");
 
-        client.get().uri("/api/ledger/entries")
+        client.get().uri("/api/machine/payments")
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
                 .exchange()
                 .expectStatus().isOk();
 
-        downstream.verify(getRequestedFor(urlEqualTo("/ledger/entries"))
+        downstream.verify(getRequestedFor(urlEqualTo("/api/machine/payments"))
                 .withoutHeader("X-GK-Tenant"));
     }
 
