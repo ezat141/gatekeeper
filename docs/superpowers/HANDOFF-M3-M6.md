@@ -1,42 +1,53 @@
 # GateKeeper M3–M6 — Handoff
 
 Written at the close of M0–M2 so the next session starts productive rather than rediscovering what
-this one learned by failing. Read this before touching code.
+this one learned by failing, and kept current through M4. Read this before touching code.
 
 ---
 
 ## 1. Where things stand
 
-**M0–M3 are complete.** M0–M2 was verified against three live services; M3 (API-key authentication)
-landed across AuthCore and GateKeeper with its own spec and plan, dated 2026-08-24.
+**M0–M4 are complete.** M0–M2 was verified against three live services; M3 (API-key authentication)
+landed across AuthCore and GateKeeper with its own spec and plan, dated 2026-08-24; M4 (route-to-scope
+authorization and the tenant check) was a GateKeeper-only milestone, spec and plan dated 2026-09-26,
+verified by mutation and against the three live services.
 
 | Repo | `master` | Tests | Visibility |
 |---|---|---|---|
 | [authcore](https://github.com/ezat141/authcore) | `4f0a228` | 78 | public |
 | [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
-| [gatekeeper](https://github.com/ezat141/gatekeeper) | `27b988d` | 70 | public |
+| [gatekeeper](https://github.com/ezat141/gatekeeper) | `106c3db` — M4's last code merge; the documentation merge follows it | 151 | public |
 
-All three clean, and all three counts confirmed by running the suites. AuthCore's run takes over ten
+All three clean, and all three counts confirmed by running the suites. AuthCore and ledger-service
+were not changed by M4. AuthCore's run takes over ten
 minutes — every test class starts its own Spring context against Testcontainers, at roughly 45 seconds
 each — so give it a generous timeout or run it in the background rather than assume it has hung.
 
-**GateKeeper's suite now requires Redis.** Without it, 15 tests fail and 4 error on
-`RedisConnectionFailureException`, which reads like a regression and is not one. Start it first:
-`docker compose up -d redis` from the authcore directory.
+**GateKeeper's suite requires Redis.** Without it, 19 tests fail and 4 error on Redis connection
+failures, which reads like a regression and is not one. Start it first: `docker compose up -d redis`
+from the authcore directory.
 
 **GateKeeper today:** three routes (`/api/accounts/**` and `/api/machine/**` to AuthCore with the path
-preserved, `/api/ledger/**` to ledger-service with `StripPrefix=1`). A caller authenticates with
-**either** a bearer JWT, verified against AuthCore's JWKS with the issuer pinned, **or** an
-`X-API-Key`, checked through AuthCore's introspection endpoint and cached in Redis. When AuthCore cannot
-answer an introspection, the gateway says 503 rather than 401. Inbound `X-GK-*` headers are stripped
-before authentication and re-stamped from verified identity afterwards, including the subject of a key
-caller. One JSON error shape. **Still no authorization beyond `anyExchange().authenticated()`** — that
-is M4's job, and M4 now has to answer for key callers as well as token callers.
+preserved, `/api/ledger/**` to ledger-service with `StripPrefix=1` and `X-API-Key` removed). A caller
+authenticates with **either** a bearer JWT, verified against AuthCore's JWKS with the issuer pinned,
+**or** an `X-API-Key`, checked through AuthCore's introspection endpoint and cached in Redis. When
+AuthCore cannot answer an introspection, the gateway says 503 rather than 401. Inbound `X-GK-*` headers
+are stripped before authentication and re-stamped from verified identity afterwards, including the
+subject of a key caller.
 
-**Next: M4.** Read §8 of the M3 spec, "Identity, tenant, and reach"
-(`specs/2026-08-24-gatekeeper-m3-design.md`), before designing it — it records what an API-key
-principal carries and what it may reach, and M4's scope rules have to read exactly that. The same
-spec says outright that scope enforcement was left for M4.
+Authorization is an ordered rule table (`RouteScopeAuthorizationManager`): accounts authenticated
+only, machine `SCOPE_payments:read` / `:write` by method, ledger a JWT *and* the scope, anything else
+refused. The edge checks scope; the downstreams check permission. `TenantAuthorizationManager` wraps
+the table: every `X-Tenant` value and every `tenant` query value must equal the JWT's `tenant` claim
+exactly, and tenant-less callers — client-credentials tokens and all API keys — are never checked. A
+refusal is a 403 in the platform shape plus one of four fixed `detail` strings, with no
+`WWW-Authenticate`; an unauthenticated caller still gets 401 with `WWW-Authenticate: Bearer`. The M4
+design (`specs/2026-09-26-gatekeeper-m4-design.md`) is the reference for all of it.
+
+**Next: M5.** Read the M4 design before designing it, sections 4 and 5 especially. Rate limiting keyed
+by tenant or client inherits M4's picture of who carries what: a user token has a `tenant`, while a
+client-credentials token and every API key have none, so a tenant key needs a rule for tenant-less
+callers — the same question M4 had to answer for its tenant check.
 
 Design and plan documents are in `docs/superpowers/specs/` and `docs/superpowers/plans/`. Milestone
 scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up.
@@ -60,6 +71,10 @@ scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up.
   `docker compose up -d postgres redis` from the authcore directory. It stops often.
 - Heredocs with markdown content fail in this shell often enough that a file-writing tool is the
   saner choice for documents.
+- **User tokens need a browser and PKCE — for the confidential `authcore-client` too.** Log in and
+  consent in a private browser window, then exchange the code with `curl.exe`. Without
+  `code_challenge`, AuthCore refuses `authcore-client`'s authorize request with `invalid_request`,
+  secret or not. The working calls are in the M4 plan, Task 6 Step 2.
 
 ---
 
@@ -160,7 +175,9 @@ is valid is the standard pattern.
 
 **M4 — Route-to-scope authorization and tenant check.** A
 `ReactiveAuthorizationManager<AuthorizationContext>` mapping route to required authority, and refusing
-a token whose `tenant` does not match the requested path. Deny is `403`.
+a token whose `tenant` does not match the requested path. Deny is `403`. **Built.** No routed path
+carries a tenant, so the check compares the `X-Tenant` header and `tenant` query parameter instead —
+the M4 design, section 3, records why.
 
 **M5 — Distributed rate limiting.** `RedisRateLimiter` token bucket keyed by tenant or client, plus a
 daily quota counter with a TTL. `429` with `Retry-After`.
@@ -173,16 +190,40 @@ TTL equal to the token's remaining lifetime. Revoked means `401`.
 
 ## 5. Deferred items these milestones inherit
 
-Found during M0–M2 and recorded rather than fixed. Each names the milestone that owns it.
+Found during M0–M4 and recorded rather than fixed. Each names the milestone that owns it, or says it
+has none.
 
-- **M4 — the 403 path still has the empty-body gap that 401 lost.** The default `accessDeniedHandler`
-  commits its own response, exactly as the default authentication entry point did before Task 13.
-  Unreachable today because no authorization rules exist; M4 makes it live. Wire a JSON access-denied
-  handler reusing `ErrorBody`. ledger-service already has one whose shape is worth copying.
-- **M4 — the two AuthCore routes are separate on purpose.** `authcore-accounts` and `authcore-machine`
-  are distinct routes rather than one combined predicate specifically so a scope rule can attach to
-  the machine route without forcing a hollow one onto the accounts route, whose real checks are
-  argument-dependent and live in AuthCore's own `@PreAuthorize`.
+- ~~**M4 — the 403 path still has the empty-body gap that 401 lost.**~~ **Closed in M4.**
+  `JsonServerAccessDeniedHandler` renders every 403 in the platform shape with a fixed `detail` and no
+  `WWW-Authenticate`, wired once on `exceptionHandling` for JWT and key callers alike — the M4 design,
+  section 7.
+- ~~**M4 — the two AuthCore routes are separate on purpose.**~~ **Closed in M4, used as intended.** The
+  machine route carries scope rules; the accounts route is authenticated only, because its real checks
+  are argument-dependent and live in AuthCore's own `@PreAuthorize` — the M4 design, section 4.
+- ~~**M4 — strip `X-API-Key` from ledger**~~ (deferred by M3 design §13). **Closed in M4.** The ledger
+  route has `RemoveRequestHeader=X-API-Key`, and a key caller is refused 403 before reaching it — the
+  M4 design, section 6.
+- **Unowned — firewall rejections have no JSON body.** Spring Security's default
+  `StrictServerWebExchangeFirewall` refuses `..`, `//`, `%2F`, `;`, `%25` and similar with a bare 400,
+  outside the platform error shape. Pre-existing Spring default; M4 came to depend on the firewall
+  (the rule table and the routes must see the same path) but did not change its response. The natural
+  home is whichever milestone next touches the error shape.
+- **M9 (or sooner, if touched) — duplicate `X-API-Key` headers.** A JWT caller sending `X-API-Key:`
+  (blank) followed by `X-API-Key: <valid key>` authenticates as the JWT, because the converter reads
+  only the first value. On the machine route both values are then forwarded to AuthCore while
+  `X-GK-Subject` names the JWT's subject. Consistent only while AuthCore also reads the first value,
+  which servlet `getHeader` does. Pre-existing since M3.
+- **Unowned, the repo owner's decision — AuthCore's session as a tenant source.** A caller holding an
+  AuthCore `JSESSIONID` cookie can make AuthCore resolve the session's tenant when the request names
+  none. The gateway forwards cookies and AuthCore refuses the mismatch itself, so it is not an
+  escalation. Stripping `Cookie` on the two AuthCore routes would close it at the edge — a behaviour
+  change left undecided (M4 design, section 5).
+- **Whoever configures trusted proxies — the subdomain stays out of reach only while
+  `spring.cloud.gateway.server.webflux.trusted-proxies` is unset.** With it set, the client's host
+  travels on as `X-Forwarded-Host`, and if AuthCore ever runs with a forward-headers strategy the
+  subdomain returns as a tenant source that outranks `X-Tenant` (M4 design, section 5).
+- **AuthCore's concern — its own 403s have an empty body.** Observed in the M4 run. Recorded so nobody
+  assumes the gateway's 403 shape extends past the gateway: a 403 with no body came from AuthCore.
 - **M7 — the JWKS fetch has no response timeout.** Spring Security's `ReactiveRemoteJWKSource` builds
   a bare `WebClient.create()`, so a host that accepts the connection and never answers hangs the
   request rather than failing closed. An active refusal is handled; a silent hang is not.

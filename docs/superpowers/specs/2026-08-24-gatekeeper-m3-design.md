@@ -250,10 +250,11 @@ before authentication, so none of this is spoofable.
 |---|---|---|
 | `/api/machine/**` | AuthCore | Works end-to-end — AuthCore re-authenticates the key itself |
 | `/api/accounts/**` | AuthCore | Authenticates; individual endpoints may still refuse on their own `@PreAuthorize` |
-| `/api/ledger/**` | ledger-service | **401 from ledger** — it is a JWT-only resource server and the caller carries no bearer token |
+| `/api/ledger/**` | ledger-service | **403 at the gateway** since M4 — see the M4 design, section 4 |
 
 The ledger 401 is the honest cost of not exchanging credentials (§3). API keys exist for machine callers
-hitting the machine route; this is documented, not defective.
+hitting the machine route; this is documented, not defective. M4 moved this refusal to the edge, where
+it is a 403 naming the reason, and stopped forwarding the key to ledger at all.
 
 ---
 
@@ -375,7 +376,8 @@ actually happens rather than what this document predicts.
   natural owner. Until then the key is a deployment secret with no online rotation path.
 - **Stripping `X-API-Key` from routes that cannot use it.** Forwarding a credential to ledger-service,
   which can do nothing with it, widens exposure for no benefit. The fix is route-conditional and
-  therefore authorization-shaped, so it belongs with M4's route rules. **Deferred to M4.**
+  therefore authorization-shaped, so it belongs with M4's route rules. **Deferred to M4**, and closed
+  there — see the M4 design, section 6.
 
 ---
 
