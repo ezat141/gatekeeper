@@ -166,12 +166,24 @@ same name, so no individual rule can forget it.
 
 - **The subdomain.** Spring Cloud Gateway replaces the client's `Host` with the downstream's unless a
   route adds `PreserveHostHeader`, and none does, so a client's subdomain never reaches AuthCore. This
-  is an assumption until the run in §9 confirms it.
+  is an assumption until the run in §9 confirms it. It also depends on the gateway stripping
+  `X-Forwarded-*` and `Forwarded`, which Spring Cloud Gateway does only while no trusted proxies are
+  configured: set `spring.cloud.gateway.server.webflux.trusted-proxies` — behind a load balancer, say —
+  and the client's host travels on as `X-Forwarded-Host`, which AuthCore would honour if it ever ran
+  with a forward-headers strategy. The subdomain would then come back as a tenant source that outranks
+  `X-Tenant`.
 - **The request body.** AuthCore's `TenantResolutionFilter` reads the parameter through servlet
   `getParameter` (`TenantResolutionFilter.java:64`), which also parses a form-encoded POST body. The
   gateway does not read bodies at authorization time, so a tenant named in a form body passes the edge.
   **It is not an escalation**: AuthCore's own check compares whatever it resolved with the token and
   refuses a mismatch. The edge check is defence in depth; AuthCore remains the authority for its data.
+- **AuthCore's session.** When a request names no tenant, `TenantResolutionFilter` falls back to the
+  tenant stored in the caller's session before `default`. It never *creates* a session on `/api/**`,
+  but it reads one from any `JSESSIONID` cookie — and a caller who logged in to AuthCore directly has
+  one. The gateway forwards cookies, so a tenant resolved this way passes the edge and is refused by
+  AuthCore's own check, exactly as the form body is. Stripping `Cookie` on the two AuthCore routes would
+  close it at the edge; that is a behaviour change beyond this design and is left as a decision for
+  later.
 
 **Consequence to document:** an `acme` user must still send `X-Tenant: acme` to reach AuthCore, which
 otherwise falls back to `default` and refuses. The gateway does not fix this for them — that was the
