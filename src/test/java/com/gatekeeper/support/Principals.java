@@ -11,8 +11,10 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Authenticated callers exactly as the gateway's two authentication paths produce them, for
- * unit tests that exercise authorization without a Spring context.
+ * Authenticated callers shaped like the ones the gateway's two authentication paths produce —
+ * the same token types and the same {@code SCOPE_*} authorities, which is all the rule table
+ * reads. (The real JWT converter also adds a {@code FACTOR_BEARER} authority, and the key
+ * manager builds a set rather than a list; neither affects a scope check.)
  *
  * <p>Scopes become {@code SCOPE_*} authorities on both kinds of principal. That is what
  * Spring's default {@code JwtGrantedAuthoritiesConverter} derives from a token's {@code scope}

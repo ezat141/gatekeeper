@@ -1,5 +1,6 @@
 package com.gatekeeper.authz;
 
+import com.gatekeeper.apikey.ApiKeyAuthenticationToken;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -8,8 +9,10 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.http.HttpMethod;
 import org.springframework.mock.http.server.reactive.MockServerHttpRequest;
 import org.springframework.mock.web.server.MockServerWebExchange;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
 import org.springframework.security.authorization.AuthorizationResult;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.core.authority.AuthorityUtils;
 import org.springframework.security.web.server.authorization.AuthorizationContext;
 import reactor.core.publisher.Mono;
 
@@ -38,6 +41,7 @@ class RouteScopeAuthorizationManagerTest {
 
     static final String GRANTED = "granted";
     static final String DENIED_WITHOUT_REASON = "denied without a reason";
+    static final String COMPLETED_EMPTY = "completed empty";
 
     private final RouteScopeAuthorizationManager manager = new RouteScopeAuthorizationManager();
 
@@ -79,6 +83,7 @@ class RouteScopeAuthorizationManagerTest {
                 row(GET, "/api/ledger/entries", "key[read]", apiKey("payments:read"), Reason.API_KEY_NOT_ACCEPTED),
                 row(GET, "/api/ledger/entries", "key[]", apiKey(), Reason.API_KEY_NOT_ACCEPTED),
                 row(POST, "/api/ledger/entries", "key[write]", apiKey("payments:write"), Reason.API_KEY_NOT_ACCEPTED),
+                row(POST, "/api/ledger/entries", "key[]", apiKey(), Reason.API_KEY_NOT_ACCEPTED),
                 row(PUT, "/api/ledger/entries", "jwt[read,write]", jwt("payments:read", "payments:write"), Reason.NO_RULE),
                 row(PATCH, "/api/ledger/entries", "jwt[read,write]", jwt("payments:read", "payments:write"), Reason.NO_RULE),
                 row(DELETE, "/api/ledger/entries", "jwt[read,write]", jwt("payments:read", "payments:write"), Reason.NO_RULE),
@@ -122,12 +127,30 @@ class RouteScopeAuthorizationManagerTest {
         assertThat(outcome(GET, "/api/unknown/thing", Mono.empty())).isEqualTo(DENIED_WITHOUT_REASON);
     }
 
+    /**
+     * Only a genuinely authenticated caller satisfies a rule. An anonymous token reports
+     * itself authenticated, and a token straight from a converter does not; neither may pass
+     * even the authenticated-only rules, and neither gets a reason — both belong at the 401.
+     */
+    @Test
+    void deniesAnAnonymousOrUnverifiedTokenWithoutAReason() {
+        Authentication anonymous = new AnonymousAuthenticationToken(
+                "key", "anonymousUser", AuthorityUtils.createAuthorityList("ROLE_ANONYMOUS"));
+        Authentication unverified = new ApiKeyAuthenticationToken("ak_raw_key");
+
+        assertThat(outcome(GET, "/api/accounts/me", Mono.just(anonymous))).isEqualTo(DENIED_WITHOUT_REASON);
+        assertThat(outcome(GET, "/api/accounts/me", Mono.just(unverified))).isEqualTo(DENIED_WITHOUT_REASON);
+    }
+
     private Object outcome(HttpMethod method, String path, Mono<Authentication> caller) {
         AuthorizationContext context = new AuthorizationContext(
                 MockServerWebExchange.from(MockServerHttpRequest.method(method, path)));
         try {
             AuthorizationResult result = manager.authorize(caller, context).block();
-            return result != null && result.isGranted() ? GRANTED : DENIED_WITHOUT_REASON;
+            if (result == null) {
+                return COMPLETED_EMPTY;
+            }
+            return result.isGranted() ? GRANTED : DENIED_WITHOUT_REASON;
         } catch (GatewayAccessDeniedException denied) {
             return denied.reason();
         }

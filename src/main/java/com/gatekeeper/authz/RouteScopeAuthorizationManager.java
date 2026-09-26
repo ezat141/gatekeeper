@@ -1,6 +1,8 @@
 package com.gatekeeper.authz;
 
 import org.springframework.http.HttpMethod;
+import org.springframework.security.authentication.AuthenticationTrustResolver;
+import org.springframework.security.authentication.AuthenticationTrustResolverImpl;
 import org.springframework.security.authorization.AuthorizationDecision;
 import org.springframework.security.authorization.AuthorizationResult;
 import org.springframework.security.authorization.ReactiveAuthorizationManager;
@@ -31,6 +33,13 @@ import static org.springframework.security.web.server.util.matcher.ServerWebExch
  * <p><strong>Rules are evaluated in order; the first match decides.</strong> A rule inserted
  * above an overlapping one silently shadows it, which is why the test pins every row.
  *
+ * <p><strong>The table and the gateway's routes must see the same path.</strong> Both match
+ * the same parsed request path with the same {@code PathPattern} engine, and Spring Security's
+ * default {@code StrictServerWebExchangeFirewall} rejects {@code ..}, encoded slashes and
+ * similar tricks before either runs. Anything that makes them diverge — a relaxed firewall, or
+ * a forwarded prefix turned into a context path by {@code server.forward-headers-strategy} —
+ * would let a request be authorized as one route and forwarded as another.
+ *
  * <p><strong>Deny by default lives in this table</strong>, as its last rule, so that a route
  * added later without a rule fails closed with a reason of its own. Spring's delegating
  * wrapper has a fallback too — a plain {@code false} decision — but the last rule here matches
@@ -38,13 +47,17 @@ import static org.springframework.security.web.server.util.matcher.ServerWebExch
  *
  * <p><strong>A refusal is an error, not a {@code false} decision.</strong> See {@link
  * GatewayAccessDeniedException} for why that is the only way the reason reaches the handler.
- * The one plain {@code false} this class returns is for a caller with no authentication, who
- * is sent to the 401 entry point before any reason could be rendered.
+ * The one plain {@code false} this class returns is for a caller with no authentication, or
+ * only an anonymous one, who is sent to the 401 entry point before any reason could be
+ * rendered.
  */
 public class RouteScopeAuthorizationManager implements ReactiveAuthorizationManager<AuthorizationContext> {
 
     private static final AuthorizationResult GRANTED = new AuthorizationDecision(true);
     private static final AuthorizationResult UNAUTHENTICATED = new AuthorizationDecision(false);
+
+    /** Not anonymous, and authenticated — the same test Spring's own {@code authenticated()} applies. */
+    private static final AuthenticationTrustResolver TRUST_RESOLVER = new AuthenticationTrustResolverImpl();
 
     private static final List<Rule> RULES = List.of(
             new Rule(pathMatchers(HttpMethod.GET, "/actuator/info"), authenticated()),
@@ -67,7 +80,7 @@ public class RouteScopeAuthorizationManager implements ReactiveAuthorizationMana
     public Mono<AuthorizationResult> authorize(Mono<Authentication> authentication, AuthorizationContext context) {
         return firstRuleMatching(context.getExchange())
                 .flatMap(rule -> authentication
-                        .filter(Authentication::isAuthenticated)
+                        .filter(TRUST_RESOLVER::isAuthenticated)
                         .flatMap(caller -> decide(rule.requirement().refusal(caller)))
                         .switchIfEmpty(Mono.just(UNAUTHENTICATED)));
     }
