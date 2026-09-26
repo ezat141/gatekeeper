@@ -209,13 +209,19 @@ an empty body, exactly as the default entry point did before M2 replaced it.
 - **It sets no `WWW-Authenticate` on a `403`.** ledger-service's handler already states this as the
   platform contract, and the two must agree.
 
-**It is wired in two places, and both are tested.**
+**It is wired once, through `exceptionHandling().accessDeniedHandler(...)`, and that one wiring covers
+both kinds of caller.** Without it, the resource server's `BearerTokenServerAccessDeniedHandler` would
+answer for bearer requests with an empty body and `WWW-Authenticate: Bearer
+error="insufficient_scope"` — escaping the shape, and calling a tenant mismatch an insufficient scope,
+which is false.
 
-- `exceptionHandling().accessDeniedHandler(...)` — covers API-key callers.
-- `oauth2ResourceServer().accessDeniedHandler(...)` — the resource server otherwise installs
-  `BearerTokenServerAccessDeniedHandler` for bearer requests, which writes an empty body and
-  `WWW-Authenticate: Bearer error="insufficient_scope"`. Left in place, a JWT caller's `403` would
-  escape the shape — and would call a tenant mismatch an insufficient scope, which is false.
+An earlier draft of this section said the handler also had to be set on
+`oauth2ResourceServer().accessDeniedHandler(...)`. The 7.0.6 bytecode says otherwise:
+`ServerHttpSecurity.getAccessDeniedHandler()` returns the explicitly configured handler whenever one is
+set, and consults the per-mechanism defaults — the resource server's among them — only when none is.
+Setting it in the second place would be dead configuration, and a mutation test removing it could
+never fail. Both a JWT caller and a key caller are still tested, because the single wiring has to be
+shown to reach both.
 
 **`ErrorBody` gains `of(status, path, detail)`**, the overload ledger-service already has. A `403`
 carries one of four fixed strings authored by the gateway, never an exception message:
@@ -268,11 +274,12 @@ degrading to a generic body.
   rule table in §4.
 - **`authz.TenantAuthorizationManager`** — wraps the table; §5.
 - **`authz.GatewayAccessDeniedException`** — `AccessDeniedException` carrying a `Reason`.
-- **`authz.Reason`** — `MISSING_SCOPE`, `API_KEY_NOT_ACCEPTED`, `TENANT_MISMATCH`, `NO_RULE`.
+- **`authz.Reason`** — `MISSING_SCOPE`, `API_KEY_NOT_ACCEPTED`, `TENANT_MISMATCH`, `NO_RULE`, each
+  carrying its own `detail` string, so a reason cannot exist without its wire text.
 - **`error.JsonServerAccessDeniedHandler`** — §7.
 - **`error.ErrorBody`** — gains the `detail` overload.
 - **`config.GatewaySecurityConfig`** — `.anyExchange().access(tenantChecked(routeTable))` after the
-  health `permitAll`; both access-denied wirings. The class comment stops saying authorization is M4's.
+  health `permitAll`; the access-denied handler on `exceptionHandling`. The class comment stops saying authorization is M4's.
 - **`application.yml`** — `RemoveRequestHeader=X-API-Key` on the ledger route.
 
 **No dependencies are added.** Everything above is in `spring-security-web` and `-core` 7.0.6, already
@@ -306,7 +313,8 @@ A test that passes the moment it is written has proven nothing. Each is made to 
 - An API key on ledger is `403` with `API_KEY_NOT_ACCEPTED`'s detail.
 - Deny by default: an authenticated caller on an unknown path is `403`; an anonymous one is still `401`
   with `WWW-Authenticate: Bearer`.
-- The `403` shape through both wirings — once for a JWT caller, once for a key caller.
+- The `403` shape for both kinds of caller — once for a JWT caller, once for a key caller — through
+  the single wiring.
 - `RemoveRequestHeader`: a JWT caller sending a blank `X-API-Key` to ledger — WireMock sees no
   `X-API-Key`.
 - **Existing tests will break**, because `RoutingTest` and others mint tokens without scopes. Every
@@ -320,8 +328,7 @@ A test that passes the moment it is written has proven nothing. Each is made to 
 | Remove the tenant wrapper | the cross-tenant tests |
 | Drop "JWT principal" from the ledger rules | the key-on-ledger test |
 | Replace the final `NO_RULE` rule with `authenticated()` | the unknown-path test |
-| Remove `oauth2ResourceServer().accessDeniedHandler` | the JWT `403`-shape test |
-| Remove the `exceptionHandling` wiring | the key `403`-shape test |
+| Remove the `exceptionHandling` access-denied wiring | the JWT *and* the key `403`-shape tests |
 | Remove `RemoveRequestHeader` | the header test |
 
 **Run it.** Boot AuthCore, ledger-service and GateKeeper and drive `curl.exe`:
