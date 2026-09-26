@@ -149,7 +149,8 @@ public class GatewaySecurityConfig {
      *   <tr><td>absent</td><td>absent</td><td>401</td></tr>
      *   <tr><td>absent</td><td>valid JWT</td><td>JWT path, unchanged from M2</td></tr>
      *   <tr><td>present, valid</td><td>either</td>
-     *       <td>200, authenticated as the key; the bearer token is not consulted</td></tr>
+     *       <td>authenticated as the key; the bearer token is not consulted, and the rule
+     *       table then decides what the key may reach</td></tr>
      *   <tr><td>present, invalid</td><td>either</td>
      *       <td>401 — no fallthrough to the JWT path; this filter's failure handler,
      *       above, gives the refusal the platform's JSON error shape (the 401 itself is

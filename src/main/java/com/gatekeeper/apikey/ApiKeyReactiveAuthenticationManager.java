@@ -22,8 +22,8 @@ import java.util.stream.Collectors;
  * endpoint, and turns its scopes into authorities.
  *
  * <p>Scopes become {@code SCOPE_*}, the shape Spring derives from a JWT's {@code scope}
- * claim. That is the whole composability property: M4 writes one
- * {@code hasAuthority("SCOPE_payments:read")} rule that accepts either credential without
+ * claim. That is the whole composability property: each scope rule in {@code
+ * com.gatekeeper.authz.RouteScopeAuthorizationManager} accepts either credential without
  * branching on how the caller authenticated. AuthCore made the same choice internally.
  */
 public class ApiKeyReactiveAuthenticationManager implements ReactiveAuthenticationManager {

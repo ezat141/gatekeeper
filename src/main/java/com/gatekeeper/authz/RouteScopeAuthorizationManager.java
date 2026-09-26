@@ -47,9 +47,9 @@ import static org.springframework.security.web.server.util.matcher.ServerWebExch
  *
  * <p><strong>A refusal is an error, not a {@code false} decision.</strong> See {@link
  * GatewayAccessDeniedException} for why that is the only way the reason reaches the handler.
- * The one plain {@code false} this class returns is for a caller with no authentication, or
- * only an anonymous one, who is sent to the 401 entry point before any reason could be
- * rendered.
+ * The one plain {@code false} this class returns is for a caller who is not genuinely
+ * authenticated — no authentication, an anonymous one, or an unverified token — and who is
+ * sent to the 401 entry point before any reason could be rendered.
  */
 public class RouteScopeAuthorizationManager implements ReactiveAuthorizationManager<AuthorizationContext> {
 

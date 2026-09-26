@@ -170,7 +170,7 @@ class AuthorizationTest {
     /** The 403 shape for a key caller — the same single wiring as for a bearer caller. */
     @Test
     void refusesAnApiKeyOnTheLedgerRoute() {
-        String rawKey = stubActiveKey("payments:read");
+        String rawKey = stubActiveKeyWithScopes("payments:read");
 
         expectForbidden(client.get().uri("/api/ledger/entries")
                         .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
@@ -182,7 +182,7 @@ class AuthorizationTest {
 
     @Test
     void refusesAnApiKeyWithoutTheWriteScopeOnAMachineWrite() {
-        String rawKey = stubActiveKey("payments:read");
+        String rawKey = stubActiveKeyWithScopes("payments:read");
 
         expectForbidden(client.post().uri("/api/machine/payments")
                         .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
@@ -199,7 +199,7 @@ class AuthorizationTest {
      */
     @Test
     void proxiesAnApiKeyOnTheMachineRouteWithTheKeyStillAttached() {
-        String rawKey = stubActiveKey("payments:read");
+        String rawKey = stubActiveKeyWithScopes("payments:read");
 
         client.get().uri("/api/machine/payments")
                 .header(ApiKeyAuthenticationConverter.HEADER_NAME, rawKey)
@@ -318,7 +318,7 @@ class AuthorizationTest {
     }
 
     /** Registers a fresh key as active with the given scopes, and returns it. */
-    private static String stubActiveKey(String... scopes) {
+    private static String stubActiveKeyWithScopes(String... scopes) {
         String rawKey = "ak_test_" + UUID.randomUUID();
         String scopeList = String.join("\",\"", scopes);
         downstream.stubFor(post(urlEqualTo(INTROSPECT_PATH))
