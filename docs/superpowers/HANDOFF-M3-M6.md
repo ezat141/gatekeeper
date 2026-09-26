@@ -7,21 +7,36 @@ this one learned by failing. Read this before touching code.
 
 ## 1. Where things stand
 
-M0–M2 is complete, and was verified against three live services rather than only against stubs.
+**M0–M3 are complete.** M0–M2 was verified against three live services; M3 (API-key authentication)
+landed across AuthCore and GateKeeper with its own spec and plan, dated 2026-08-24.
 
 | Repo | `master` | Tests | Visibility |
 |---|---|---|---|
-| [authcore](https://github.com/ezat141/authcore) | `3a8aceb` | 65 | public |
-| [ledger-service](https://github.com/ezat141/ledger-service) | `3c32b32` | 26 | public |
-| [gatekeeper](https://github.com/ezat141/gatekeeper) | `4d29912` | 24 | public |
+| [authcore](https://github.com/ezat141/authcore) | `fa1b9d0` | 78 | public |
+| [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
+| [gatekeeper](https://github.com/ezat141/gatekeeper) | `27b988d` | 70 | public |
 
-All three clean and synced with their remotes.
+All three clean. Counts for ledger-service and GateKeeper were confirmed by running the suites;
+AuthCore's is a count of `@Test` methods, which matched the run exactly for the other two.
+**AuthCore's own README still says 65** — stale since M3 added the introspection tests.
+
+**GateKeeper's suite now requires Redis.** Without it, 15 tests fail and 4 error on
+`RedisConnectionFailureException`, which reads like a regression and is not one. Start it first:
+`docker compose up -d redis` from the authcore directory.
 
 **GateKeeper today:** three routes (`/api/accounts/**` and `/api/machine/**` to AuthCore with the path
-preserved, `/api/ledger/**` to ledger-service with `StripPrefix=1`); JWT authentication against
-AuthCore's JWKS with the issuer pinned; inbound `X-GK-*` stripped before authentication and re-stamped
-from verified claims afterwards; one JSON error shape. **No authorization beyond
-`anyExchange().authenticated()`** — that is M4's job.
+preserved, `/api/ledger/**` to ledger-service with `StripPrefix=1`). A caller authenticates with
+**either** a bearer JWT, verified against AuthCore's JWKS with the issuer pinned, **or** an
+`X-API-Key`, checked through AuthCore's introspection endpoint and cached in Redis. When AuthCore cannot
+answer an introspection, the gateway says 503 rather than 401. Inbound `X-GK-*` headers are stripped
+before authentication and re-stamped from verified identity afterwards, including the subject of a key
+caller. One JSON error shape. **Still no authorization beyond `anyExchange().authenticated()`** — that
+is M4's job, and M4 now has to answer for key callers as well as token callers.
+
+**Next: M4.** Read §8 of the M3 spec, "Identity, tenant, and reach"
+(`specs/2026-08-24-gatekeeper-m3-design.md`), before designing it — it records what an API-key
+principal carries and what it may reach, and M4's scope rules have to read exactly that. The same
+spec says outright that scope enforcement was left for M4.
 
 Design and plan documents are in `docs/superpowers/specs/` and `docs/superpowers/plans/`. Milestone
 scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up.
