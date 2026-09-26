@@ -67,7 +67,8 @@ what makes the pairing meaningful rather than cosmetic. All four seams already e
 ### Claims AuthCore actually emits on an access token
 
 Standard: `iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`, `scope`.
-Custom: `tenant` (slug), `roles` (e.g. `ROLE_ADMIN`), `permissions` (e.g. `payments:read`,
+Custom: `tenant` (slug), `roles` (e.g. `["ADMIN"]` or `["USER"]` — without the `ROLE_` prefix, which
+`AuthCoreUser.roleNames()` strips before the claim is written), `permissions` (e.g. `payments:read`,
 `accounts:read:all`).
 
 `roles`, `permissions` and `tenant` are **absent** on client-credentials tokens — there is no user

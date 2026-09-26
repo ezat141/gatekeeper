@@ -53,6 +53,14 @@ The gateway today derives only `SCOPE_*` authorities from a JWT (Spring's defaul
 made API-key scopes the same `SCOPE_*` shape. M4 keeps it that way: **the edge checks scope, the
 downstream checks permission.** Each check is made where the information that justifies it lives.
 
+**This revisits the audience rationale.** The M0–M2 design (section 9, "What the default validator
+does and does not check") accepted an unvalidated `aud` because the gateway was a pass-through and
+the downstream re-verified. M4 ended that: the edge now makes a decision ledger-service does not
+repeat — the client's scope. Audience stays unvalidated for a different reason: the edge's decisions
+read only scopes, and AuthCore grants scopes per client, so the client a token was issued to adds
+nothing to them. M5 must revisit this if it keys rate limits by client, because that is a decision
+by client identity.
+
 ---
 
 ## 3. Decision: no path carries a tenant
@@ -165,8 +173,10 @@ same name, so no individual rule can forget it.
 **Deliberately not inspected:**
 
 - **The subdomain.** Spring Cloud Gateway replaces the client's `Host` with the downstream's unless a
-  route adds `PreserveHostHeader`, and none does, so a client's subdomain never reaches AuthCore. This
-  is an assumption until the run in §9 confirms it. It also depends on the gateway stripping
+  route adds `PreserveHostHeader`, and none does, so a client's subdomain never reaches AuthCore. The
+  run in §9 confirmed it: an `acme` token sent with `X-Tenant: acme` and `Host: default.localhost:8081`
+  got `200` from AuthCore, which resolves the subdomain before `X-Tenant` and would have answered `403`
+  had the gateway forwarded that `Host`. It also depends on the gateway stripping
   `X-Forwarded-*` and `Forwarded`, which Spring Cloud Gateway does only while no trusted proxies are
   configured: set `spring.cloud.gateway.server.webflux.trusted-proxies` — behind a load balancer, say —
   and the client's host travels on as `X-Forwarded-Host`, which AuthCore would honour if it ever ran
@@ -177,6 +187,9 @@ same name, so no individual rule can forget it.
   gateway does not read bodies at authorization time, so a tenant named in a form body passes the edge.
   **It is not an escalation**: AuthCore's own check compares whatever it resolved with the token and
   refuses a mismatch. The edge check is defence in depth; AuthCore remains the authority for its data.
+  The run in §9 confirmed that AuthCore reads the body and the gateway does not: a form body of
+  `tenant=acme`, with no header, got `200` where the same request with no body got AuthCore's `403`,
+  and `tenant=default` in the body was refused by AuthCore, not the gateway.
 - **AuthCore's session.** When a request names no tenant, `TenantResolutionFilter` falls back to the
   tenant stored in the caller's session before `default`. It never *creates* a session on `/api/**`,
   but it reads one from any `JSESSIONID` cookie — and a caller who logged in to AuthCore directly has

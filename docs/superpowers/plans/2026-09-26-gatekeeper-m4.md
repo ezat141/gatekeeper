@@ -1886,12 +1886,14 @@ curl.exe -s -X POST http://localhost:8080/oauth2/token -d "grant_type=authorizat
 **Writing `acme` admin (`authcore-client`, both scopes).** In a new private window, log in as `alice` / `alice-password` and grant both scopes on the consent screen:
 
 ```
-http://localhost:8080/oauth2/authorize?response_type=code&client_id=authcore-client&redirect_uri=http://127.0.0.1:8080/authorized&scope=openid%20payments:read%20payments:write&tenant=acme
+http://localhost:8080/oauth2/authorize?response_type=code&client_id=authcore-client&redirect_uri=http://127.0.0.1:8080/authorized&scope=openid%20payments:read%20payments:write&tenant=acme&code_challenge=jOE5exqeFE_I-Pd0J6sXoCuGr4fI1i-07DziFgujcnQ&code_challenge_method=S256
 ```
 
 ```bash
-curl.exe -s -u authcore-client:secret -X POST http://localhost:8080/oauth2/token -d "grant_type=authorization_code&code=PASTE_CODE&redirect_uri=http://127.0.0.1:8080/authorized"
+curl.exe -s -u authcore-client:secret -X POST http://localhost:8080/oauth2/token -d "grant_type=authorization_code&code=PASTE_CODE&redirect_uri=http://127.0.0.1:8080/authorized&code_verifier=authcore-test-code-verifier-minimum-43-chars-00"
 ```
+
+The confidential client requires PKCE too — found in the run: without `code_challenge`, AuthCore refuses the authorize request with `invalid_request`.
 
 Use `localhost` for every token call, never `127.0.0.1` — the gateway pins the issuer, and a token issued at `127.0.0.1` is refused 401.
 
