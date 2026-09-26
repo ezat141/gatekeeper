@@ -26,14 +26,16 @@ import java.util.stream.Stream;
  * is the single rule for tenant-less principals the M3 design's section 8 anticipated.
  *
  * <p><strong>Deliberately not inspected:</strong> the subdomain, because the gateway does not
- * forward the client's {@code Host}; and the request body, which AuthCore's {@code
- * getParameter} would also read for a form POST. A tenant named in a form body passes here and
- * is refused by AuthCore's own check. This is defence in depth; AuthCore stays the authority.
+ * forward the client's {@code Host} and strips forwarded-host headers while no trusted proxies
+ * are configured; the request body, which AuthCore's {@code getParameter} would also read for a
+ * form POST; and AuthCore's session, which it consults when a request names no tenant and
+ * carries a session cookie. A tenant resolved from any of these passes here and is refused by
+ * AuthCore's own check. This is defence in depth; AuthCore stays the authority.
  */
 public class TenantAuthorizationManager implements ReactiveAuthorizationManager<AuthorizationContext> {
 
-    static final String TENANT_HEADER = "X-Tenant";
-    static final String TENANT_PARAMETER = "tenant";
+    private static final String TENANT_HEADER = "X-Tenant";
+    private static final String TENANT_PARAMETER = "tenant";
     private static final String TENANT_CLAIM = "tenant";
 
     private final ReactiveAuthorizationManager<AuthorizationContext> delegate;

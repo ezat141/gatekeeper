@@ -125,6 +125,31 @@ class TenantAuthorizationManagerTest {
                 .isEqualTo(Reason.TENANT_MISMATCH);
     }
 
+    /**
+     * AuthCore's {@code getParameter} reads only the first value. The gateway reads every
+     * one, so neither order can slip a second tenant past.
+     */
+    @Test
+    void refusesARepeatedQueryParameterWhicheverValueComesFirst() {
+        assertThat(outcome(acmeUser, request("/api/accounts/me?tenant=acme&tenant=default")))
+                .isEqualTo(Reason.TENANT_MISMATCH);
+        assertThat(outcome(acmeUser, request("/api/accounts/me?tenant=default&tenant=acme")))
+                .isEqualTo(Reason.TENANT_MISMATCH);
+    }
+
+    /** Parameter names are decoded too, on both sides: {@code %74enant} is {@code tenant}. */
+    @Test
+    void readsAnEncodedParameterName() {
+        assertThat(outcome(acmeUser, request("/api/accounts/me?%74enant=default")))
+                .isEqualTo(Reason.TENANT_MISMATCH);
+    }
+
+    @Test
+    void passesWhenTheHeaderAndTheQueryBothNameTheTokensTenant() {
+        assertThat(outcome(acmeUser, request("/api/accounts/me?tenant=acme").header("X-Tenant", "acme")))
+                .isEqualTo(GRANTED);
+    }
+
     // --- Callers with no tenant ----------------------------------------------------------
 
     /**
