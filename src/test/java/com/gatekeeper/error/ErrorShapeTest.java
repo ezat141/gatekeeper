@@ -78,7 +78,8 @@ class ErrorShapeTest {
                 .expectBody()
                 .jsonPath("$.error").isEqualTo("unauthorized")
                 .jsonPath("$.status").isEqualTo(401)
-                .jsonPath("$.path").isEqualTo("/api/ledger/entries");
+                .jsonPath("$.path").isEqualTo("/api/ledger/entries")
+                .jsonPath("$.detail").doesNotExist();
     }
 
     /**
@@ -104,6 +105,7 @@ class ErrorShapeTest {
                 .expectBody()
                 .jsonPath("$.error").isEqualTo("unauthorized")
                 .jsonPath("$.status").isEqualTo(401)
-                .jsonPath("$.path").isEqualTo("/api/ledger/entries");
+                .jsonPath("$.path").isEqualTo("/api/ledger/entries")
+                .jsonPath("$.detail").doesNotExist();
     }
 }
