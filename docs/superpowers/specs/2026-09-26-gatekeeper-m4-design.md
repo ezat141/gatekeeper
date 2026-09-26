@@ -248,8 +248,10 @@ Security 7.0.6 jars rather than remembered.
 
 So **our managers deny by returning `Mono.error(new GatewayAccessDeniedException(reason))` from
 `authorize()`** rather than a `false` decision. `GatewayAccessDeniedException` extends
-`AccessDeniedException` and carries a `Reason`. The error passes through the delegating wrapper and
-`verify()` unchanged to `ExceptionTranslationWebFilter`, which still routes an anonymous caller to the
+`AccessDeniedException` and carries a `Reason`. The error passes through every wrapper unchanged — the
+delegating manager, `verify()`, and, because Actuator enables observations,
+`ObservationReactiveAuthorizationManager`, which only records the error — to
+`ExceptionTranslationWebFilter`, which still routes an anonymous caller to the
 `401` entry point and anyone else to our handler. The handler maps `Reason` to `detail`, and falls back
 to a generic `detail` for a plain `AccessDeniedException`.
 
