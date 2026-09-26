@@ -38,9 +38,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code apiKeyAuthenticationWebFilter}.
  *
  * <p>Every proxied ("OK") case below reaches the same WireMock stub that answers 200
- * unconditionally — every credential here carries payments:read, which is what GET on the
- * machine route requires — so a 200 means the gateway authenticated the caller as the
- * credential the precedence table says should win.
+ * unconditionally — every credential that should win carries payments:read, which is what
+ * GET on the machine route requires — so a 200 means the gateway authenticated the caller as
+ * the credential the precedence table says should win.
  *
  * <p>Every test that touches introspection uses a freshly random key from {@link #newKey()}
  * rather than a fixed literal. Redis is the same instance AuthCore uses and persists between

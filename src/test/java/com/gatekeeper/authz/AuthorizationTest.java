@@ -211,6 +211,23 @@ class AuthorizationTest {
     }
 
     /**
+     * Authentication runs before authorization, so a key the gateway cannot validate is a
+     * 401 even on a route that would refuse every key. A 403 here would tell an
+     * unauthenticated caller what the route's policy is.
+     */
+    @Test
+    void refusesAnInvalidApiKeyOnTheLedgerRouteWith401() {
+        client.get().uri("/api/ledger/entries")
+                .header(ApiKeyAuthenticationConverter.HEADER_NAME, "ak_test_" + UUID.randomUUID())
+                .exchange()
+                .expectStatus().isUnauthorized()
+                .expectBody()
+                .jsonPath("$.detail").doesNotExist();
+
+        assertThat(downstream.findAll(anyRequestedFor(urlPathEqualTo("/ledger/entries")))).isEmpty();
+    }
+
+    /**
      * A blank X-API-Key rides the JWT path (M3's precedence rules), so it would otherwise be
      * forwarded to a service that can do nothing with it. The M3 item deferred to M4.
      */
@@ -234,6 +251,8 @@ class AuthorizationTest {
                         .header(HttpHeaders.AUTHORIZATION, bearer("acme", "payments:read", "payments:write"))
                         .exchange(),
                 "/api/unknown/thing", Reason.NO_RULE);
+
+        assertThat(downstream.findAll(anyRequestedFor(urlPathMatching("/(api|ledger)/.*")))).isEmpty();
     }
 
     @Test
@@ -258,9 +277,10 @@ class AuthorizationTest {
         client.get().uri("/api/accounts/../machine/payments")
                 .header(HttpHeaders.AUTHORIZATION, bearer("acme"))
                 .exchange()
-                .expectStatus().isBadRequest();
+                .expectStatus().isBadRequest()
+                .expectBody().isEmpty();
 
-        assertThat(downstream.findAll(anyRequestedFor(urlPathMatching("/api/.*")))).isEmpty();
+        assertThat(downstream.findAll(anyRequestedFor(urlPathMatching("/(api|ledger)/.*")))).isEmpty();
     }
 
     /** No credential is still 401, not 403 — whichever rule the path matches. */
