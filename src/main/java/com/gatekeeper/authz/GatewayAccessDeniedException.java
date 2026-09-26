@@ -11,7 +11,9 @@ import org.springframework.security.access.AccessDeniedException;
  * the decision itself, and {@code authorizeExchange} wraps every manager in the {@code final}
  * {@code DelegatingReactiveAuthorizationManager}, so overriding {@code verify()} is never
  * reached. A manager that denies by returning this exception as an error from {@code
- * authorize()} gets its reason through both wrappers unchanged, to {@code
+ * authorize()} gets its reason through every wrapper unchanged — the delegating manager,
+ * {@code verify()}, and, with observations enabled as they are here, {@code
+ * ObservationReactiveAuthorizationManager}, which only records the error — to {@code
  * ExceptionTranslationWebFilter} and on to the handler. Verified in the bytecode; see the M4
  * design, section 7.
  */

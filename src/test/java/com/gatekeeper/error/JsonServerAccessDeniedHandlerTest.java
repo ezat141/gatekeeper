@@ -15,6 +15,8 @@ import org.springframework.mock.web.server.MockServerWebExchange;
 import org.springframework.security.access.AccessDeniedException;
 
 import java.util.Arrays;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -53,6 +55,22 @@ class JsonServerAccessDeniedHandlerTest {
     void everyReasonHasADistinctDetail() {
         assertThat(Arrays.stream(Reason.values()).map(Reason::detail).distinct())
                 .hasSize(Reason.values().length);
+    }
+
+    /**
+     * The wire contract, spelled out. Every other assertion compares a detail with
+     * {@code reason.detail()}, which cannot catch a reworded string; this one can.
+     */
+    @Test
+    void theDetailStringsAreTheOnesTheDesignPublishes() {
+        assertThat(Arrays.stream(Reason.values()).collect(Collectors.toMap(r -> r, Reason::detail)))
+                .containsExactlyInAnyOrderEntriesOf(Map.of(
+                        Reason.MISSING_SCOPE, "the credential does not carry the scope this route requires",
+                        Reason.API_KEY_NOT_ACCEPTED, "this route does not accept API keys",
+                        Reason.TENANT_MISMATCH, "the request names a tenant other than the token's",
+                        Reason.NO_RULE, "no rule permits this method and path"));
+        assertThat(JsonServerAccessDeniedHandler.GENERIC_DETAIL)
+                .isEqualTo("the credential does not permit this request");
     }
 
     private static MockServerWebExchange exchangeFor(String path) {

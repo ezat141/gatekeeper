@@ -13,7 +13,8 @@ import java.util.List;
  * layer — {@link JsonServerAuthenticationEntryPoint} and {@link
  * JsonServerAccessDeniedHandler} — supply the application's configured writers and no view
  * resolvers, which is how {@code AbstractErrorWebExceptionHandler} satisfies the same
- * requirement for itself. One class, so the two cannot come to write the shape differently.
+ * requirement for itself. One class, so the two use the same writers; the shape itself is
+ * {@link ErrorBody}'s.
  */
 final class CodecWriterContext implements ServerResponse.Context {
 
