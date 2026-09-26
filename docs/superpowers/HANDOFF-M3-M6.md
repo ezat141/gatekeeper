@@ -16,9 +16,9 @@ landed across AuthCore and GateKeeper with its own spec and plan, dated 2026-08-
 | [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
 | [gatekeeper](https://github.com/ezat141/gatekeeper) | `27b988d` | 70 | public |
 
-All three clean. Counts for ledger-service and GateKeeper were confirmed by running the suites;
-AuthCore's is a count of `@Test` methods, which matched the run exactly for the other two.
-**AuthCore's own README still says 65** — stale since M3 added the introspection tests.
+All three clean, and all three counts confirmed by running the suites. AuthCore's run takes over ten
+minutes — every test class starts its own Spring context against Testcontainers, at roughly 45 seconds
+each — so give it a generous timeout or run it in the background rather than assume it has hung.
 
 **GateKeeper's suite now requires Redis.** Without it, 15 tests fail and 4 error on
 `RedisConnectionFailureException`, which reads like a regression and is not one. Start it first:
