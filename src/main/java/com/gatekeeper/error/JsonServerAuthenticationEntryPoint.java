@@ -3,17 +3,14 @@ package com.gatekeeper.error;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
-import org.springframework.http.codec.HttpMessageWriter;
 import org.springframework.http.codec.ServerCodecConfigurer;
 import org.springframework.security.core.AuthenticationException;
 import org.springframework.security.web.server.ServerAuthenticationEntryPoint;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.server.ServerResponse;
-import org.springframework.web.reactive.result.view.ViewResolver;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -52,24 +49,6 @@ public class JsonServerAuthenticationEntryPoint implements ServerAuthenticationE
                 .header(HttpHeaders.WWW_AUTHENTICATE, "Bearer")
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
-                .flatMap(response -> response.writeTo(exchange, new WriterContext()));
-    }
-
-    /**
-     * {@link ServerResponse#writeTo} needs a {@link ServerResponse.Context} to know which
-     * writers are available; {@code AbstractErrorWebExceptionHandler} satisfies the same
-     * requirement for itself the same way, by supplying its configured writers and no view
-     * resolvers.
-     */
-    private final class WriterContext implements ServerResponse.Context {
-        @Override
-        public List<HttpMessageWriter<?>> messageWriters() {
-            return codecConfigurer.getWriters();
-        }
-
-        @Override
-        public List<ViewResolver> viewResolvers() {
-            return List.of();
-        }
+                .flatMap(response -> response.writeTo(exchange, new CodecWriterContext(codecConfigurer)));
     }
 }
