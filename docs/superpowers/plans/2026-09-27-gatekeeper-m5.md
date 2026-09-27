@@ -1212,7 +1212,7 @@ Then `.\mvnw.cmd -o test` — expected 183.
 
 - [ ] **Step 6: Make it fail on purpose**
 
-1. In the script, move the quota block above the bucket block. Expected: `aRateRefusalSpendsNoQuota` fails. Revert.
+1. In the script, move the quota block above the bucket block. Expected: `checksTheBucketBeforeTheQuota` fails (added in Task 3: the plan's original expectation named `aRateRefusalSpendsNoQuota`, which cannot see the order — only a request over both limits can). Revert.
 2. Replace `math.max(1, until_midnight)` in the quota refusal with `1`. Expected: `refusesOnceTheDailyQuotaIsUsedUpUntilUtcMidnight` fails. Revert.
 3. Replace the `if tonumber(redis.call('HGET', KEYS[2], 'day')) == day then` condition with `if true then`. Expected: `resetsTheQuotaAtUtcMidnight` fails. Revert.
 
@@ -2278,7 +2278,7 @@ Each mutation is a temporary edit on `master` after Task 6's merge, never commit
 | # | Edit | Run | Must fail |
 |---|---|---|---|
 | 1 | In `check.lua`, delete the quota block (the `if count + 1 > quota then … end` and keep the writes) | `RedisRateLimitStoreTest,RateLimitTest` | the quota tests in both |
-| 2 | In `check.lua`, move the quota block above the bucket block | `RedisRateLimitStoreTest` | `aRateRefusalSpendsNoQuota` |
+| 2 | In `check.lua`, move the quota block above the bucket block | `RedisRateLimitStoreTest` | `checksTheBucketBeforeTheQuota` |
 | 3 | In `RateLimitConfig`, the per-instance store from Task 6 Step 3 | `TwoGatewaysShareOneLimitTest` | `shareOneDailyQuota`, `shareOneBurst` |
 | 4 | In `RateLimitFilter.limit`, remove `.onErrorResume(...)` | `RateLimitFilterTest,DeadRedisFailOpenTest` | the store-fails test and the dead-Redis test |
 | 5 | In `RateLimitFilter.apply`, set `Retry-After` to `"5"` | `RateLimitTest,RateLimitFilterTest` | `refusesOnceTheDailyQuotaIsUsedUp`, `refusesTheRequestAfterTheBurstWith429`, `refusesWithoutForwarding` |

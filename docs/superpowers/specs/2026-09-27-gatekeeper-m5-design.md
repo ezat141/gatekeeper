@@ -178,6 +178,22 @@ One `EVAL` per request. Arguments: rate, burst, daily quota, and an optional `no
 The script is atomic, so two instances can never both take the last token. Redis 7 (the platform's
 `redis:7-alpine`) replicates script effects by default, so reading `TIME` in a writing script is safe.
 
+**Found in Task 3's review, and now part of the design:**
+
+- **The script is loaded once, as text.** A script built from a classpath resource re-checks the
+  resource's modification time on every execution, under a lock — blocking I/O on the event loop.
+- **Plan values are bounded at `10^12`** (burst and daily quota). A value near `Long.MAX_VALUE`
+  overflows the script's arithmetic, and a huge burst failed the script after its first write, leaving
+  a bucket with no expiry and the plan silently failing open. `10^12` is exact in a Lua double and
+  keeps the bucket's expiry far inside Redis's limit. Larger values stop the boot.
+- **Quota remaining is never negative.** A quota lowered mid-day below what was spent reports `0`.
+
+**Known limit: Redis's clock stepping backwards.** Refill is `max(0, now − ts)`, so after a backward
+step a drained bucket stays drained — refused with `Retry-After: 1` — until the clock passes the stored
+`ts` again; a step back across midnight resets the day's count. The triggers are an NTP step on the
+Redis host or a failover to a replica with a skewed clock. Rare enough to accept; recorded rather than
+engineered around.
+
 ---
 
 ## 7. Decision: when Redis is unavailable, let requests through
