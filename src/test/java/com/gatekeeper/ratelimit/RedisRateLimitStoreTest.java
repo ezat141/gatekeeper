@@ -118,6 +118,23 @@ class RedisRateLimitStoreTest {
         assertThat(next.quotaRemaining()).isEqualTo(3);
     }
 
+    /**
+     * Over both limits at once, the bucket answers: the caller is told to slow down (retry in a
+     * second), not that the day is spent. Only a request over both limits can tell the order
+     * of the two checks apart.
+     */
+    @Test
+    void checksTheBucketBeforeTheQuota() {
+        RateLimitIdentity caller = fresh();
+        Plan plan = new Plan("t", 1, 1, 1);
+        check(caller, plan, NOON);
+
+        Decision refused = check(caller, plan, NOON);
+
+        assertThat(refused.reason()).isEqualTo(RateLimitReason.RATE_LIMITED);
+        assertThat(refused.retryAfterSeconds()).isEqualTo(1);
+    }
+
     /** A request refused for the quota takes no token. */
     @Test
     void aQuotaRefusalTakesNoToken() {
