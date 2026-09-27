@@ -10,12 +10,13 @@ import java.util.Map;
  * The one JSON error shape the platform renders for a refused or failed request, shared by
  * {@link GlobalErrorWebExceptionHandler} (exceptions that reach the WebFlux error-handling
  * layer), {@link JsonServerAuthenticationEntryPoint} (the 401 Spring Security commits
- * directly) and {@link JsonServerAccessDeniedHandler} (the 403 it commits the same way).
+ * directly) and {@link JsonServerAccessDeniedHandler} (the 403 it commits the same way), and
+ * {@link TooManyRequestsWriter} (the rate limiter's 429).
  *
- * <p>Three call sites building the same shape independently is exactly how it drifts apart
+ * <p>Four call sites building the same shape independently is exactly how it drifts apart
  * over time, so the construction lives in one place.
  *
- * <p>{@code detail} is present only when a caller supplies one — today only the 403 does.
+ * <p>{@code detail} is present only when a caller supplies one — today the 403 and the 429 do.
  * ledger-service's {@code ErrorBody} has the identical overload, so the two services agree on
  * the field's name and on its absence when there is nothing to say.
  */
