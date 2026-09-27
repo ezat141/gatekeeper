@@ -46,4 +46,19 @@ class TooManyRequestsWriterTest {
 
         assertThat(exchange.getResponse().getHeaders().get(HttpHeaders.WWW_AUTHENTICATE)).isNull();
     }
+
+    @Test
+    void keepsTheJsonContentTypeWhateverTheCallerPasses() {
+        MockServerWebExchange exchange = MockServerWebExchange.from(MockServerHttpRequest.get("/x"));
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put(HttpHeaders.CONTENT_TYPE, "text/plain");
+        headers.put(HttpHeaders.RETRY_AFTER, "3");
+
+        writer.write(exchange, "the caller's daily quota is used up", headers).block();
+
+        MockServerHttpResponse response = exchange.getResponse();
+        assertThat(response.getHeaders().getContentType()).isEqualTo(MediaType.APPLICATION_JSON);
+        assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("3");
+        assertThat(response.getBodyAsString().block()).startsWith("{\"error\":\"too_many_requests\"");
+    }
 }

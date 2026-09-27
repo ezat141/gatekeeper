@@ -18,7 +18,7 @@ import java.util.Map;
  *
  * <p>The caller supplies the {@code detail} and every header, {@code Retry-After} included: this
  * class knows the shape of a refusal, not the rules of rate limiting. No {@code WWW-Authenticate}
- * — the caller is authenticated.
+ * — the caller is authenticated. The content type is always JSON; a caller cannot override it.
  */
 @Component
 public class TooManyRequestsWriter {
@@ -32,8 +32,8 @@ public class TooManyRequestsWriter {
     public Mono<Void> write(ServerWebExchange exchange, String detail, Map<String, String> headers) {
         String path = exchange.getRequest().getPath().value();
         return ServerResponse.status(HttpStatus.TOO_MANY_REQUESTS)
+                .headers(outgoing -> outgoing.setAll(headers))
                 .contentType(MediaType.APPLICATION_JSON)
-                .headers(outgoing -> headers.forEach(outgoing::set))
                 .bodyValue(ErrorBody.of(HttpStatus.TOO_MANY_REQUESTS, path, detail))
                 .flatMap(response -> response.writeTo(exchange, new CodecWriterContext(codecConfigurer)));
     }

@@ -9,11 +9,11 @@ import java.util.List;
 
 /**
  * {@link ServerResponse#writeTo} needs a {@link ServerResponse.Context} to know which writers
- * are available. Both handlers that commit a response outside the WebFlux error-handling
- * layer — {@link JsonServerAuthenticationEntryPoint} and {@link
- * JsonServerAccessDeniedHandler} — supply the application's configured writers and no view
+ * are available. All three writers that commit a response outside the WebFlux error-handling
+ * layer — {@link JsonServerAuthenticationEntryPoint}, {@link JsonServerAccessDeniedHandler} and
+ * {@link TooManyRequestsWriter} — supply the application's configured writers and no view
  * resolvers, which is how {@code AbstractErrorWebExceptionHandler} satisfies the same
- * requirement for itself. One class, so the two use the same writers; the shape itself is
+ * requirement for itself. One class, so the three use the same writers; the shape itself is
  * {@link ErrorBody}'s.
  */
 final class CodecWriterContext implements ServerResponse.Context {
