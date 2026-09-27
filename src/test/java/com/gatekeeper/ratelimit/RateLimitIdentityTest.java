@@ -71,6 +71,14 @@ class RateLimitIdentityTest {
                 .contains(new RateLimitIdentity(Kind.CLIENT, "c"));
     }
 
+    /** A blank subject, with no tenant and no audience, leaves nothing usable either. */
+    @Test
+    void aBlankSubjectWithoutAnAudienceHasNoIdentity() {
+        assertThat(RateLimitIdentity.of(jwt(builder -> builder
+                .subject("").claim("scope", List.of("x")))))
+                .isEmpty();
+    }
+
     @Test
     void anApiKeyCountsAgainstItsName() {
         Authentication key = new ApiKeyAuthenticationToken("demo-reporting-job",
