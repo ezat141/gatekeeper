@@ -161,6 +161,8 @@ class RedisRateLimitStoreTest {
     void neverReportsANegativeQuotaRemaining() {
         RateLimitIdentity caller = fresh();
         check(caller, new Plan("t", 1, 3, 5), NOON);
+        // The fixed `now` doesn't stop the real-time TTL; a slow run must not see it expire.
+        redis.persist(RedisRateLimitStore.bucketKey(caller)).block();
         check(caller, new Plan("t", 1, 3, 5), NOON);
         check(caller, new Plan("t", 1, 3, 5), NOON);
 
