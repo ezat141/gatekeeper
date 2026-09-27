@@ -2192,22 +2192,28 @@ class TwoGatewaysShareOneLimitTest {
                 .expectBody().jsonPath("$.detail").isEqualTo(RateLimitReason.RATE_LIMITED.detail());
     }
 
+    /**
+     * Command-line arguments, not {@code SpringApplicationBuilder.properties(...)}: those set
+     * default properties, the lowest-priority source, so {@code application.yml} would win —
+     * {@code server.port: 8081} would put both instances on one port, and {@code default-plan:
+     * free} would give every fresh tenant the test override's unlimited plan. Arguments outrank
+     * every configuration file.
+     */
     private static ConfigurableApplicationContext gateway() {
-        return new SpringApplicationBuilder(GateKeeperApplication.class).properties(Map.ofEntries(
-                Map.entry("server.port", "0"),
-                Map.entry("gatekeeper.auth.jwk-set-uri", downstream.baseUrl() + "/oauth2/jwks"),
-                Map.entry("gatekeeper.auth.issuer", ISSUER),
-                Map.entry("gatekeeper.downstream.ledger", downstream.baseUrl()),
-                Map.entry("gatekeeper.downstream.authcore", downstream.baseUrl()),
-                Map.entry("gatekeeper.rate-limit.default-plan", "burst3"),
-                Map.entry("gatekeeper.rate-limit.plans.burst3.requests-per-second", "1"),
-                Map.entry("gatekeeper.rate-limit.plans.burst3.burst", "3"),
-                Map.entry("gatekeeper.rate-limit.plans.burst3.daily-quota", "1000"),
-                Map.entry("gatekeeper.rate-limit.plans.quota3.requests-per-second", "1000"),
-                Map.entry("gatekeeper.rate-limit.plans.quota3.burst", "1000"),
-                Map.entry("gatekeeper.rate-limit.plans.quota3.daily-quota", "3"),
-                Map.entry("gatekeeper.rate-limit.assignments.tenants." + QUOTA_TENANT, "quota3")))
-                .run();
+        return new SpringApplicationBuilder(GateKeeperApplication.class).run(
+                "--server.port=0",
+                "--gatekeeper.auth.jwk-set-uri=" + downstream.baseUrl() + "/oauth2/jwks",
+                "--gatekeeper.auth.issuer=" + ISSUER,
+                "--gatekeeper.downstream.ledger=" + downstream.baseUrl(),
+                "--gatekeeper.downstream.authcore=" + downstream.baseUrl(),
+                "--gatekeeper.rate-limit.default-plan=burst3",
+                "--gatekeeper.rate-limit.plans.burst3.requests-per-second=1",
+                "--gatekeeper.rate-limit.plans.burst3.burst=3",
+                "--gatekeeper.rate-limit.plans.burst3.daily-quota=1000",
+                "--gatekeeper.rate-limit.plans.quota3.requests-per-second=1000",
+                "--gatekeeper.rate-limit.plans.quota3.burst=1000",
+                "--gatekeeper.rate-limit.plans.quota3.daily-quota=3",
+                "--gatekeeper.rate-limit.assignments.tenants." + QUOTA_TENANT + "=quota3");
     }
 
     private static int port(ConfigurableApplicationContext context) {
@@ -2225,7 +2231,7 @@ class TwoGatewaysShareOneLimitTest {
 }
 ```
 
-`SpringApplicationBuilder.properties(Map)` sets default properties, which `classpath:/config/application.yml` would override. The rate-limit properties above are **not** set in that file (it only sets `free` and `pro`), so they apply. Check this assumption in the first run: if `shareOneBurst` never refuses, print the second response's `X-RateLimit-Burst-Capacity` — it must read `3`. If it reads `1000000`, the defaults are being overridden; pass the same entries as command-line arguments to `.run(...)` instead (`--key=value`), which outrank every file, and report which you used.
+An earlier draft passed these through `SpringApplicationBuilder.properties(Map)`. Task 1's code review showed, with Boot's own binder, that those are default properties and lose to `application.yml`: the second instance would try port 8081, and `default-plan` would stay `free`. Command-line arguments outrank every file. If `shareOneBurst` never refuses, print the second response's `X-RateLimit-Burst-Capacity`: it must read `3`.
 
 - [ ] **Step 3: Run it to make sure it fails first**
 
