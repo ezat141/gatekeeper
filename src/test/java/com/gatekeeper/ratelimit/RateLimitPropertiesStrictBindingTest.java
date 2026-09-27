@@ -49,7 +49,7 @@ class RateLimitPropertiesStrictBindingTest {
                 .run(context -> {
                     assertThat(context).hasFailed();
                     String messageChain = messageChain(context.getStartupFailure());
-                    assertThat(messageChain).containsAnyOf("api-key", "unbound");
+                    assertThat(messageChain).contains("assignments.api-key.demo-job").contains("left unbound");
                 });
     }
 
