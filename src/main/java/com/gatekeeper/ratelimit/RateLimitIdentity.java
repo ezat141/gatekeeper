@@ -1,6 +1,7 @@
 package com.gatekeeper.ratelimit;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 
 /**
  * Whose bucket a request counts against: a tenant, or else a client, or else an API key. The
@@ -12,6 +13,11 @@ import java.nio.charset.StandardCharsets;
  * structure or the {@code {…}} hash tag it is wrapped in.
  */
 public record RateLimitIdentity(Kind kind, String name) {
+
+    public RateLimitIdentity {
+        Objects.requireNonNull(kind, "kind");
+        Objects.requireNonNull(name, "name");
+    }
 
     public enum Kind {
         TENANT("tenant"),

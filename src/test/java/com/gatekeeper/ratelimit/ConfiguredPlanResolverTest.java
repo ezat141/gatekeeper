@@ -9,6 +9,7 @@ import java.time.Duration;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
 class ConfiguredPlanResolverTest {
 
@@ -50,5 +51,10 @@ class ConfiguredPlanResolverTest {
     void keepsATenantAndAClientOfTheSameNameApart() {
         assertThat(resolver.resolve(new RateLimitIdentity(Kind.TENANT, "shared-name")).name()).isEqualTo("pro");
         assertThat(resolver.resolve(new RateLimitIdentity(Kind.CLIENT, "shared-name")).name()).isEqualTo("free");
+    }
+
+    @Test
+    void rejectsAnIdentityWithoutAName() {
+        assertThatNullPointerException().isThrownBy(() -> new RateLimitIdentity(Kind.TENANT, null));
     }
 }

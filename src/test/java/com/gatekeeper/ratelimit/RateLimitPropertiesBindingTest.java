@@ -34,5 +34,10 @@ class RateLimitPropertiesBindingTest {
     void appliesTheTestOverrideSoExistingSuitesAreNeverLimited() {
         assertThat(properties.plans().get("free").requestsPerSecond()).isEqualTo(1_000_000);
         assertThat(properties.plans().get("pro").dailyQuota()).isEqualTo(1_000_000_000L);
+
+        assertThat(properties.plans().values()).allSatisfy(limits -> {
+            assertThat(limits.requestsPerSecond()).isGreaterThanOrEqualTo(1_000_000);
+            assertThat(limits.dailyQuota()).isGreaterThanOrEqualTo(1_000_000_000L);
+        });
     }
 }

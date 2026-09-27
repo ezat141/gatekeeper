@@ -13,9 +13,11 @@ import java.util.Set;
  * <p><strong>Every rule is checked here, in the constructor, so a violation stops the boot.</strong>
  * The first rule matters most: a mistyped prefix binds no plans at all, and relaxed binding
  * would otherwise start a gateway that limits nothing — the one silent failure the handoff
- * warns about.
+ * warns about. Unknown keys under the prefix are refused too, so a misspelt kind inside
+ * {@code assignments} (for example {@code api-key} for {@code api-keys}) fails the boot rather
+ * than silently putting its callers on the default plan.
  */
-@ConfigurationProperties(prefix = "gatekeeper.rate-limit")
+@ConfigurationProperties(prefix = "gatekeeper.rate-limit", ignoreUnknownFields = false)
 public record RateLimitProperties(
         Duration redisTimeout,
         String defaultPlan,
@@ -46,7 +48,7 @@ public record RateLimitProperties(
         public PlanLimits {
             if (requestsPerSecond < 1 || burst < 1 || dailyQuota < 1) {
                 throw new IllegalArgumentException(
-                        "every rate-limit plan value must be at least 1, got requests-per-second="
+                        "every rate-limit plan value must be present and at least 1, got requests-per-second="
                                 + requestsPerSecond + ", burst=" + burst + ", daily-quota=" + dailyQuota);
             }
         }
@@ -74,7 +76,7 @@ public record RateLimitProperties(
             assigned.forEach((who, plan) -> {
                 if (!planNames.contains(plan)) {
                     throw new IllegalArgumentException("gatekeeper.rate-limit.assignments." + kind
-                            + " assigns " + who + " to unknown plan " + plan);
+                            + " assigns " + who + " to unknown plan '" + plan + "'");
                 }
             });
         }
