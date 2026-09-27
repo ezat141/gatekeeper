@@ -4,6 +4,7 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -61,14 +62,23 @@ public class RedisRateLimitStore implements RateLimitStore {
         return run(identity, plan, Double.toString(now));
     }
 
+    /**
+     * Subscribes on a worker thread. Lettuce opens its shared connection with a blocking wait
+     * inside {@code subscribe()}, before any timeout downstream has started — up to its 60-second
+     * handshake timeout on a Redis that accepts and never answers. On a worker, that wait holds a
+     * worker, never the event loop, and the filter's timeout always applies. {@code defer} makes
+     * the {@code execute} call itself, and so the subscribe where Lettuce blocks, happen on the
+     * worker. The M5 design, section 7.
+     */
     private Mono<Decision> run(RateLimitIdentity identity, Plan plan, String now) {
-        return redis.execute(SCRIPT,
-                        List.of(bucketKey(identity), quotaKey(identity)),
-                        List.of(Integer.toString(plan.requestsPerSecond()),
-                                Long.toString(plan.burst()),
-                                Long.toString(plan.dailyQuota()),
-                                now))
-                .next()
+        return Mono.defer(() -> redis.execute(SCRIPT,
+                                List.of(bucketKey(identity), quotaKey(identity)),
+                                List.of(Integer.toString(plan.requestsPerSecond()),
+                                        Long.toString(plan.burst()),
+                                        Long.toString(plan.dailyQuota()),
+                                        now))
+                        .next())
+                .subscribeOn(Schedulers.boundedElastic())
                 .map(RedisRateLimitStore::toDecision);
     }
 
