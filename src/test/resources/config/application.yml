@@ -1,0 +1,18 @@
+# Loaded after classpath:/application.yml and overriding it property by property.
+#
+# Every existing integration test calls as tenant acme or a handful of clients, and quota state
+# lives for a day in the Redis the tests share. Left at the real limits, repeated runs would
+# accumulate counts and start failing at random. So every plan the main configuration defines
+# is made effectively unlimited here. Rate-limit tests define their own small plans and use
+# fresh identities, and never rely on these two.
+gatekeeper:
+  rate-limit:
+    plans:
+      free:
+        requests-per-second: 1000000
+        burst: 1000000
+        daily-quota: 1000000000
+      pro:
+        requests-per-second: 1000000
+        burst: 1000000
+        daily-quota: 1000000000
