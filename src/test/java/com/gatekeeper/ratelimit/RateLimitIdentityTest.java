@@ -35,7 +35,7 @@ class RateLimitIdentityTest {
 
     /** aud is the identity when present, even where sub differs. */
     @Test
-    void preferTheAudienceOverTheSubject() {
+    void prefersTheAudienceOverTheSubject() {
         assertThat(RateLimitIdentity.of(jwt(builder -> builder
                 .subject("someone").audience(List.of("the-client")))))
                 .contains(new RateLimitIdentity(Kind.CLIENT, "the-client"));
@@ -46,6 +46,21 @@ class RateLimitIdentityTest {
     void fallsBackToTheSubjectWithoutAnAudience() {
         assertThat(RateLimitIdentity.of(jwt(builder -> builder.subject("authcore-machine"))))
                 .contains(new RateLimitIdentity(Kind.CLIENT, "authcore-machine"));
+    }
+
+    /** A blank aud[0] is no audience either: fall back to a non-blank sub, as if aud were absent. */
+    @Test
+    void ignoresABlankAudienceAndFallsBackToTheSubject() {
+        assertThat(RateLimitIdentity.of(jwt(builder -> builder
+                .subject("authcore-machine").audience(List.of("")))))
+                .contains(new RateLimitIdentity(Kind.CLIENT, "authcore-machine"));
+    }
+
+    /** Nothing usable is left — no tenant, no audience, no subject — so there is no identity. */
+    @Test
+    void aTokenWithNoTenantAudienceOrSubjectHasNoIdentity() {
+        assertThat(RateLimitIdentity.of(jwt(builder -> builder.claim("scope", List.of("x")))))
+                .isEmpty();
     }
 
     /** A blank tenant is no tenant: every such token would otherwise share one bucket. */
@@ -65,11 +80,22 @@ class RateLimitIdentityTest {
     }
 
     @Test
-    void anythingElseHasNoIdentity() {
+    void anUnauthenticatedApiKeyHasNoIdentity() {
+        Authentication key = new ApiKeyAuthenticationToken("ak_raw");
+
+        assertThat(RateLimitIdentity.of(key)).isEmpty();
+    }
+
+    @Test
+    void anAnonymousCallerHasNoIdentity() {
         Authentication anonymous = new AnonymousAuthenticationToken(
                 "key", "anonymousUser", AuthorityUtils.createAuthorityList("ROLE_ANONYMOUS"));
 
         assertThat(RateLimitIdentity.of(anonymous)).isEmpty();
+    }
+
+    @Test
+    void noAuthenticationHasNoIdentity() {
         assertThat(RateLimitIdentity.of(null)).isEmpty();
     }
 
