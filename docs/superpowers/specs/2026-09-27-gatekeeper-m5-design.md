@@ -95,10 +95,25 @@ never decides by client identity, and that per-client rate limiting is that mome
   not a resource server. Validation would need resource indicators or an audience customizer in
   AuthCore, a change M5 does not require.
 - **Reading it is safe.** `aud` is inside the signed token and AuthCore sets it from the registered
-  client, so a caller cannot choose whose bucket they drain.
+  client, so a caller cannot name an arbitrary bucket.
+- **One exception, found in Task 2's review: OIDC ID tokens.** An ID token carries `aud = [client]`,
+  `sub = username` and no `tenant`, and M4 recorded that one may authenticate at the gateway. It would
+  count against `client:<spa>` rather than the user's tenant. So a user holding both tokens can choose
+  which of two buckets to spend, and ID-token callers from every tenant share one bucket. The root is
+  the M4 open item — ID tokens should not authenticate here at all — and fixing it there closes this
+  too. Treating ID tokens as having no identity would be worse: the filter forwards those unlimited.
 - **What remains open is unchanged by M5:** were AuthCore ever to issue tokens for another resource
   server using the same scope names, those tokens would be accepted here. That was true before M5, is
   not made worse by it, and is recorded in the README.
+- **The client derivation depends on AuthCore's `aud` shape.** Adopting resource indicators or an
+  audience customizer — the route to real audience validation — would change `aud` to name a resource
+  server, alone or beside the client. `aud[0]` would then stop naming the client, and every client
+  would silently share one bucket. That change must change this derivation with it.
+
+**A caller with no usable identity is forwarded unlimited.** A tenant-less JWT whose `aud` and `sub`
+are both missing or blank has no identity, and the filter forwards it with a warning rather than
+limiting it. AuthCore cannot issue such a token; the alternative — one shared bucket for every such
+token — would let any one of them exhaust the others.
 
 ---
 
