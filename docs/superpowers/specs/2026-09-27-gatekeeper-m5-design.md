@@ -220,6 +220,38 @@ dependency of every request, JWT callers included.
 **Rejected — a configuration switch.** Two behaviours to test and document, for a choice no deployment
 has asked to make.
 
+### A timeout alone was not enough — found in Task 5, decided with the repo owner
+
+Task 5's silent-Redis test hung rather than failing open, and thread dumps showed why. The first time a
+gateway uses Redis, Lettuce opens its shared connection with a **blocking wait inside `subscribe()`**
+(`LettuceConnectionFactory.getSharedReactiveConnection` → `RedisClient.connect` →
+`DefaultConnectionFuture.get()`). The wait happens before `.timeout(…)` has started its clock, so the
+timeout never fires; it lasts up to Lettuce's handshake timeout, 60 seconds by default; and it runs on
+whatever thread subscribes — potentially a Netty event loop. A firewalled Redis causes the same wait
+(10 s connect timeout).
+
+**Chosen — keep the call off the event loop, and connect before traffic arrives.**
+
+- **The store subscribes on `Schedulers.boundedElastic()`.** A blocking connect then holds a worker
+  thread, never the event loop, and the filter's timeout always applies. This lives in
+  `RedisRateLimitStore`, the one place that knows the call can block; the filter stays generic.
+- **A bounded warm-up at startup.** Before the web server accepts traffic, the gateway pings Redis once,
+  off the calling thread, waiting at most two seconds and ignoring failure. Without it, the first
+  request after boot would pay for the connection and the script load, exceed 200 ms, and go through
+  unlimited — Task 5 saw exactly that when it tried the worker thread alone. Once connected, Lettuce
+  reconnects in the background without blocking, so the blocking wait belongs to first use only.
+
+**Rejected — shorter Lettuce timeouts** (`spring.data.redis.connect-timeout`, `spring.data.redis.timeout`).
+They shorten the wait but still block the subscribing thread, on every request while Redis stays
+unreachable, and they change the API-key cache's command timeout too.
+
+**Rejected — accept the hang and narrow the test.** It gives up the guarantee this section calls not
+optional.
+
+**Recorded, not fixed here:** M3's API-key cache uses the same template and very likely has the same
+exposure on a silent Redis — its first call could block an event loop for up to the handshake timeout.
+It predates M5 and belongs to whoever next touches that path.
+
 ---
 
 ## 8. The `429` response
