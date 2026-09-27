@@ -60,6 +60,31 @@ gatekeeper:
     # The JWKS fetch has no timeout and that is filed as an M7 defect. Do not repeat it:
     # a host that accepts the connection and never answers must fail, not hang.
     timeout: 2s
+  rate-limit:
+    # How long a request waits for Redis before going through unlimited. Rate limiting is a
+    # capacity control, not a security control, so a Redis failure must not become a gateway
+    # outage — and it must fail fast, not hang (the JWKS fetch's missing timeout is an open M7
+    # item; this call does not repeat it). See the M5 design, section 7.
+    redis-timeout: 200ms
+    default-plan: free
+    plans:
+      free:
+        requests-per-second: 5
+        burst: 10
+        daily-quota: 1000
+      pro:
+        requests-per-second: 50
+        burst: 100
+        daily-quota: 100000
+    # Anyone unlisted is on default-plan. Tenants are user tokens' tenant claim; clients are a
+    # tenant-less token's aud (its client id); api-keys are the key's name from introspection.
+    assignments:
+      tenants:
+        acme: pro
+      clients:
+        authcore-machine: pro
+      api-keys:
+        demo-reporting-job: free
 
 management:
   endpoints:
