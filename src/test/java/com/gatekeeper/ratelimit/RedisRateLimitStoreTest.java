@@ -83,6 +83,8 @@ class RedisRateLimitStoreTest {
         RateLimitIdentity caller = fresh();
         Plan plan = new Plan("t", 10, 3, 100);
         check(caller, plan, NOON);
+        // The fixed `now` doesn't stop the real-time TTL; a slow run must not see it expire.
+        redis.persist(RedisRateLimitStore.bucketKey(caller)).block();
 
         Decision decision = check(caller, plan, NOON + 3600);
 
@@ -110,6 +112,8 @@ class RedisRateLimitStoreTest {
         RateLimitIdentity caller = fresh();
         Plan plan = new Plan("t", 1, 1, 5);
         check(caller, plan, NOON);
+        // The fixed `now` doesn't stop the real-time TTL; a slow run must not see it expire.
+        redis.persist(RedisRateLimitStore.bucketKey(caller)).block();
         assertThat(check(caller, plan, NOON).reason()).isEqualTo(RateLimitReason.RATE_LIMITED);
 
         Decision next = check(caller, plan, NOON + 1);
@@ -128,6 +132,8 @@ class RedisRateLimitStoreTest {
         RateLimitIdentity caller = fresh();
         Plan plan = new Plan("t", 1, 1, 1);
         check(caller, plan, NOON);
+        // The fixed `now` doesn't stop the real-time TTL; a slow run must not see it expire.
+        redis.persist(RedisRateLimitStore.bucketKey(caller)).block();
 
         Decision refused = check(caller, plan, NOON);
 
@@ -148,6 +154,20 @@ class RedisRateLimitStoreTest {
         assertThat(refused.tokensRemaining()).isEqualTo(4);
         assertThat(redis.opsForHash().get(RedisRateLimitStore.bucketKey(caller), "tokens").block())
                 .asString().startsWith("4");
+    }
+
+    /** A plan's quota lowered mid-day, below what was already spent, must not go negative. */
+    @Test
+    void neverReportsANegativeQuotaRemaining() {
+        RateLimitIdentity caller = fresh();
+        check(caller, new Plan("t", 1, 3, 5), NOON);
+        check(caller, new Plan("t", 1, 3, 5), NOON);
+        check(caller, new Plan("t", 1, 3, 5), NOON);
+
+        Decision refused = check(caller, new Plan("t", 1, 3, 1), NOON);
+
+        assertThat(refused.reason()).isEqualTo(RateLimitReason.RATE_LIMITED);
+        assertThat(refused.quotaRemaining()).isZero();
     }
 
     @Test

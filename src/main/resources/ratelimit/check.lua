@@ -38,7 +38,9 @@ end
 
 -- Bucket first: a request refused for speed spends none of the day, and nothing is written.
 if tokens < 1 then
-  return {0, 1, 0, quota - count, math.max(1, math.ceil((1 - tokens) / rate)), until_midnight}
+  -- With integer rates of at least 1 (the configuration's minimum) this is always 1; the
+  -- formula matters only for fractional rates.
+  return {0, 1, 0, math.max(0, quota - count), math.max(1, math.ceil((1 - tokens) / rate)), until_midnight}
 end
 
 -- Then the quota: a request refused for the day takes no token, and nothing is written.

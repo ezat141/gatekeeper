@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 /**
@@ -68,6 +69,16 @@ class RateLimitPropertiesTest {
         assertThatIllegalArgumentException().isThrownBy(() -> new PlanLimits(0, 10, 1000));
         assertThatIllegalArgumentException().isThrownBy(() -> new PlanLimits(5, 0, 1000));
         assertThatIllegalArgumentException().isThrownBy(() -> new PlanLimits(5, 10, 0));
+    }
+
+    /** A value near Long.MAX_VALUE overflows the script's arithmetic, or fails it mid-write. */
+    @Test
+    void refusesALimitAboveTheBound() {
+        assertThatIllegalArgumentException().isThrownBy(() -> new PlanLimits(5, 1_000_000_000_001L, 1000));
+        assertThatIllegalArgumentException().isThrownBy(() -> new PlanLimits(5, 10, Long.MAX_VALUE));
+
+        assertThatCode(() -> new PlanLimits(5, PlanLimits.MAX_VALUE, PlanLimits.MAX_VALUE))
+                .doesNotThrowAnyException();
     }
 
     @Test

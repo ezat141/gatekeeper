@@ -42,14 +42,26 @@ public record RateLimitProperties(
         assignments.requireKnownPlans(plans.keySet());
     }
 
-    /** One plan's allowance. Every number at least 1. */
+    /** One plan's allowance. Every number at least 1, and burst and daily quota at most {@link #MAX_VALUE}. */
     public record PlanLimits(int requestsPerSecond, long burst, long dailyQuota) {
+
+        /**
+         * 1e12: exact in a Lua double, so the script's arithmetic never overflows it, and
+         * {@code burst / rate * 2} stays far inside Redis's {@code EXPIRE} limit.
+         */
+        static final long MAX_VALUE = 1_000_000_000_000L;
 
         public PlanLimits {
             if (requestsPerSecond < 1 || burst < 1 || dailyQuota < 1) {
                 throw new IllegalArgumentException(
                         "every rate-limit plan value must be present and at least 1, got requests-per-second="
                                 + requestsPerSecond + ", burst=" + burst + ", daily-quota=" + dailyQuota);
+            }
+            if (burst > MAX_VALUE || dailyQuota > MAX_VALUE) {
+                throw new IllegalArgumentException(
+                        "burst and daily-quota must be at most " + MAX_VALUE
+                                + "; larger values overflow the Redis script, got burst=" + burst
+                                + ", daily-quota=" + dailyQuota);
             }
         }
     }

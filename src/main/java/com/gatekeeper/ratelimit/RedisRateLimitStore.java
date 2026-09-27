@@ -5,6 +5,9 @@ import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import reactor.core.publisher.Mono;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
@@ -19,8 +22,20 @@ import java.util.List;
 public class RedisRateLimitStore implements RateLimitStore {
 
     @SuppressWarnings("rawtypes")
-    private static final RedisScript<List> SCRIPT =
-            RedisScript.of(new ClassPathResource("ratelimit/check.lua"), List.class);
+    private static final RedisScript<List> SCRIPT = RedisScript.of(loadScript(), List.class);
+
+    /**
+     * The text, loaded once. A script built from a {@code Resource} re-checks the resource's
+     * modification time on every execution — blocking I/O on the event loop, under a lock
+     * shared by every request.
+     */
+    private static String loadScript() {
+        try {
+            return new ClassPathResource("ratelimit/check.lua").getContentAsString(StandardCharsets.UTF_8);
+        } catch (IOException ex) {
+            throw new UncheckedIOException("the rate-limit script is missing from the classpath", ex);
+        }
+    }
 
     private final ReactiveStringRedisTemplate redis;
 
