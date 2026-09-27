@@ -27,9 +27,11 @@ import java.util.Optional;
  * never reaches a downstream. It applies to every route without route configuration.
  *
  * <p><strong>Fails open, fast.</strong> A Redis error, a timeout, or an empty answer lets the
- * request through unlimited, with a warning and no rate-limit headers. Rate limiting is a
- * capacity control; a Redis outage must not become a gateway outage. M6's revocation check will
- * fail closed on the same Redis, deliberately — see the M5 design, section 7.
+ * request through unlimited, with no rate-limit headers, and opens the {@link RedisCircuitBreaker}:
+ * for its window no request calls Redis at all, and the breaker logs the outage once when it opens
+ * and once when it closes. Rate limiting is a capacity control; a Redis outage must not become a
+ * gateway outage. M6's revocation check will fail closed on the same Redis, deliberately — see the
+ * M5 design, section 7.
  *
  * <p>The fail-open branch covers only the store call, never the downstream chain: an error from
  * the downstream must not be mistaken for Redis failing and forward the request a second time.
@@ -43,13 +45,15 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
     private final RateLimitStore store;
     private final TooManyRequestsWriter writer;
     private final Duration timeout;
+    private final RedisCircuitBreaker breaker;
 
     public RateLimitFilter(PlanResolver plans, RateLimitStore store, TooManyRequestsWriter writer,
-                           RateLimitProperties properties) {
+                           RateLimitProperties properties, RedisCircuitBreaker breaker) {
         this.plans = plans;
         this.store = store;
         this.writer = writer;
         this.timeout = properties.redisTimeout();
+        this.breaker = breaker;
     }
 
     @Override
@@ -61,22 +65,29 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                 .flatMap(identity -> identity
                         .map(caller -> limit(exchange, chain, caller))
                         .orElseGet(() -> {
-                            log.warn("Routed request with no rate-limit identity; forwarding unlimited: {}",
+                            log.debug("Routed request with no rate-limit identity; forwarding unlimited: {}",
                                     exchange.getRequest().getPath());
                             return chain.filter(exchange);
                         }));
     }
 
     private Mono<Void> limit(ServerWebExchange exchange, GatewayFilterChain chain, RateLimitIdentity caller) {
+        if (!breaker.allowCall()) {
+            log.debug("Rate limiter's breaker is open; forwarding {} unlimited", caller.key());
+            return chain.filter(exchange);
+        }
         Plan plan = plans.resolve(caller);
         return store.check(caller, plan)
                 .timeout(timeout)
                 .map(Optional::of)
+                .switchIfEmpty(Mono.error(() -> new IllegalStateException("store answered nothing")))
+                .doOnNext(decision -> breaker.recordSuccess())
                 .onErrorResume(error -> {
-                    log.warn("Rate limiter unavailable; forwarding {} unlimited", caller.key(), error);
+                    breaker.recordFailure(error);
                     return Mono.just(Optional.<Decision>empty());
                 })
-                .defaultIfEmpty(Optional.empty())
+                // From here the chain continues on Lettuce's or the timeout's thread, as Spring Cloud
+                // Gateway's own limiter does.
                 .flatMap(decision -> decision
                         .map(outcome -> apply(exchange, chain, plan, outcome))
                         .orElseGet(() -> chain.filter(exchange)));

@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class RateLimitFilterTest {
 
@@ -111,6 +112,38 @@ class RateLimitFilterTest {
         assertThat(storeCalls).hasValue(0);
     }
 
+    @Test
+    void skipsTheStoreWhileTheBreakerIsOpen() {
+        RateLimitFilter filter = filter(store(Mono.error(new IllegalStateException("redis down"))), freshBreaker());
+        run(filter, exchange(), ACME);
+        MockServerWebExchange second = exchange();
+
+        run(filter, second, ACME);
+
+        assertThat(storeCalls).hasValue(1);
+        assertThat(chainCalls).hasValue(2);
+        assertThat(second.getResponse().getHeaders().getFirst("X-RateLimit-Remaining")).isNull();
+    }
+
+    /** A downstream error is not a Redis failure: it propagates, and the breaker stays closed. */
+    @Test
+    void propagatesADownstreamErrorWithoutForwardingTwice() {
+        RedisCircuitBreaker breaker = freshBreaker();
+        RateLimitFilter filter = filter(store(Mono.just(new Decision(true, null, 9, 999, 0, 3600))), breaker);
+        GatewayFilterChain failing = exchange -> {
+            chainCalls.incrementAndGet();
+            return Mono.error(new IllegalStateException("downstream failed"));
+        };
+
+        assertThatThrownBy(() -> filter.filter(exchange(), failing)
+                .contextWrite(ReactiveSecurityContextHolder.withAuthentication(ACME))
+                .block(Duration.ofSeconds(5)))
+                .hasMessageContaining("downstream failed");
+
+        assertThat(chainCalls).hasValue(1);
+        assertThat(breaker.allowCall()).isTrue();
+    }
+
     private static MockServerWebExchange exchange() {
         return MockServerWebExchange.from(MockServerHttpRequest.get("/api/ledger/entries"));
     }
@@ -122,13 +155,25 @@ class RateLimitFilterTest {
         };
     }
 
+    private static RedisCircuitBreaker freshBreaker() {
+        return new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, System::nanoTime);
+    }
+
     private RateLimitFilter filter(RateLimitStore store) {
+        return filter(store, freshBreaker());
+    }
+
+    private RateLimitFilter filter(RateLimitStore store, RedisCircuitBreaker breaker) {
         return new RateLimitFilter(new ConfiguredPlanResolver(PROPERTIES), store,
-                new TooManyRequestsWriter(ServerCodecConfigurer.create()), PROPERTIES);
+                new TooManyRequestsWriter(ServerCodecConfigurer.create()), PROPERTIES, breaker);
     }
 
     private void run(MockServerWebExchange exchange, RateLimitStore store, Authentication caller) {
-        filter(store).filter(exchange, chain)
+        run(filter(store), exchange, caller);
+    }
+
+    private void run(RateLimitFilter filter, MockServerWebExchange exchange, Authentication caller) {
+        filter.filter(exchange, chain)
                 .contextWrite(ReactiveSecurityContextHolder.withAuthentication(caller))
                 .block(Duration.ofSeconds(5));
     }

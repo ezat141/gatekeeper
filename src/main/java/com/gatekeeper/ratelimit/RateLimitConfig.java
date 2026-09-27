@@ -12,8 +12,14 @@ public class RateLimitConfig {
         return new ConfiguredPlanResolver(properties);
     }
 
+    /** Declared as the concrete type so {@link RedisWarmUp} can use its connection step. */
     @Bean
-    public RateLimitStore rateLimitStore(ReactiveStringRedisTemplate redis) {
+    public RedisRateLimitStore rateLimitStore(ReactiveStringRedisTemplate redis) {
         return new RedisRateLimitStore(redis);
+    }
+
+    @Bean
+    public RedisCircuitBreaker redisCircuitBreaker() {
+        return new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, System::nanoTime);
     }
 }
