@@ -220,6 +220,69 @@ dependency of every request, JWT callers included.
 **Rejected — a configuration switch.** Two behaviours to test and document, for a choice no deployment
 has asked to make.
 
+### A timeout alone was not enough — found in Task 5, decided with the repo owner
+
+Task 5's silent-Redis test hung rather than failing open, and thread dumps showed why. The first time a
+gateway uses Redis, Lettuce opens its shared connection with a **blocking wait inside `subscribe()`**
+(`LettuceConnectionFactory.getSharedReactiveConnection` → `RedisClient.connect` →
+`DefaultConnectionFuture.get()`). The wait happens before `.timeout(…)` has started its clock, so the
+timeout never fires; it lasts up to Lettuce's handshake timeout, 60 seconds by default; and it runs on
+whatever thread subscribes — potentially a Netty event loop. A firewalled Redis causes the same wait
+(10 s connect timeout).
+
+**Chosen — keep the call off the event loop, and connect before traffic arrives.**
+
+- **The store subscribes on `Schedulers.boundedElastic()`.** A blocking connect then holds a worker
+  thread, never the event loop, and the filter's timeout always applies. This lives in
+  `RedisRateLimitStore`, the one place that knows the call can block; the filter stays generic.
+- **A bounded warm-up at startup.** Before the web server accepts traffic, the gateway pings Redis once,
+  off the calling thread, waiting at most two seconds and ignoring failure. Without it, the first
+  request after boot would pay for the connection and the script load, exceed 200 ms, and go through
+  unlimited — Task 5 saw exactly that when it tried the worker thread alone. Once connected, Lettuce
+  reconnects in the background without blocking, so the blocking wait belongs to first use only.
+
+**Rejected — shorter Lettuce timeouts** (`spring.data.redis.connect-timeout`, `spring.data.redis.timeout`).
+They shorten the wait but still block the subscribing thread, on every request while Redis stays
+unreachable, and they change the API-key cache's command timeout too.
+
+**Rejected — accept the hang and narrow the test.** It gives up the guarantee this section calls not
+optional.
+
+**Recorded, not fixed here:** M3's API-key cache uses the same template and very likely has the same
+exposure on a silent Redis — its first call could block an event loop for up to the handshake timeout.
+It predates M5 and belongs to whoever next touches that path.
+
+### …and moving it to a worker was not enough either — found in Task 5's review
+
+Measured against the real Redis behind a frozen proxy: 159 requests in five seconds of silence opened
+146 connections, none of them ever closed. The mechanism: when a request's timeout fires, Reactor
+cancels the worker by **interrupting** it; Lettuce stops waiting but abandons its connection attempt
+rather than cancelling it, and the next queued worker starts a fresh one. Each late failure is also
+logged as a dropped error. When Redis answers again, every orphan becomes a live client — enough, at
+production traffic, to exceed Redis's `maxclients` on the Redis AuthCore shares.
+
+A second gap followed from the same review: once connected, Lettuce buffers every command while it
+reconnects, without a bound, and a cancelled command stays buffered. The limiter adds one per request.
+
+**Chosen — connect once, and stop asking a Redis that is not answering.**
+
+- **One connection attempt at a time, which no request can cancel.** The store holds a single cached
+  "connected" step: a ping, subscribed on a worker thread, whose success is cached for good and whose
+  failure is not cached at all. A request waits on it within its own timeout; timing out stops the
+  request waiting, never the attempt. Once connected, the hot path makes no thread hop — Lettuce's
+  commands are non-blocking on an established connection, and it reconnects in the background. The
+  startup warm-up subscribes to the same step.
+- **A circuit breaker in the filter** — chosen with the repo owner over rejecting commands client-wide
+  (which would change the API-key cache's behaviour during a reconnect) and over a separate Redis client
+  for the limiter (a second connection and duplicated configuration). After a store failure or timeout,
+  the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and
+  a success closes the breaker. This bounds what the limiter can add to Lettuce's buffer to about one
+  command per window, keeps workers free, and turns an outage into one warning when the breaker opens
+  and one line when it closes, instead of a stack trace per request.
+- **The cost, stated:** after any Redis failure, limiting is suspended for up to five seconds even if
+  Redis recovers sooner. That is the fail-open choice of this section applied to a window rather than a
+  single request.
+
 ---
 
 ## 8. The `429` response
