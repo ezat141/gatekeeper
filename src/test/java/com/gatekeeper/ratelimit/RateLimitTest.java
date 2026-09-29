@@ -199,6 +199,14 @@ class RateLimitTest {
         assertThat(redis.hasKey(RedisRateLimitStore.quotaKey(identity)).block()).isFalse();
     }
 
+    /** The health probe is not a gateway route, so the limiter never runs against it. */
+    @Test
+    void theHealthProbeCarriesNoRateLimitHeaders() {
+        client.get().uri("/actuator/health").exchange()
+                .expectStatus().isOk()
+                .expectHeader().doesNotExist("X-RateLimit-Remaining");
+    }
+
     private WebTestClient.ResponseSpec ledger(String bearer) {
         return client.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, bearer).exchange();
     }

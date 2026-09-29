@@ -240,9 +240,11 @@ whatever thread subscribes — potentially a Netty event loop. A firewalled Redi
   established connection makes no thread hop.)
 - **A bounded warm-up at startup.** Before the web server accepts traffic, the gateway pings Redis once,
   off the calling thread, waiting at most two seconds and ignoring failure. Without it, the first
-  request after boot would pay for the connection and the script load, exceed 200 ms, and go through
-  unlimited — Task 5 saw exactly that when it tried the worker thread alone. Once connected, Lettuce
-  reconnects in the background without blocking, so the blocking wait belongs to first use only.
+  request after boot would pay for opening the connection, exceed 200 ms, and go through unlimited —
+  Task 5 saw exactly that when it tried the worker thread alone. The warm-up only opens the
+  connection, not the script: the first request still pays one extra round trip, `EVALSHA` answered
+  `NOSCRIPT` then `EVAL`, which is small. Once connected, Lettuce reconnects in the background
+  without blocking, so the blocking wait belongs to first use only.
 
 **Rejected — shorter Lettuce timeouts** (`spring.data.redis.connect-timeout`, `spring.data.redis.timeout`).
 They shorten the wait but still block the subscribing thread, on every request while Redis stays

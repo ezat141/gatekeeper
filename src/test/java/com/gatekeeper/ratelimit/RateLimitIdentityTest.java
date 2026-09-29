@@ -94,6 +94,15 @@ class RateLimitIdentityTest {
         assertThat(RateLimitIdentity.of(key)).isEmpty();
     }
 
+    /** A blank name, same as a blank tenant: every such key would otherwise share one bucket. */
+    @Test
+    void anApiKeyWithABlankNameHasNoIdentity() {
+        Authentication key = new ApiKeyAuthenticationToken(" ",
+                AuthorityUtils.createAuthorityList("SCOPE_payments:read"));
+
+        assertThat(RateLimitIdentity.of(key)).isEmpty();
+    }
+
     @Test
     void anAnonymousCallerHasNoIdentity() {
         Authentication anonymous = new AnonymousAuthenticationToken(

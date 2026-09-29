@@ -74,8 +74,13 @@ public class RedisRateLimitStore implements RateLimitStore {
         // validateConnection() when setValidateConnection(true), which Spring Boot does not set —
         // and normal operation calls none of them; Lettuce itself reconnects in the background.
         // After a lifecycle stop and restart, the first check would connect on the calling thread.
+        //
+        // .single() turns an empty ping into an error too, so it is not cached as success either —
+        // cache's own "empty" branch only covers a Mono that completes with no error and no value
+        // reaching thenReturn, which never happens once thenReturn always supplies one.
         this.connected = Mono.defer(ping)
                 .subscribeOn(Schedulers.boundedElastic())
+                .single()
                 .thenReturn(Boolean.TRUE)
                 .cache(ok -> FOREVER, error -> Duration.ZERO, () -> Duration.ZERO);
     }

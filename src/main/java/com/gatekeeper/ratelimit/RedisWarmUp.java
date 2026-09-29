@@ -13,9 +13,11 @@ import java.time.Duration;
  * section 7.
  *
  * <p>Lettuce opens its shared connection on first use. Without this, the first rate-limited
- * request after boot would pay for the connection and the script load, exceed the limiter's
- * timeout, and go through unlimited. {@code afterSingletonsInstantiated} runs while the context
- * refreshes, before the web server binds its port.
+ * request after boot would pay for opening that connection, exceed the limiter's timeout, and go
+ * through unlimited. This only opens the connection, not the script: the first request still pays
+ * one extra round trip, {@code EVALSHA} answered {@code NOSCRIPT} then {@code EVAL}, which is
+ * small. {@code afterSingletonsInstantiated} runs while the context refreshes, before the web
+ * server binds its port.
  *
  * <p><strong>Bounded, and never fails the boot.</strong> It waits on the store's own connection
  * step — which already runs on a worker thread — for at most {@link #WARM_UP_TIMEOUT}. Giving up

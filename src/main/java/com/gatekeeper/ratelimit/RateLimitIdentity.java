@@ -61,7 +61,8 @@ public record RateLimitIdentity(Kind kind, String name) {
      *       token, which also carries the client as {@code aud} and no {@code tenant}, would
      *       count against its client rather than its tenant — see the handoff. See the M5
      *       design, section 4.</li>
-     *   <li>An API key is its name, from introspection.</li>
+     *   <li>An API key is its name, from introspection. A blank name is treated as absent, as a
+     *       blank tenant is above: every such key would otherwise share one bucket.</li>
      * </ul>
      *
      * Anything else has no identity. Every routed request is authenticated, so that is not
@@ -82,7 +83,9 @@ public record RateLimitIdentity(Kind kind, String name) {
                     : Optional.empty();
         }
         if (authentication instanceof ApiKeyAuthenticationToken apiKey && apiKey.isAuthenticated()) {
-            return Optional.ofNullable(apiKey.getName()).map(name -> new RateLimitIdentity(Kind.API_KEY, name));
+            return Optional.ofNullable(apiKey.getName())
+                    .filter(name -> !name.isBlank())
+                    .map(name -> new RateLimitIdentity(Kind.API_KEY, name));
         }
         return Optional.empty();
     }

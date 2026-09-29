@@ -66,6 +66,20 @@ class RedisRateLimitStoreConnectTest {
         assertThat(pings).hasValue(1);
     }
 
+    /** An empty ping is not a success: it must not be cached, so the next caller pings again. */
+    @Test
+    void anEmptyPingIsRetried() {
+        RedisRateLimitStore store = new RedisRateLimitStore(null, () -> {
+            int attempt = pings.incrementAndGet();
+            return attempt == 1 ? Mono.empty() : Mono.just("PONG");
+        });
+
+        assertThatThrownBy(() -> store.connect().block(Duration.ofSeconds(2)));
+        store.connect().block(Duration.ofSeconds(2));
+
+        assertThat(pings).hasValue(2);
+    }
+
     @Test
     void triesAgainAfterAFailure() {
         RedisRateLimitStore store = new RedisRateLimitStore(null, () -> Mono.fromCallable(() -> {
