@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.util.NoSuchElementException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -74,7 +75,8 @@ class RedisRateLimitStoreConnectTest {
             return attempt == 1 ? Mono.empty() : Mono.just("PONG");
         });
 
-        assertThatThrownBy(() -> store.connect().block(Duration.ofSeconds(2)));
+        assertThatThrownBy(() -> store.connect().block(Duration.ofSeconds(2)))
+                .isInstanceOf(NoSuchElementException.class);
         store.connect().block(Duration.ofSeconds(2));
 
         assertThat(pings).hasValue(2);

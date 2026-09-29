@@ -511,7 +511,7 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 ./mvnw test
 ```
 
-**233 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services, so most of the suite runs offline. The tests that exercise an API key or the rate limiter's script are the exception: they need a real Redis, started as shown in the [Quickstart](#quickstart). Without Redis, 44 of the 233 fail or never run (23 before M5) — a missing container, not a defect; the fail-open tests pass either way because they bring their own dead or silent Redis.
+**236 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services, so most of the suite runs offline. The tests that exercise an API key or the rate limiter's script are the exception: they need a real Redis, started as shown in the [Quickstart](#quickstart). Without Redis, 45 of the 236 fail or never run (23 before M5) — a missing container, not a defect; the fail-open tests pass either way because they bring their own dead or silent Redis.
 
 **Routing and startup**
 
@@ -566,18 +566,18 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 | `RateLimitPropertiesBindingTest` | 2 | `application.yml` binds as written, and the test override makes every shipped plan effectively unlimited so the older suites are never limited |
 | `RateLimitPropertiesStrictBindingTest` | 2 | A misspelt assignment kind stops the boot rather than silently binding nothing |
 | `ConfiguredPlanResolverTest` | 5 | Each kind of assignment, the default plan, and a tenant and a client of the same name kept apart |
-| `RateLimitIdentityTest` | 16 | Tenant, then `aud`, then `sub`; blank values treated as absent; no identity for an anonymous or unauthenticated caller; percent-encoding of the key |
+| `RateLimitIdentityTest` | 17 | Tenant, then `aud`, then `sub`; blank values treated as absent; no identity for an anonymous or unauthenticated caller or a blank API-key name; percent-encoding of the key |
 | `RedisRateLimitStoreTest` | 11 | The script against **real Redis** with a fixed `now`: the burst, refill at the plan's rate and never past the burst, the quota until UTC midnight and its reset across it, the bucket checked first, refusals that write nothing, quota remaining never negative, key names and expiries, and Redis's own clock when no time is given |
-| `RedisRateLimitStoreConnectTest` | 3 | One connection attempt at a time: callers who give up neither cancel nor repeat it; a success is kept, a failure is retried |
+| `RedisRateLimitStoreConnectTest` | 4 | One connection attempt at a time: callers who give up neither cancel nor repeat it; a success is kept, a failure is retried, an empty ping is retried |
 | `RedisCircuitBreakerTest` | 8 | Opens on a failure, denies for the window, lets exactly one caller probe, closes only on the probe's success, and opens once — not hundreds of times — when answers arrive around the timeout |
 | `RedisWarmUpTest` | 3 | The startup ping returns within its bound when Redis never answers, quietly when it fails, and after one ping when it answers |
 | `RateLimitFilterTest` | 9 | Allowed requests forwarded once with the headers; refusals never forwarded; a failing, silent or empty store fails open; no identity skips the store; an open breaker skips it; a downstream error is not mistaken for Redis failing and forwarded twice; a late answer does not close the breaker |
-| `RateLimitTest` | 7 | End to end through WireMock: the `429` after the burst and after the quota, headers on allowed responses, `free` and `pro` differing, one tenant's users sharing a bucket, two clients not, and `401`/`403` carrying no headers and touching no Redis |
+| `RateLimitTest` | 8 | End to end through WireMock: the `429` after the burst and after the quota, headers on allowed responses, `free` and `pro` differing, one tenant's users sharing a bucket, two clients not, `401`/`403` carrying no headers and touching no Redis, and the health probe carrying none either |
 | `TwoGatewaysShareOneLimitTest` | 3 | Two application contexts, one Redis: one combined burst and one combined quota |
 | `DeadRedisFailOpenTest` | 1 | A Redis port nobody listens on: `200`, no rate-limit headers |
 | `SilentRedisFailOpenTest` | 1 | A Redis that accepts and never answers: every request served within about the timeout, and at most one connection ever opened |
 
-Current run, with Redis up: `Tests run: 233, Failures: 0, Errors: 0, Skipped: 0`.
+Current run, with Redis up: `Tests run: 236, Failures: 0, Errors: 0, Skipped: 0`.
 
 Five earlier tests are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
 
