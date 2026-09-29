@@ -57,9 +57,9 @@ validated at startup. One atomic Lua script per request checks a token bucket
 (`gatekeeper:rl:{id}`) and then a daily quota (`gatekeeper:quota:{id}`) on Redis's clock, so every
 instance sharing the Redis enforces one limit. A refusal is a 429 in the platform shape, with the
 fixed `detail` of its reason (`RATE_LIMITED` or `QUOTA_EXCEEDED`), a computed `Retry-After`, and
-`X-RateLimit-*` and `X-Quota-*` headers, which allowed responses carry too. A Redis failure **fails open** within 200 ms:
-a single-flight connection off the event loop, a warm-up before the port binds, and a five-second
-circuit breaker keep it from hanging or leaking connections. The M5 design
+`X-RateLimit-*` and `X-Quota-*` headers, which allowed responses carry too. A Redis failure **fails
+open** within 200 ms: a single-flight connection off the event loop, a warm-up before the port binds,
+and a five-second circuit breaker keep it from hanging or leaking connections. The M5 design
 (`specs/2026-09-27-gatekeeper-m5-design.md`) is the reference, section 7 especially.
 
 **Next: M6 — the revocation check.** It reads the same Redis M5 does, and must decide the opposite way:

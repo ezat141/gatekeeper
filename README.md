@@ -443,7 +443,7 @@ The platform's error shape, with one of two fixed `detail` strings ([`RateLimitR
 - **The downstream is never contacted.**
 - **Written in one place.** [`TooManyRequestsWriter`](src/main/java/com/gatekeeper/error/TooManyRequestsWriter.java) renders it through the same `ErrorBody` as the `401` and `403`, and the filter completes the response itself — no exception, no detour through the global error handler.
 
-**Allowed responses carry the same six `X-RateLimit-*` and `X-Quota-*` headers**, so a well-behaved client can slow down before it is refused. The bucket headers keep Spring's names; the quota headers are the gateway's own, since Spring has no quota. `X-Quota-Reset` is the seconds until the quota resets. **Responses carrying none of these headers:** `401` and `403`, which it runs after; the health probe, which is not routed; and requests let through while Redis is failing.
+**Allowed responses carry the same six `X-RateLimit-*` and `X-Quota-*` headers**, so a well-behaved client can slow down before it is refused. The bucket headers keep Spring's names; the quota headers are the gateway's own, since Spring has no quota. `X-Quota-Reset` is the seconds until the quota resets. **Responses carrying none of these headers:** `401` and `403`, which the limiter runs after; the health probe, which is not routed; and requests let through while Redis is failing.
 
 ### When Redis fails, requests go through
 
@@ -608,7 +608,7 @@ The M5 tests were checked the same way. Deleting the quota check from the script
 
 ## Known limitations
 
-Honest about what this is not, yet. Several of these are the direct consequence of M0–M5 being a deliberately narrow slice. The handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5) keeps the full list of open items the milestones' reviews and runs found, with an owner for each.
+Honest about what this is not, yet. Several of these are the direct consequence of M0–M5 being a deliberately narrow slice. The handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5) keeps the open items the milestones' reviews and runs found, with an owner for each.
 
 - **Identity headers are informational, not authoritative.** They are stamped from verified claims and inbound ones are stripped — see [the section above](#the-identity-headers-it-stamps) — but no downstream should authorize on them, and ledger-service deliberately does not. Treating `X-GK-*` as a trust signal would make every service behind this gateway depend on the gateway being unbypassable, which it is not.
 
