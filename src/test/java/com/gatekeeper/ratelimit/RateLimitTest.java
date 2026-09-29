@@ -155,9 +155,9 @@ class RateLimitTest {
     }
 
     /**
-     * Alice and bob come through two different, fresh clients on purpose. If the sharing came
-     * from the client instead of the tenant, bob's client would have a fresh bucket of its own
-     * and his fourth request would still be allowed. Only the shared tenant can explain the 429.
+     * Every request comes through a fresh client, so the only thing the four share is the
+     * tenant: were the limiter keyed by client, each request would get a fresh bucket and the
+     * fourth would still be allowed.
      */
     @Test
     void usersOfOneTenantShareABucket() {
