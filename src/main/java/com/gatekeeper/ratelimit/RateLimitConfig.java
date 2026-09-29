@@ -20,6 +20,7 @@ public class RateLimitConfig {
 
     @Bean
     public RedisCircuitBreaker redisCircuitBreaker() {
-        return new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, System::nanoTime);
+        return new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, RedisCircuitBreaker.FAILURES_TO_OPEN,
+                System::nanoTime);
     }
 }

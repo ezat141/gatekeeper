@@ -371,9 +371,10 @@ All in a new package, `com.gatekeeper.ratelimit`, except the writer.
 - **`RateLimitFilter`** — a `GlobalFilter` ordered just after `IdentityStampFilter` and before every
   routing filter. It applies to all three routes with no route configuration. It resolves identity and
   plan, calls the store under the timeout, and on allow adds the headers and continues; on refusal
-  writes the `429`; on error or timeout continues without headers and opens the breaker.
-- **`RedisCircuitBreaker`** — §7: after a store failure, no Redis calls for five seconds, then one
-  probe; only the probe's success closes it.
+  writes the `429`; on error or timeout continues without headers and counts the failure against the
+  breaker.
+- **`RedisCircuitBreaker`** — §7: after three consecutive store failures, no Redis calls for five
+  seconds, then one probe; only the probe's success closes it, and its failure re-opens it at once.
 - **`RedisWarmUp`** — §7: one bounded connection attempt at startup, before the port binds.
 - **`error.TooManyRequestsWriter`** — §8.
 

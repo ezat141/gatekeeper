@@ -5,17 +5,26 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
 /**
  * Stops the limiter asking a Redis that is not answering. The M5 design, section 7.
  *
- * <p>After a store failure or timeout the breaker opens: for {@link #OPEN_FOR} no request calls
- * Redis, and each is forwarded unlimited. Then exactly one request probes; its success closes the
- * breaker, its failure opens it for another window. This bounds what the limiter adds to Lettuce's
- * unbounded reconnect buffer to about one command per window, and turns an outage into one
- * warning when the breaker opens and one line when it closes, instead of a stack trace per request.
+ * <p>After {@link #FAILURES_TO_OPEN} consecutive store failures or timeouts the breaker opens: for
+ * {@link #OPEN_FOR} no request calls Redis, and each is forwarded unlimited. Then exactly one request
+ * probes; its success closes the breaker, its failure opens it for another window at once. This
+ * bounds what the limiter adds to Lettuce's unbounded reconnect buffer to about one command per
+ * window, and turns an outage into one warning when the breaker opens and one line when it closes,
+ * instead of a stack trace per request.
+ *
+ * <p><strong>Why three, not one.</strong> The timeout is measured in the gateway, so a single one may
+ * be the gateway's own slowness — a GC pause, or CPU starved by the very flood a capacity control
+ * exists for — rather than Redis's. Opening on one would switch limiting off for everyone under
+ * overload. So an isolated failure fails only its own request open, any success while closed resets
+ * the count, and it takes three in a row to open. A hard outage still reaches three within the
+ * first few requests; a failed probe needs no such count, because the evidence is already in.
  *
  * <p><strong>Only the probe closes it.</strong> Each call takes a {@link Permit} before it asks
  * Redis and reports its outcome with that permit. A request already in flight when the breaker
@@ -23,12 +32,14 @@ import java.util.function.LongSupplier;
  * it does not close the breaker. Otherwise a Redis answering around the timeout would open and
  * close it hundreds of times a second.
  *
- * <p>The cost: after any Redis failure, limiting stays suspended for up to one window even if Redis
+ * <p>The cost: once the breaker opens, limiting stays suspended for up to one window even if Redis
  * recovers sooner.
  */
 public class RedisCircuitBreaker {
 
     static final Duration OPEN_FOR = Duration.ofSeconds(5);
+    /** Consecutive failures, while closed, that open the breaker. */
+    static final int FAILURES_TO_OPEN = 3;
 
     private static final Logger log = LoggerFactory.getLogger(RedisCircuitBreaker.class);
 
@@ -44,13 +55,16 @@ public class RedisCircuitBreaker {
 
     private final Duration openFor;
     private final long openForNanos;
+    private final int failuresToOpen;
     private final LongSupplier nanoTime;
     private final AtomicBoolean open = new AtomicBoolean();
     private final AtomicLong openUntil = new AtomicLong();
+    private final AtomicInteger consecutiveFailures = new AtomicInteger();
 
-    public RedisCircuitBreaker(Duration openFor, LongSupplier nanoTime) {
+    public RedisCircuitBreaker(Duration openFor, int failuresToOpen, LongSupplier nanoTime) {
         this.openFor = openFor;
         this.openForNanos = openFor.toNanos();
+        this.failuresToOpen = failuresToOpen;
         this.nanoTime = nanoTime;
     }
 
@@ -71,25 +85,47 @@ public class RedisCircuitBreaker {
         return openUntil.compareAndSet(until, now + openForNanos) ? Permit.PROBE : Permit.DENIED;
     }
 
-    /** Closes the breaker, but only for the probe's success. True only when this call closed it. */
+    /**
+     * While closed, resets the count of consecutive failures. While open, closes the breaker, but
+     * only for the probe's success; a late success from before the opening does nothing. True only
+     * when this call closed it.
+     */
     public boolean recordSuccess(Permit permit) {
-        if (permit == Permit.PROBE && open.compareAndSet(true, false)) {
-            log.info("Rate limiter's Redis answered again; limiting resumed");
-            return true;
+        if (permit == Permit.PROBE) {
+            // Reset again before closing, in case a failure was counted just as the breaker opened:
+            // the first failure after the closing counts from zero, and none after it is lost.
+            consecutiveFailures.set(0);
+            if (open.compareAndSet(true, false)) {
+                log.info("Rate limiter's Redis answered again; limiting resumed");
+                return true;
+            }
+        } else if (permit == Permit.CLOSED && !open.get()) {
+            consecutiveFailures.set(0);
         }
         return false;
     }
 
     /**
-     * Opens the breaker for a window from now, or, if it is already open — a failed probe, or a
-     * late failure from before the opening — extends it. Warns, with the cause, only on the
-     * opening. True only when this call opened it.
+     * While closed, counts the failure, and opens the breaker for a window from now when it is the
+     * {@link #FAILURES_TO_OPEN}th in a row, warning with the cause. While open — a failed probe, or
+     * a late failure from before the opening — re-opens it for a window from now, at once. True only
+     * when this call opened it.
      */
     public boolean recordFailure(Permit permit, Throwable error) {
+        if (permit == Permit.CLOSED && !open.get()) {
+            int failures = consecutiveFailures.incrementAndGet();
+            if (failures < failuresToOpen) {
+                log.debug("Rate limiter's Redis failed; failing this request open; {} of {} consecutive failures: {}",
+                        failures, failuresToOpen, error.toString());
+                return false;
+            }
+        }
         openUntil.set(nanoTime.getAsLong() + openForNanos);
         if (open.compareAndSet(false, true)) {
-            log.warn("Rate limiter's Redis failed; forwarding requests unlimited for {} s at a time until it answers",
-                    openFor.toSeconds(), error);
+            // The count describes only the stretch while closed.
+            consecutiveFailures.set(0);
+            log.warn("Rate limiter's Redis failed {} times in a row; forwarding requests unlimited for {} s at a time"
+                    + " until it answers", failuresToOpen, openFor.toSeconds(), error);
             return true;
         }
         log.debug("Rate limiter's Redis still failing ({} call): {}", permit, error.toString());

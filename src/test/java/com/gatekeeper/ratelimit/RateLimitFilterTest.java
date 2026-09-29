@@ -122,20 +122,45 @@ class RateLimitFilterTest {
     @Test
     void skipsTheStoreWhileTheBreakerIsOpen() {
         RateLimitFilter filter = filter(store(Mono.error(new IllegalStateException("redis down"))), freshBreaker());
+        for (int i = 0; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
+            run(filter, exchange(), ACME);
+        }
+        MockServerWebExchange next = exchange();
+
+        run(filter, next, ACME);
+
+        assertThat(storeCalls).hasValue(RedisCircuitBreaker.FAILURES_TO_OPEN);
+        assertThat(chainCalls).hasValue(RedisCircuitBreaker.FAILURES_TO_OPEN + 1);
+        assertThat(next.getResponse().getHeaders().getFirst("X-RateLimit-Remaining")).isNull();
+    }
+
+    /** One slow or failed answer fails its own request open; the next caller is still limited. */
+    @Test
+    void anIsolatedFailureDoesNotSkipTheStoreForOthers() {
+        Queue<Mono<Decision>> answers = new ArrayDeque<>(List.of(
+                Mono.error(new IllegalStateException("redis slow")),
+                Mono.just(new Decision(true, null, 9, 999, 0, 3600))));
+        RateLimitFilter filter = filter((identity, plan) -> {
+            storeCalls.incrementAndGet();
+            return answers.remove();
+        }, freshBreaker());
         run(filter, exchange(), ACME);
         MockServerWebExchange second = exchange();
 
         run(filter, second, ACME);
 
-        assertThat(storeCalls).hasValue(1);
+        assertThat(storeCalls).hasValue(2);
         assertThat(chainCalls).hasValue(2);
-        assertThat(second.getResponse().getHeaders().getFirst("X-RateLimit-Remaining")).isNull();
+        assertThat(second.getResponse().getHeaders().getFirst("X-RateLimit-Remaining")).isEqualTo("9");
     }
 
-    /** A downstream error is not a Redis failure: it propagates, and the breaker stays closed. */
+    /**
+     * A downstream error is not a Redis failure: it propagates, and the breaker stays closed. The
+     * breaker here opens on a single failure, so one mistaken failure would show.
+     */
     @Test
     void propagatesADownstreamErrorWithoutForwardingTwice() {
-        RedisCircuitBreaker breaker = freshBreaker();
+        RedisCircuitBreaker breaker = new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, 1, System::nanoTime);
         RateLimitFilter filter = filter(store(Mono.just(new Decision(true, null, 9, 999, 0, 3600))), breaker);
         GatewayFilterChain failing = exchange -> {
             chainCalls.incrementAndGet();
@@ -152,7 +177,7 @@ class RateLimitFilterTest {
     }
 
     /**
-     * A request in flight when another's failure opened the breaker answers afterwards: it is
+     * A request in flight when others' failures opened the breaker answers afterwards: it is
      * served with its decision, but its success does not close the breaker — only a probe's does.
      */
     @Test
@@ -160,6 +185,8 @@ class RateLimitFilterTest {
         Sinks.One<Decision> late = Sinks.one();
         Queue<Mono<Decision>> answers = new ArrayDeque<>(List.of(
                 late.asMono(),
+                Mono.error(new IllegalStateException("redis down")),
+                Mono.error(new IllegalStateException("redis down")),
                 Mono.error(new IllegalStateException("redis down")),
                 Mono.just(new Decision(true, null, 9, 999, 0, 3600))));
         RateLimitFilter filter = filter((identity, plan) -> {
@@ -169,15 +196,17 @@ class RateLimitFilterTest {
         CompletableFuture<Void> inFlight = filter.filter(exchange(), chain)
                 .contextWrite(ReactiveSecurityContextHolder.withAuthentication(ACME))
                 .toFuture();
-        run(filter, exchange(), ACME);
+        for (int i = 0; i < 3; i++) {
+            run(filter, exchange(), ACME);
+        }
 
         late.tryEmitValue(new Decision(true, null, 9, 999, 0, 3600));
         inFlight.get(5, TimeUnit.SECONDS);
         MockServerWebExchange next = exchange();
         run(filter, next, ACME);
 
-        assertThat(storeCalls).hasValue(2);
-        assertThat(chainCalls).hasValue(3);
+        assertThat(storeCalls).hasValue(4);
+        assertThat(chainCalls).hasValue(5);
         assertThat(next.getResponse().getHeaders().getFirst("X-RateLimit-Remaining")).isNull();
     }
 
@@ -193,7 +222,8 @@ class RateLimitFilterTest {
     }
 
     private static RedisCircuitBreaker freshBreaker() {
-        return new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, System::nanoTime);
+        return new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, RedisCircuitBreaker.FAILURES_TO_OPEN,
+                System::nanoTime);
     }
 
     private RateLimitFilter filter(RateLimitStore store) {
