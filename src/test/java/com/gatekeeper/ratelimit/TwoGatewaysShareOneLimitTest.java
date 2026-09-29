@@ -8,7 +8,9 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.client.ReactorResourceFactory;
 import org.springframework.test.web.reactive.server.WebTestClient;
 
 import java.time.Instant;
@@ -32,7 +34,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * M5 design, section 11.
  *
  * <p>The quota test needs no timing and is the unconditional proof. The burst test relies on
- * four requests landing within the second one token takes to refill.
+ * four requests landing within the second one token takes to refill; both instances are warmed
+ * with one request each in {@link #start()} first, so neither test pays a cold-start cost that
+ * a real deployment would already have absorbed.
+ *
+ * <p>Each instance is also given its own {@link ReactorResourceFactory} (see {@link #gateway()}):
+ * Boot's default one sets {@code useGlobalResources(true)}, so it shares Reactor Netty's event
+ * loops and connection pools with every other Spring context in the JVM. Left at the default,
+ * {@link #stop()} closing one gateway would dispose those pools out from under every other test
+ * class running in the same suite — not just this one's — surfacing as {@code
+ * PrematureCloseException} in unrelated tests' teardown.
  */
 class TwoGatewaysShareOneLimitTest {
 
@@ -58,6 +69,8 @@ class TwoGatewaysShareOneLimitTest {
         second = gateway();
         toFirst = clientFor(first);
         toSecond = clientFor(second);
+        warmUp(toFirst);
+        warmUp(toSecond);
     }
 
     @AfterAll
@@ -68,22 +81,33 @@ class TwoGatewaysShareOneLimitTest {
         if (second != null) {
             second.close();
         }
-        downstream.stop();
+        if (downstream != null) {
+            downstream.stop();
+        }
     }
 
     @Test
     void theTwoInstancesAreDistinct() {
-        assertThat(port(first)).isNotEqualTo(port(second));
+        int firstPort = port(first);
+        int secondPort = port(second);
+        assertThat(firstPort).isNotEqualTo(secondPort);
+        assertThat(firstPort).isNotEqualTo(8081);
+        assertThat(secondPort).isNotEqualTo(8081);
+
+        assertThat(first.getBeansOfType(ReactorResourceFactory.class)).hasSize(1);
+        assertThat(second.getBeansOfType(ReactorResourceFactory.class)).hasSize(1);
+        assertThat(first.getBean(ReactorResourceFactory.class).isUseGlobalResources()).isFalse();
+        assertThat(second.getBean(ReactorResourceFactory.class).isUseGlobalResources()).isFalse();
     }
 
     @Test
     void shareOneDailyQuota() {
         String token = userToken(QUOTA_TENANT);
-        toFirst.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
-        toSecond.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
-        toFirst.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
+        ledger(toFirst, token).expectStatus().isOk().expectHeader().valueEquals("X-Quota-Remaining", "2");
+        ledger(toSecond, token).expectStatus().isOk().expectHeader().valueEquals("X-Quota-Remaining", "1");
+        ledger(toFirst, token).expectStatus().isOk().expectHeader().valueEquals("X-Quota-Remaining", "0");
 
-        toSecond.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange()
+        ledger(toSecond, token)
                 .expectStatus().isEqualTo(429)
                 .expectBody().jsonPath("$.detail").isEqualTo(RateLimitReason.QUOTA_EXCEEDED.detail());
     }
@@ -91,13 +115,30 @@ class TwoGatewaysShareOneLimitTest {
     @Test
     void shareOneBurst() {
         String token = userToken("t-" + UUID.randomUUID());
-        toFirst.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
-        toSecond.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
-        toFirst.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
+        ledger(toFirst, token).expectStatus().isOk().expectHeader().valueEquals("X-RateLimit-Remaining", "2");
+        ledger(toSecond, token).expectStatus().isOk().expectHeader().valueEquals("X-RateLimit-Remaining", "1");
+        ledger(toFirst, token).expectStatus().isOk().expectHeader().valueEquals("X-RateLimit-Remaining", "0");
 
-        toSecond.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange()
+        ledger(toSecond, token)
                 .expectStatus().isEqualTo(429)
                 .expectBody().jsonPath("$.detail").isEqualTo(RateLimitReason.RATE_LIMITED.detail());
+    }
+
+    /**
+     * One request per instance before the timed tests run, so a cold circuit breaker probe or a
+     * cold connection pool never counts against {@link #shareOneBurst()}'s one-second budget. A
+     * fresh, unrelated tenant so it spends none of the timed tests' own allowance; the response
+     * must already carry the limiter's headers, so a breaker trip here fails fast with a clear
+     * cause instead of surfacing later as a mysterious timing failure.
+     */
+    private static void warmUp(WebTestClient client) {
+        ledger(client, userToken("warm-" + UUID.randomUUID()))
+                .expectStatus().isOk()
+                .expectHeader().exists("X-RateLimit-Remaining");
+    }
+
+    private static WebTestClient.ResponseSpec ledger(WebTestClient client, String token) {
+        return client.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token).exchange();
     }
 
     /**
@@ -106,22 +147,35 @@ class TwoGatewaysShareOneLimitTest {
      * {@code server.port: 8081} would put both instances on one port, and {@code default-plan:
      * free} would give every fresh tenant the test override's unlimited plan. Arguments outrank
      * every configuration file.
+     *
+     * <p>The initializer registers a private {@link ReactorResourceFactory} before Boot's own
+     * {@code @ConditionalOnMissingBean} one would apply, so each context keeps its Reactor Netty
+     * resources to itself — see the class Javadoc.
      */
     private static ConfigurableApplicationContext gateway() {
-        return new SpringApplicationBuilder(GateKeeperApplication.class).run(
-                "--server.port=0",
-                "--gatekeeper.auth.jwk-set-uri=" + downstream.baseUrl() + "/oauth2/jwks",
-                "--gatekeeper.auth.issuer=" + ISSUER,
-                "--gatekeeper.downstream.ledger=" + downstream.baseUrl(),
-                "--gatekeeper.downstream.authcore=" + downstream.baseUrl(),
-                "--gatekeeper.rate-limit.default-plan=burst3",
-                "--gatekeeper.rate-limit.plans.burst3.requests-per-second=1",
-                "--gatekeeper.rate-limit.plans.burst3.burst=3",
-                "--gatekeeper.rate-limit.plans.burst3.daily-quota=1000",
-                "--gatekeeper.rate-limit.plans.quota3.requests-per-second=1000",
-                "--gatekeeper.rate-limit.plans.quota3.burst=1000",
-                "--gatekeeper.rate-limit.plans.quota3.daily-quota=3",
-                "--gatekeeper.rate-limit.assignments.tenants." + QUOTA_TENANT + "=quota3");
+        return new SpringApplicationBuilder(GateKeeperApplication.class)
+                .initializers(context -> ((GenericApplicationContext) context).registerBean(
+                        ReactorResourceFactory.class, TwoGatewaysShareOneLimitTest::privateReactorResources))
+                .run(
+                        "--server.port=0",
+                        "--gatekeeper.auth.jwk-set-uri=" + downstream.baseUrl() + "/oauth2/jwks",
+                        "--gatekeeper.auth.issuer=" + ISSUER,
+                        "--gatekeeper.downstream.ledger=" + downstream.baseUrl(),
+                        "--gatekeeper.downstream.authcore=" + downstream.baseUrl(),
+                        "--gatekeeper.rate-limit.default-plan=burst3",
+                        "--gatekeeper.rate-limit.plans.burst3.requests-per-second=1",
+                        "--gatekeeper.rate-limit.plans.burst3.burst=3",
+                        "--gatekeeper.rate-limit.plans.burst3.daily-quota=1000",
+                        "--gatekeeper.rate-limit.plans.quota3.requests-per-second=1000",
+                        "--gatekeeper.rate-limit.plans.quota3.burst=1000",
+                        "--gatekeeper.rate-limit.plans.quota3.daily-quota=3",
+                        "--gatekeeper.rate-limit.assignments.tenants." + QUOTA_TENANT + "=quota3");
+    }
+
+    private static ReactorResourceFactory privateReactorResources() {
+        ReactorResourceFactory factory = new ReactorResourceFactory();
+        factory.setUseGlobalResources(false);
+        return factory;
     }
 
     private static int port(ConfigurableApplicationContext context) {
