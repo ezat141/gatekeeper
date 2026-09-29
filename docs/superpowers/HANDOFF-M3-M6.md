@@ -1,31 +1,35 @@
 # GateKeeper M3–M6 — Handoff
 
 Written at the close of M0–M2 so the next session starts productive rather than rediscovering what
-this one learned by failing, and kept current through M4. Read this before touching code.
+this one learned by failing, and kept current through M5. Read this before touching code.
 
 ---
 
 ## 1. Where things stand
 
-**M0–M4 are complete.** M0–M2 was verified against three live services; M3 (API-key authentication)
+**M0–M5 are complete.** M0–M2 was verified against three live services; M3 (API-key authentication)
 landed across AuthCore and GateKeeper with its own spec and plan, dated 2026-08-24; M4 (route-to-scope
 authorization and the tenant check) was a GateKeeper-only milestone, spec and plan dated 2026-09-26,
-verified by mutation and against the three live services.
+verified by mutation and against the three live services. M5 (distributed rate limiting and daily
+quotas) was GateKeeper-only too, spec and plan dated 2026-09-27, verified by mutation and by two
+gateway processes against the live platform and one shared Redis.
 
 | Repo | `master` | Tests | Visibility |
 |---|---|---|---|
 | [authcore](https://github.com/ezat141/authcore) | `4f0a228` | 78 | public |
 | [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
-| [gatekeeper](https://github.com/ezat141/gatekeeper) | `003583c` — M4 complete, its final-review cleanup included | 151 | public |
+| [gatekeeper](https://github.com/ezat141/gatekeeper) | `4f54b9f` — M5's last code merge; the merge of M5's documentation follows it | 233 | public |
 
 All three clean, and all three counts confirmed by running the suites. AuthCore and ledger-service
-were not changed by M4. AuthCore's run takes over ten minutes — every test class starts its own
+were not changed by M4 or M5. AuthCore's run takes over ten minutes — every test class starts its own
 Spring context against Testcontainers, at roughly 45 seconds each — so give it a generous timeout or
 run it in the background rather than assume it has hung.
 
-**GateKeeper's suite requires Redis.** Without it, 19 tests fail and 4 error on Redis connection
-failures, which reads like a regression and is not one. Start it first: `docker compose up -d redis`
-from the authcore directory.
+**GateKeeper's suite requires Redis.** Without it (measured with `-Dspring.data.redis.port=1`), the run
+reports `Tests run: 231, Failures: 25, Errors: 17`: 41 tests fail on Redis connection failures, and
+`TwoGatewaysShareOneLimitTest` fails in its setup, reported as one failure in place of its three
+tests — 44 of 233 not passing, up from 23 before M5. It reads like a regression and is not one. Start
+Redis first: `docker compose up -d redis` from the authcore directory.
 
 **GateKeeper today:** three routes (`/api/accounts/**` and `/api/machine/**` to AuthCore with the path
 preserved, `/api/ledger/**` to ledger-service with `StripPrefix=1` and `X-API-Key` removed). A caller
@@ -45,15 +49,32 @@ refusal is a 403 in the platform shape plus one of four fixed `detail` strings, 
 `WWW-Authenticate`; an unauthenticated caller still gets 401 with `WWW-Authenticate: Bearer`. The M4
 design (`specs/2026-09-26-gatekeeper-m4-design.md`) is the reference for all of it.
 
-**Next: M5.** Read the M4 design before designing it, sections 4 and 5 especially. Rate limiting keyed
-by tenant or client inherits M4's picture of who carries what: a user token has a `tenant`, while a
-client-credentials token and every API key have none, so a tenant key needs a rule for tenant-less
-callers — the same question M4 had to answer for its tenant check. Keying by client means reading the
-token's `aud` (Spring Authorization Server's default: the client id; access tokens carry no
-`client_id` claim). The README's audience rationale is safe only while the gateway never decides by
-client identity — per-client rate limiting is exactly that, so decide audience validation in the M5
-design. Any endpoint M5 adds needs its own row in `RouteScopeAuthorizationManager`, or it is refused
-`NO_RULE`.
+Every routed request is then rate limited (`RateLimitFilter`, a `GlobalFilter` just after
+`IdentityStampFilter`, so a 401 or 403 is never counted). The caller's identity is `tenant:<slug>` for
+a user token, else `client:<aud[0]>` (falling back to `sub`), else `apikey:<name>`; `aud` is read, not
+validated. Plans and assignments are `gatekeeper.rate-limit.*` in `application.yml`, strictly bound and
+validated at startup. One atomic Lua script per request checks a token bucket
+(`gatekeeper:rl:{id}`) and then a daily quota (`gatekeeper:quota:{id}`) on Redis's clock, so every
+instance sharing the Redis enforces one limit. A refusal is a 429 in the platform shape, with the
+fixed `detail` of its reason (`RATE_LIMITED` or `QUOTA_EXCEEDED`), a computed `Retry-After`, and
+`X-RateLimit-*` and `X-Quota-*` headers, which allowed responses carry too. A Redis failure **fails
+open** within 200 ms: a single-flight connection off the event loop, a warm-up before the port binds,
+and a five-second circuit breaker keep it from hanging or leaking connections. The M5 design
+(`specs/2026-09-27-gatekeeper-m5-design.md`) is the reference, section 7 especially.
+
+**Next: M6 — the revocation check.** It reads the same Redis M5 does, and must decide the opposite way:
+a failure to answer must **refuse**, because a revoked token getting through is a security failure,
+where an unlimited request is only a capacity one. It must also refuse **fast**. AuthCore itself shows
+what happens otherwise: with Redis stopped in M5's run, AuthCore's routes hung about 60 seconds before
+answering, and a direct call got no answer in 15. Read the M5 design, section 7, before designing it:
+why M5 failed open, and how it avoided hanging — Lettuce's first connection blocks inside
+`subscribe()` before any timeout's clock starts, cancelling that wait leaks a connection per request,
+and Lettuce buffers commands without bound while disconnected. A fail-closed check needs the same
+single-flight connection and bounded wait, or it turns a Redis outage into a hung gateway rather than
+a prompt refusal; which status that refusal carries is M6's to decide. If M6 uses a circuit breaker,
+an open breaker must mean *refuse*, not *skip the check*: copying the limiter's pattern would silently
+fail open. The contract is in §4 below. Any endpoint M6 adds needs its own row in
+`RouteScopeAuthorizationManager`, or it is refused `NO_RULE`.
 
 Design and plan documents are in `docs/superpowers/specs/` and `docs/superpowers/plans/`. Milestone
 scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up.
@@ -72,6 +93,10 @@ scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up.
   `[System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))`.
   Verify with raw bytes — reading a subject through a PowerShell string *consumes* the BOM and hides it.
 - **`git commit -m` breaks on quotes.** Write a message file and use `git commit -F`.
+- **`mvnw.cmd spring-boot:run "-Dspring-boot.run.arguments=…"` fails here**, because the project path
+  contains spaces (`'D:\courses\My' is not recognized`). To start GateKeeper with arguments — two
+  instances on different ports, say — build with `.\mvnw.cmd -o -q package -DskipTests` and run
+  `java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar --server.port=… …`.
 - **Never add a `Co-Authored-By` line.** Standing preference: it keeps Claude out of the contributors graph.
 - **Docker Desktop must be running** for AuthCore (Postgres + Redis):
   `docker compose up -d postgres redis` from the authcore directory. It stops often.
@@ -144,7 +169,9 @@ every alternative is worse and one of them destroys what this platform exists to
   The design claim, stated in the responsibility matrix and all three READMEs, is that these services
   couple by a wire contract with no shared code and no shared database, and that GateKeeper is
   stateless and owns no business data. A JDBC connection into AuthCore's schema quietly deletes the
-  most distinctive property of the project.
+  most distinctive property of the project. (M5 has since made the gateway hold one kind of business
+  data — which tenant, client or key is on which plan — in its configuration, deliberately and until
+  M9; the M5 design, section 3.)
 - *A shared Redis cache* only appears to dodge the question. Nothing populates such a cache today —
   AuthCore hits Postgres per request — so adding that population **is itself an AuthCore change**. It
   does not avoid modifying AuthCore; it makes the contract implicit and undocumented instead of
@@ -186,17 +213,21 @@ carries a tenant, so the check compares the `X-Tenant` header and `tenant` query
 the M4 design, section 3, records why.
 
 **M5 — Distributed rate limiting.** `RedisRateLimiter` token bucket keyed by tenant or client, plus a
-daily quota counter with a TTL. `429` with `Retry-After`.
+daily quota counter with a TTL. `429` with `Retry-After`. **Built** — but not on `RedisRateLimiter`,
+which takes its rates per route id rather than per caller: the gateway runs its own script, bucket and
+quota together, on Redis's clock, keyed by tenant, else client, else API key. The M5 design, sections
+2, 4 and 6, records why.
 
 **M6 — Revocation check.** A reactive `EXISTS` against AuthCore's deny-list. The contract is already
 live: `RevocationService` writes Redis key **`authcore:revoked:jti:<jti>`**, value `"revoked"`, with a
-TTL equal to the token's remaining lifetime. Revoked means `401`.
+TTL equal to the token's remaining lifetime. Revoked means `401`. A Redis that cannot answer must
+refuse, not admit — the opposite of M5's choice, and deliberately so (§1).
 
 ---
 
 ## 5. Deferred items these milestones inherit
 
-Found during M0–M4 and recorded rather than fixed. Each names the milestone that owns it, or says it
+Found during M0–M5 and recorded rather than fixed. Each names the milestone that owns it, or says it
 has none.
 
 - ~~**M4 — the 403 path still has the empty-body gap that 401 lost.**~~ **Closed in M4.**
@@ -241,7 +272,11 @@ has none.
   authenticated-only rules (`/api/accounts/**`, `/actuator/info`) would admit it. Read from the
   Spring Authorization Server 7.1.0 and Spring Security 7.0.6 bytecode and AuthCore's
   `AuthCoreTokenCustomizer`, not by sending an ID token. The fix belongs in AuthCore's token typing;
-  the gateway could also refuse tokens that carry no `scope`, if wanted.
+  the gateway could also refuse tokens that carry no `scope`, if wanted. **Since M5 it also picks a
+  bucket:** an ID token has no `tenant`, so the rate limiter counts it against `client:<aud>` rather
+  than the user's tenant — a user holding both tokens can choose which of two buckets to spend, and
+  ID-token callers from every tenant share one. Fixing this item closes that too (M5 design,
+  section 4).
 - **Whoever configures trusted proxies — the subdomain stays out of reach only while
   `spring.cloud.gateway.server.webflux.trusted-proxies` is unset.** With it set, the client's host
   travels on as `X-Forwarded-Host`, and if AuthCore ever runs with a forward-headers strategy the
@@ -260,6 +295,44 @@ has none.
   every error it produces; ledger-service reshapes only those two. Deliberate scope. Do not let a
   README claim a uniformity that stops at 403.
 
+Found during M5, by its reviews and its live run:
+
+- **AuthCore's concern, and a warning for M6 — AuthCore hangs when Redis is down.** Observed in the M5
+  run: with Redis stopped, requests through the gateway's AuthCore routes hung about 60 seconds and
+  ended 401, and AuthCore called directly gave no answer in 15 seconds. The gateway's ledger route
+  answered in 22–26 ms meanwhile. M6's revocation check must fail closed *fast*, not like this (§1).
+- **Whoever next touches the API-key path — M3's cache on a Redis outage.** It uses the same template
+  as the limiter, without the limiter's protections. Observed in the M5 run: an API-key caller hung
+  with Redis stopped, waiting in Lettuce's disconnected buffer up to the command timeout. And a Redis
+  that accepts connections and never answers could block an event loop on the cache's first
+  connection, for up to Lettuce's 60-second handshake timeout (M5 design, section 7).
+- **Unowned — Lettuce buffers commands without bound while disconnected.** M5's circuit breaker bounds
+  the limiter's share to about one command per five-second window. The client-wide fix
+  (`REJECT_COMMANDS` as the disconnected behaviour, or a bounded `requestQueueSize`) was considered and
+  not adopted, because it changes M3's API-key cache behaviour during a reconnect.
+- **The M4 ID-token item above — ID tokens pick their bucket.** Recorded there; fixing it closes this.
+- **Unowned, natural home M10 or later — no per-IP flood protection.** The limiter counts only
+  authenticated, authorized requests. Floods of unauthenticated or forbidden requests never reach a
+  downstream, but cost gateway CPU and, for random API keys, negatively cached introspection calls
+  (M5 design, sections 5 and 12).
+- **Whoever changes AuthCore's `aud` — `aud[0]` stops naming the client if AuthCore adopts resource
+  indicators or an audience customizer.** `aud` would then name a resource server, alone or beside the
+  client, and every client would silently share one bucket. That change must change
+  `RateLimitIdentity` with it (M5 design, section 4).
+- **Unowned, accepted — Redis's clock stepping backwards.** After a backward step a drained bucket stays
+  drained, refused with `Retry-After: 1`, until Redis's clock passes the stored time again; a step
+  back across midnight resets the day's count. Triggered by an NTP step on the Redis host or a failover
+  to a replica with a skewed clock (M5 design, section 6).
+- **Unowned — a downstream sending `X-RateLimit-*` or `X-Quota-*` would duplicate the gateway's.**
+  Spring Cloud Gateway appends downstream response headers to those a filter set. No downstream sends
+  them today; setting the headers in `beforeCommit` would fix it.
+- **Unowned — the warm-up's timeout (2 s) and the breaker's window (5 s) are constants, not
+  properties**, and the warm-up does not run under lazy initialisation.
+- **Anyone deploying — rate-limit assignment keys cannot be set through environment variables.**
+  Relaxed binding lowercases an environment variable and splits it on underscores, so a name like
+  `demo-reporting-job` cannot be expressed. Use a mounted configuration file or
+  `SPRING_APPLICATION_JSON`.
+
 ---
 
 ## 6. How M0–M2 was run, and why it is worth repeating
@@ -268,7 +341,12 @@ Every task got a `feature/task-N` branch off `master`, merged back with `git mer
 topology stays visible on GitHub. Two reviews per task — spec compliance first, then code quality —
 each by an independent agent explicitly told **not to trust the implementer's report**, followed by
 fix-and-re-review loops until clean. M4 used `feature/m4-task-N` because the `feature/task-N` names
-from M0–M3 still exist; M5 should use `feature/m5-task-N`.
+from M0–M3 still exist, and M5 used `feature/m5-task-N`; M6 should use `feature/m6-task-N`.
+
+One practical note from M5: implementer subagents occasionally stalled, waiting on "background work"
+that had already ended, without reporting. When one goes quiet, check the branch — a reviewer can
+verify the commit directly rather than wait on the implementer's report, which the reviews are told
+not to trust anyway.
 
 Roughly a dozen genuine defects surfaced this way, and **almost every one originated in the plan
 rather than in the implementation.** Two techniques did most of the work:
@@ -276,10 +354,13 @@ rather than in the implementation.** Two techniques did most of the work:
 **Mutation testing.** Delete the line a test claims to cover, in a scratch copy, and confirm the test
 fails. This caught a key-rotation test that would have passed against a decoder with refresh-on-miss
 removed, and an anti-spoofing suite where four of five tests still passed with the strip filter
-deleted entirely.
+deleted entirely. In M5 it caught a shared-tenant test that sent every user through one client, and so
+could not tell a tenant's bucket from a client's.
 
 **Running the thing.** Booting the service and hitting it with `curl` found what reading the diff
 could not: a cross-tenant leak that the tests asserted was correct, a missing `WWW-Authenticate` on
-two of three 401 paths, and a 403 branch that cannot occur in production at all.
+two of three 401 paths, and a 403 branch that cannot occur in production at all. In M5 it found that
+AuthCore itself hangs when Redis is down, and that a burst can be demonstrated only once each
+gateway's cold path — its first JWKS fetch or introspection — has been paid.
 
 A test that passes the moment you write it has proven nothing yet. Make it fail first, on purpose.

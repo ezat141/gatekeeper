@@ -22,7 +22,10 @@ Design: [`docs/superpowers/specs/2026-09-27-gatekeeper-m5-design.md`](../specs/2
 - **Verify every framework name you add** that this plan does not give, with `javap -cp <jar> <FQCN>` against `~/.m2/repository`.
 - **Jackson 3** (`tools.jackson.databind`) if you ever need a mapper. This plan does not.
 - **Branches:** `feature/m5-task-N` off `master`, merged with `git merge --no-ff`. The `feature/task-N` and `feature/m4-task-N` names are taken.
-- **Suite count on `master` before M5: 151.**
+- **Suite count on `master` before M5: 151.** After M5: **233**. The per-task counts below are this
+  plan's originals; reviews added tests along the way (the breaker, the warm-up, the connection step,
+  strict binding and more), so the real totals run higher from Task 1 on. The README lists every class
+  with its final count.
 
 **Single-repo milestone.** Only `D:\courses\My CV\My cv\ProjectsCVs\gatekeeper` changes. AuthCore and ledger-service are started for Task 8 and never modified.
 
@@ -2249,7 +2252,7 @@ Before any fix, prove the test can fail: temporarily change `RateLimitConfig.rat
 
 Run `.\mvnw.cmd -o test -Dtest=TwoGatewaysShareOneLimitTest`. Expected: `shareOneDailyQuota` and `shareOneBurst` **fail** — each instance counts only its own half. Revert with `git checkout -- src/main/java/com/gatekeeper/ratelimit/RateLimitConfig.java`.
 
-- [ ] **Step 4: Run it against the real store** — `.\mvnw.cmd -o test -Dtest=TwoGatewaysShareOneLimitTest` — expected PASS, 3. Full suite — expected 203.
+- [ ] **Step 4: Run it against the real store** — `.\mvnw.cmd -o test -Dtest=TwoGatewaysShareOneLimitTest` — expected PASS, 3. Full suite — expected 203. (The final count is 233: reviews of Tasks 1–5 added tests this plan did not foresee.)
 
 - [ ] **Step 5: Commit**
 
@@ -2284,21 +2287,24 @@ Each mutation is a temporary edit on `master` after Task 6's merge, never commit
 | 5 | In `RateLimitFilter.apply`, set `Retry-After` to `"5"` | `RateLimitTest,RateLimitFilterTest` | `refusesOnceTheDailyQuotaIsUsedUp`, `refusesTheRequestAfterTheBurstWith429`, `refusesWithoutForwarding` |
 | 6 | In `RateLimitIdentity.of`, skip the tenant branch | `RateLimitIdentityTest,RateLimitTest` | `aUserTokenCountsAgainstItsTenant`, `usersOfOneTenantShareABucket` |
 
-Finish with `git status --short` (must be empty) and the full suite (203).
+Finish with `git status --short` (must be empty) and the full suite (203 as planned; 233 in fact, for the reason given in Task 6 Step 4).
+
+As run, Task 7 also broke the breaker so that any success closes it (three breaker and filter tests failed) and removed the cached connection step (two connect tests failed), and found one gap: the shared-tenant test used one client for both users, so it could not tell tenant from client. That test was fixed, and mutation 6 then failed `usersOfOneTenantShareABucket` too.
 
 ---
 
 ## Task 8: Run it against the real thing
 
-- [ ] **Step 1: Start everything.** From the authcore directory, `docker compose up -d postgres redis`. Start AuthCore and ledger-service with `.\mvnw.cmd -o spring-boot:run`. Start **two** GateKeepers with a tiny plan for the demo key (the machine client stays on `pro`, from `application.yml`):
+- [ ] **Step 1: Start everything.** From the authcore directory, `docker compose up -d postgres redis`. Start AuthCore and ledger-service with `.\mvnw.cmd -o spring-boot:run`. Build GateKeeper once, then start **two** from the jar with a tiny plan for the demo key (the machine client stays on `pro`, from `application.yml`):
 
 ```bash
-.\mvnw.cmd -o spring-boot:run "-Dspring-boot.run.arguments=--server.port=8081 --gatekeeper.rate-limit.plans.tiny.requests-per-second=1 --gatekeeper.rate-limit.plans.tiny.burst=3 --gatekeeper.rate-limit.plans.tiny.daily-quota=6 --gatekeeper.rate-limit.assignments.api-keys.demo-reporting-job=tiny"
+.\mvnw.cmd -o -q package -DskipTests
+java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar --server.port=8081 --gatekeeper.rate-limit.plans.tiny.requests-per-second=1 --gatekeeper.rate-limit.plans.tiny.burst=3 --gatekeeper.rate-limit.plans.tiny.daily-quota=6 --gatekeeper.rate-limit.assignments.api-keys.demo-reporting-job=tiny
 ```
 
-and the same with `--server.port=8083`.
+and the same with `--server.port=8083`. Not `spring-boot:run "-Dspring-boot.run.arguments=…"`: on Windows it fails when the project path contains spaces (`'D:\courses\My' is not recognized`).
 
-- [ ] **Step 2: One burst across two instances.** Send the demo key (`X-API-Key: ak_demo_reporting_job_local_only_0000000000`) to `GET /api/machine/payments`, alternating `:8081` and `:8083`, four times back to back. Expected: three `200`s, then `429` with `Retry-After: 1`, the `RATE_LIMITED` detail, `X-RateLimit-Remaining: 0`.
+- [ ] **Step 2: One burst across two instances.** Send the demo key (`X-API-Key: ak_demo_reporting_job_local_only_0000000000`) to `GET /api/machine/payments`, alternating `:8081` and `:8083`, four times back to back. Expected: three `200`s, then `429` with `Retry-After: 1`, the `RATE_LIMITED` detail, `X-RateLimit-Remaining: 0`. (As run, each instance's first introspection of the key took long enough for a token to refill; the burst was shown with a machine token on a burst-3 plan instead — the design, section 11.)
 
 - [ ] **Step 3: One quota across two instances.** Wait two seconds between requests so the bucket never empties, and keep alternating until the quota of 6 is spent. Expected: six `200`s in total across both instances — counting the three from Step 2 — then `429` with the `QUOTA_EXCEEDED` detail and `Retry-After` equal to the seconds until UTC midnight.
 

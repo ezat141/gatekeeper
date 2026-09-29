@@ -111,9 +111,9 @@ never decides by client identity, and that per-client rate limiting is that mome
   would silently share one bucket. That change must change this derivation with it.
 
 **A caller with no usable identity is forwarded unlimited.** A tenant-less JWT whose `aud` and `sub`
-are both missing or blank has no identity, and the filter forwards it with a warning rather than
-limiting it. AuthCore cannot issue such a token; the alternative — one shared bucket for every such
-token — would let any one of them exhaust the others.
+are both missing or blank has no identity, and the filter forwards it, logged at debug level, rather
+than limiting it. AuthCore cannot issue such a token; the alternative — one shared bucket for every
+such token — would let any one of them exhaust the others.
 
 ---
 
@@ -199,8 +199,9 @@ engineered around.
 ## 7. Decision: when Redis is unavailable, let requests through
 
 **Chosen — fail open, fast.** The Redis call has its own timeout (`gatekeeper.rate-limit.redis-timeout`,
-`200ms`). On an error or a timeout the request proceeds unlimited, a warning is logged, and the
-response carries **no** rate-limit headers — not invented ones, as Spring's `-1` would be.
+`200ms`). On an error or a timeout the request proceeds unlimited, a warning is logged (once per
+outage, since the circuit breaker below), and the response carries **no** rate-limit headers — not
+invented ones, as Spring's `-1` would be.
 
 - The rule table and the tenant check use no Redis and keep working. A Redis outage costs unlimited
   traffic for its duration, not a platform outage. This is the default of Spring's limiter and of
@@ -235,6 +236,8 @@ whatever thread subscribes — potentially a Netty event loop. A firewalled Redi
 - **The store subscribes on `Schedulers.boundedElastic()`.** A blocking connect then holds a worker
   thread, never the event loop, and the filter's timeout always applies. This lives in
   `RedisRateLimitStore`, the one place that knows the call can block; the filter stays generic.
+  (Narrowed by the next subsection: only the connection step runs on a worker now, and a check on an
+  established connection makes no thread hop.)
 - **A bounded warm-up at startup.** Before the web server accepts traffic, the gateway pings Redis once,
   off the calling thread, waiting at most two seconds and ignoring failure. Without it, the first
   request after boot would pay for the connection and the script load, exceed 200 ms, and go through
@@ -276,7 +279,7 @@ reconnects, without a bound, and a cancelled command stays buffered. The limiter
   (which would change the API-key cache's behaviour during a reconnect) and over a separate Redis client
   for the limiter (a second connection and duplicated configuration). After a store failure or timeout,
   the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and
-  a success closes the breaker. This bounds what the limiter can add to Lettuce's buffer to about one
+  the probe's success closes the breaker. This bounds what the limiter can add to Lettuce's buffer to about one
   command per window, keeps workers free, and turns an outage into one warning when the breaker opens
   and one line when it closes, instead of a stack trace per request.
 - **The cost, stated:** after any Redis failure, limiting is suspended for up to five seconds even if
@@ -347,7 +350,10 @@ All in a new package, `com.gatekeeper.ratelimit`, except the writer.
 - **`RateLimitFilter`** — a `GlobalFilter` ordered just after `IdentityStampFilter` and before every
   routing filter. It applies to all three routes with no route configuration. It resolves identity and
   plan, calls the store under the timeout, and on allow adds the headers and continues; on refusal
-  writes the `429`; on error or timeout continues without headers.
+  writes the `429`; on error or timeout continues without headers and opens the breaker.
+- **`RedisCircuitBreaker`** — §7: after a store failure, no Redis calls for five seconds, then one
+  probe; only the probe's success closes it.
+- **`RedisWarmUp`** — §7: one bounded connection attempt at startup, before the port binds.
 - **`error.TooManyRequestsWriter`** — §8.
 
 **No new endpoints, so no new rule-table rows.** The rule table is unchanged.
@@ -373,9 +379,16 @@ gatekeeper:
 ```
 
 **Validated at startup; a violation stops the boot:** at least one plan; the default plan exists; every
-assignment names an existing plan; every number is at least `1`; the timeout is positive. The first rule
-is also the defence against the silent failure the handoff warns about: a mistyped prefix binds no
-plans, and the gateway refuses to start rather than limiting nothing.
+assignment names an existing plan; every number is at least `1`, and burst and daily quota at most
+`10^12` (§6); the timeout is positive; and no unknown key under `gatekeeper.rate-limit` (added
+during Task 1: a misspelt `api-key:` for `api-keys:` would otherwise put its callers on the default plan
+silently). The first rule is also the defence against the silent failure the handoff warns about: a
+mistyped prefix binds no plans, and the gateway refuses to start rather than limiting nothing.
+
+**Assignment keys cannot come from environment variables.** Relaxed binding lowercases an environment
+variable and splits it on underscores, so a name such as `demo-reporting-job` cannot be expressed as
+one. Override assignments through a mounted configuration file, `SPRING_APPLICATION_JSON`, or
+command-line arguments.
 
 ---
 
@@ -424,10 +437,39 @@ tests use their own small plans and fresh tenant and client names per test.
 | Fix `Retry-After` at a constant | the `Retry-After` tests |
 | Ignore the tenant in the identity | the shared-tenant-bucket test |
 
+Task 7 confirmed every row, and two more that §7's review findings called for: a breaker that any
+success closes fails three breaker and filter tests, and an uncached connection step fails two connect
+tests. It found one gap and fixed it: the shared-tenant test sent both users through one client, so it
+could not tell a tenant bucket from a client bucket; it now uses a fresh client per request.
+
 **Run it.** Two GateKeeper processes on `8081` and `8083` with a tiny plan set on the command line;
 real AuthCore tokens and the demo key sent alternately until either instance answers `429` with
 `Retry-After`; a tiny daily quota exhausted the same way; Redis stopped, JWT callers still answered
 `200`; Redis restarted, limits resumed.
+
+What the run showed, with real AuthCore and ledger-service and one shared Redis:
+
+- **One quota across two instances.** The demo key on `tiny` (1/s, burst 3, quota 6): six requests
+  alternating between the instances were allowed, `X-Quota-Remaining` counting 5, 4, 3, 2, 1, 0 across
+  both; the seventh was refused `QUOTA_EXCEEDED` with `Retry-After: 49515`, exactly the seconds to UTC
+  midnight at that moment. `X-RateLimit-Remaining` stayed at 3: the refused request took no token.
+- **One burst across two instances.** A machine token on a burst-3 plan, four requests alternating in
+  714 ms: `200`, `200`, `200`, then `429 RATE_LIMITED` with `Retry-After: 1` on `8083`, which had itself
+  seen only one earlier request. A first attempt took 1.7 s and never tripped: each gateway fetched
+  AuthCore's JWKS on its first token, and a token refilled meanwhile. The API key's first
+  introspections did the same. Demonstrating a burst needs the cold path paid first.
+- **Plans differ.** The machine client on `pro` showed `X-RateLimit-Burst-Capacity: 100`,
+  `X-RateLimit-Replenish-Rate: 50`, `X-Quota-Limit: 100000`; the demo key on `tiny` showed burst 3.
+- **Redis stopped.** The breaker logged one warning after a 200 ms timeout. Requests to ledger
+  answered `200` in 22–26 ms with no rate-limit headers. Requests to the AuthCore routes hung about
+  60 s and ended `401` — AuthCore itself hangs when Redis is down (called directly, it gave no answer
+  in 15 s), not the gateway. An API-key caller hung too: M3's cache waits in Lettuce's disconnected
+  buffer, the exposure recorded in §7, now observed.
+- **Redis restarted.** Limiting resumed about 15 s later — Lettuce's reconnect backoff plus the
+  breaker's window — and the breaker logged one line, "limiting resumed".
+- **Starting two instances.** `mvnw.cmd spring-boot:run "-Dspring-boot.run.arguments=…"` fails on
+  Windows when the project path contains spaces; `java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar
+  --server.port=… --gatekeeper.rate-limit…` works.
 
 ---
 
@@ -466,3 +508,7 @@ real AuthCore tokens and the demo key sent alternately until either instance ans
 - Allowed responses carry the rate-limit and quota headers; `401`, `403` and health responses do not.
 - Every mutation in §11 fails a test, and the run behaves as described.
 - GateKeeper green, each task on its own `feature/m5-task-N` branch, reviewed and merged.
+
+Every item above was met — by the suite (233 tests), the mutation checks and the run (§11); the
+AuthCore and API-key hangs the run saw with Redis down are not the limiter's. What the reviews and the
+run left open is in the handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5).
