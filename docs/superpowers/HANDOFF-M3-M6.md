@@ -327,8 +327,9 @@ Found during M5, by its reviews and its live run:
 - **Unowned — a downstream sending `X-RateLimit-*` or `X-Quota-*` would duplicate the gateway's.**
   Spring Cloud Gateway appends downstream response headers to those a filter set. No downstream sends
   them today; setting the headers in `beforeCommit` would fix it.
-- **Unowned — the warm-up's timeout (2 s) and the breaker's window (5 s) are constants, not
-  properties**, and the warm-up does not run under lazy initialisation.
+- **Unowned — the warm-up's timeout (2 s), the breaker's window (5 s) and its threshold (three
+  consecutive failures) are constants, not properties**, and the warm-up does not run under lazy
+  initialisation.
 - **Anyone deploying — rate-limit assignment keys cannot be set through environment variables.**
   Relaxed binding lowercases an environment variable and splits it on underscores, so a name like
   `demo-reporting-job` cannot be expressed. Use a mounted configuration file or

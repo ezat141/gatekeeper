@@ -279,14 +279,40 @@ reconnects, without a bound, and a cancelled command stays buffered. The limiter
   startup warm-up subscribes to the same step.
 - **A circuit breaker in the filter** — chosen with the repo owner over rejecting commands client-wide
   (which would change the API-key cache's behaviour during a reconnect) and over a separate Redis client
-  for the limiter (a second connection and duplicated configuration). After a store failure or timeout,
-  the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and
+  for the limiter (a second connection and duplicated configuration). After three consecutive store
+  failures or timeouts (see below), the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and
   the probe's success closes the breaker. This bounds what the limiter can add to Lettuce's buffer to about one
   command per window, keeps workers free, and turns an outage into one warning when the breaker opens
   and one line when it closes, instead of a stack trace per request.
-- **The cost, stated:** after any Redis failure, limiting is suspended for up to five seconds even if
+- **The cost, stated:** once the breaker opens, limiting is suspended for up to five seconds even if
   Redis recovers sooner. That is the fail-open choice of this section applied to a window rather than a
   single request.
+
+**The breaker opens on three consecutive failures, not one — decided with the repo owner after the
+milestone's final review.** A single timeout is not evidence that Redis is down: the 200 ms is measured
+in the gateway, so a GC pause or CPU starvation under a flood — exactly when a capacity control matters
+— times out requests the same way a dead Redis does. Opening on the first one would switch limiting off
+for everyone in five-second windows under overload, a feedback loop. So:
+
+- A failure while the breaker is closed fails that request open and counts it (DEBUG, no stack trace).
+- **Three failures in a row open the breaker**, with the one WARN. Any success while closed resets the
+  count, so isolated slow answers never open it.
+- While open, nothing changes: requests skip Redis, and one probe per window decides. **A failed probe
+  re-opens it at once** — the evidence is already in — and only the probe's success closes it.
+- The threshold is a constant, like the five-second window and the two-second warm-up.
+
+A hard outage still opens the breaker within the first few requests: concurrent requests time out
+together, and against a silent Redis they all wait on the same single connection attempt, so the
+count reaches three without adding a connection. A Redis that answers slowly but intermittently now
+keeps the breaker closed; each slow request fails open on its own, which is this section's choice per
+request.
+
+**What three does not cover, stated.** The count has no time or rate basis. A gateway pause longer than
+200 ms under a flood times out every in-flight request at once — far more than three — so that case
+still opens the breaker; three mainly protects low-concurrency traffic. And at high throughput,
+independent failures line up three in a row often enough to open it repeatedly (roughly throughput × p³
+per second for a failure rate p). A failure ratio over a sliding window with a minimum call count is
+the fuller answer; it is left as a follow-up.
 
 ---
 
@@ -352,9 +378,10 @@ All in a new package, `com.gatekeeper.ratelimit`, except the writer.
 - **`RateLimitFilter`** — a `GlobalFilter` ordered just after `IdentityStampFilter` and before every
   routing filter. It applies to all three routes with no route configuration. It resolves identity and
   plan, calls the store under the timeout, and on allow adds the headers and continues; on refusal
-  writes the `429`; on error or timeout continues without headers and opens the breaker.
-- **`RedisCircuitBreaker`** — §7: after a store failure, no Redis calls for five seconds, then one
-  probe; only the probe's success closes it.
+  writes the `429`; on error or timeout continues without headers and counts the failure against the
+  breaker.
+- **`RedisCircuitBreaker`** — §7: after three consecutive store failures, no Redis calls for five
+  seconds, then one probe; only the probe's success closes it, and its failure re-opens it at once.
 - **`RedisWarmUp`** — §7: one bounded connection attempt at startup, before the port binds.
 - **`error.TooManyRequestsWriter`** — §8.
 

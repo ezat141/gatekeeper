@@ -15,7 +15,8 @@ class RedisCircuitBreakerTest {
     static final IllegalStateException DOWN = new IllegalStateException("redis down");
 
     final AtomicLong now = new AtomicLong(1_000_000_000L);
-    final RedisCircuitBreaker breaker = new RedisCircuitBreaker(WINDOW, now::get);
+    final RedisCircuitBreaker breaker =
+            new RedisCircuitBreaker(WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
 
     @Test
     void allowsEveryCallWhileClosed() {
@@ -23,9 +24,40 @@ class RedisCircuitBreakerTest {
         assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
     }
 
+    /** A single timeout may be the gateway's own slowness: it fails its request open, no more. */
     @Test
-    void aFailureOpensItForTheWindow() {
+    void oneFailureDoesNotOpenIt() {
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
+
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
+    }
+
+    @Test
+    void threeConsecutiveFailuresOpenIt() {
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
         assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isTrue();
+
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
+    }
+
+    @Test
+    void aSuccessResetsTheCount() {
+        breaker.recordFailure(breaker.allowCall(), DOWN);
+        breaker.recordFailure(breaker.allowCall(), DOWN);
+        assertThat(breaker.recordSuccess(breaker.allowCall())).isFalse();
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
+
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
+
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isTrue();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
+    }
+
+    @Test
+    void itStaysOpenForTheWindow() {
+        open();
 
         assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
         advance(WINDOW.minusMillis(1));
@@ -34,7 +66,7 @@ class RedisCircuitBreakerTest {
 
     @Test
     void afterTheWindowExactlyOneCallerProbes() {
-        breaker.recordFailure(breaker.allowCall(), DOWN);
+        open();
         advance(WINDOW);
 
         assertThat(breaker.allowCall()).isEqualTo(Permit.PROBE);
@@ -44,7 +76,7 @@ class RedisCircuitBreakerTest {
 
     @Test
     void onlyTheProbeClosesIt() {
-        breaker.recordFailure(breaker.allowCall(), DOWN);
+        open();
         advance(WINDOW);
         Permit probe = breaker.allowCall();
         assertThat(probe).isEqualTo(Permit.PROBE);
@@ -61,7 +93,7 @@ class RedisCircuitBreakerTest {
     void aLateSuccessFromBeforeTheOpeningDoesNotCloseIt() {
         Permit inFlight = breaker.allowCall();
         assertThat(inFlight).isEqualTo(Permit.CLOSED);
-        breaker.recordFailure(breaker.allowCall(), DOWN);
+        open();
 
         assertThat(breaker.recordSuccess(inFlight)).isFalse();
 
@@ -70,7 +102,7 @@ class RedisCircuitBreakerTest {
 
     @Test
     void aFailedProbeReopensItForAnotherWindow() {
-        breaker.recordFailure(breaker.allowCall(), DOWN);
+        open();
         advance(WINDOW);
         Permit probe = breaker.allowCall();
         assertThat(probe).isEqualTo(Permit.PROBE);
@@ -81,6 +113,39 @@ class RedisCircuitBreakerTest {
         assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
         advance(Duration.ofMillis(1));
         assertThat(breaker.allowCall()).isEqualTo(Permit.PROBE);
+    }
+
+    /**
+     * The evidence is already in: one failed probe re-opens the breaker for a window from its
+     * failure, without waiting for three. The probe fails a while after it was let through, as a
+     * probe that times out does, so the window cannot be the one its permit started.
+     */
+    @Test
+    void aFailedProbeReopensAtOnce() {
+        open();
+        advance(WINDOW);
+        Permit probe = breaker.allowCall();
+        assertThat(probe).isEqualTo(Permit.PROBE);
+        advance(Duration.ofMillis(200));
+
+        breaker.recordFailure(probe, new IllegalStateException("still down"));
+
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
+        advance(WINDOW.minusMillis(1));
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
+        advance(Duration.ofMillis(1));
+        assertThat(breaker.allowCall()).isEqualTo(Permit.PROBE);
+    }
+
+    @Test
+    void theCountStartsAgainAfterItCloses() {
+        open();
+        advance(WINDOW);
+        assertThat(breaker.recordSuccess(breaker.allowCall())).isTrue();
+
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
+
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
     }
 
     @Test
@@ -95,7 +160,12 @@ class RedisCircuitBreakerTest {
      */
     @Test
     void lateAnswersAroundTheTimeoutOpenItOnlyOnce() {
-        int openings = breaker.recordFailure(breaker.allowCall(), DOWN) ? 1 : 0;
+        int openings = 0;
+        for (int i = 0; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
+            if (breaker.recordFailure(breaker.allowCall(), DOWN)) {
+                openings++;
+            }
+        }
 
         for (int i = 0; i < 100; i++) {
             breaker.recordSuccess(Permit.CLOSED);
@@ -106,6 +176,14 @@ class RedisCircuitBreakerTest {
 
         assertThat(openings).isEqualTo(1);
         assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
+    }
+
+    /** Opens it the only way it opens: consecutive failures, the last of which reports the opening. */
+    private void open() {
+        for (int i = 1; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
+            assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
+        }
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isTrue();
     }
 
     private void advance(Duration by) {
