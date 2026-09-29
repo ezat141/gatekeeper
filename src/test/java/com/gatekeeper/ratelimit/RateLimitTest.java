@@ -154,14 +154,19 @@ class RateLimitTest {
         ledger(userToken(freshTenant(), "ezzat")).expectHeader().valueEquals("X-RateLimit-Burst-Capacity", "3");
     }
 
+    /**
+     * Alice and bob come through two different, fresh clients on purpose. If the sharing came
+     * from the client instead of the tenant, bob's client would have a fresh bucket of its own
+     * and his fourth request would still be allowed. Only the shared tenant can explain the 429.
+     */
     @Test
     void usersOfOneTenantShareABucket() {
         String tenant = freshTenant();
-        ledger(userToken(tenant, "alice")).expectStatus().isOk();
-        ledger(userToken(tenant, "alice")).expectStatus().isOk();
-        ledger(userToken(tenant, "bob")).expectStatus().isOk();
+        ledger(userToken(tenant, "alice", "c-" + UUID.randomUUID())).expectStatus().isOk();
+        ledger(userToken(tenant, "alice", "c-" + UUID.randomUUID())).expectStatus().isOk();
+        ledger(userToken(tenant, "bob", "c-" + UUID.randomUUID())).expectStatus().isOk();
 
-        ledger(userToken(tenant, "bob")).expectStatus().isEqualTo(429);
+        ledger(userToken(tenant, "bob", "c-" + UUID.randomUUID())).expectStatus().isEqualTo(429);
     }
 
     @Test
@@ -203,10 +208,14 @@ class RateLimitTest {
     }
 
     private static String userToken(String tenant, String subject) {
+        return userToken(tenant, subject, "authcore-spa");
+    }
+
+    private static String userToken(String tenant, String subject, String clientId) {
         Map<String, Object> claims = new HashMap<>();
         claims.put("scope", List.of("payments:read"));
         claims.put("tenant", tenant);
-        claims.put("aud", List.of("authcore-spa"));
+        claims.put("aud", List.of(clientId));
         return "Bearer " + signingKey.mint(ISSUER, subject, Instant.now().plus(5, ChronoUnit.MINUTES), claims);
     }
 
