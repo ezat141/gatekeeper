@@ -10,12 +10,13 @@ import java.util.Set;
  * {@code gatekeeper.rate-limit.*}: the plans, who is on which, and how long the gateway waits
  * for Redis before letting a request through unlimited. The M5 design, sections 3, 7 and 10.
  *
- * <p><strong>Every rule is checked here, in the constructor, so a violation stops the boot.</strong>
- * The first rule matters most: a mistyped prefix binds no plans at all, and relaxed binding
- * would otherwise start a gateway that limits nothing — the one silent failure the handoff
- * warns about. Unknown keys under the prefix are refused too, so a misspelt kind inside
- * {@code assignments} (for example {@code api-key} for {@code api-keys}) fails the boot rather
- * than silently putting its callers on the default plan.
+ * <p><strong>Every value rule is checked in the constructor, and unknown keys are refused by the
+ * binding itself, so a violation stops the boot.</strong> The first rule matters most: a mistyped
+ * prefix binds no plans at all, and relaxed binding would otherwise start a gateway that limits
+ * nothing — the one silent failure the handoff warns about. Unknown keys under the prefix are
+ * refused by {@code ignoreUnknownFields = false} on the annotation above, so a misspelt kind
+ * inside {@code assignments} (for example {@code api-key} for {@code api-keys}) fails the boot
+ * rather than silently putting its callers on the default plan.
  */
 @ConfigurationProperties(prefix = "gatekeeper.rate-limit", ignoreUnknownFields = false)
 public record RateLimitProperties(

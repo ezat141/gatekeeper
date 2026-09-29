@@ -199,6 +199,21 @@ class RateLimitTest {
         assertThat(redis.hasKey(RedisRateLimitStore.quotaKey(identity)).block()).isFalse();
     }
 
+    /**
+     * The health probe is not a gateway route, so the limiter never runs against it. Authenticated
+     * on purpose: an anonymous request carries no headers anyway, since it has no identity for the
+     * limiter to key on, so it could not tell "not a gateway route" from "no identity". A valid
+     * bearer rules that out — health is {@code permitAll}, so it is still 200.
+     */
+    @Test
+    void theHealthProbeCarriesNoRateLimitHeaders() {
+        client.get().uri("/actuator/health")
+                .header(HttpHeaders.AUTHORIZATION, userToken(freshTenant(), "ezzat"))
+                .exchange()
+                .expectStatus().isOk()
+                .expectHeader().doesNotExist("X-RateLimit-Remaining");
+    }
+
     private WebTestClient.ResponseSpec ledger(String bearer) {
         return client.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, bearer).exchange();
     }

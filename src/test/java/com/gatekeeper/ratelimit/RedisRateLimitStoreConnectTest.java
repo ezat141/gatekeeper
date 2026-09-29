@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.util.NoSuchElementException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -64,6 +65,21 @@ class RedisRateLimitStoreConnectTest {
         store.connect().block(Duration.ofSeconds(2));
 
         assertThat(pings).hasValue(1);
+    }
+
+    /** An empty ping is not a success: it must not be cached, so the next caller pings again. */
+    @Test
+    void anEmptyPingIsRetried() {
+        RedisRateLimitStore store = new RedisRateLimitStore(null, () -> {
+            int attempt = pings.incrementAndGet();
+            return attempt == 1 ? Mono.empty() : Mono.just("PONG");
+        });
+
+        assertThatThrownBy(() -> store.connect().block(Duration.ofSeconds(2)))
+                .isInstanceOf(NoSuchElementException.class);
+        store.connect().block(Duration.ofSeconds(2));
+
+        assertThat(pings).hasValue(2);
     }
 
     @Test

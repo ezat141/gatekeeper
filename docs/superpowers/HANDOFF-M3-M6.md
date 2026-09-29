@@ -26,10 +26,11 @@ Spring context against Testcontainers, at roughly 45 seconds each — so give it
 run it in the background rather than assume it has hung.
 
 **GateKeeper's suite requires Redis.** Without it (measured with `-Dspring.data.redis.port=1`), the run
-reports `Tests run: 231, Failures: 25, Errors: 17`: 41 tests fail on Redis connection failures, and
+reports `Tests run: 234, Failures: 26, Errors: 17`: 42 tests fail on Redis connection failures, and
 `TwoGatewaysShareOneLimitTest` fails in its setup, reported as one failure in place of its three
-tests — 44 of 233 not passing, up from 23 before M5. It reads like a regression and is not one. Start
-Redis first: `docker compose up -d redis` from the authcore directory.
+tests — 45 of 236 not passing, up from 23 before M5 (as of the M5 cleanup). It reads like a
+regression and is not one. Start Redis first: `docker compose up -d redis` from the authcore
+directory.
 
 **GateKeeper today:** three routes (`/api/accounts/**` and `/api/machine/**` to AuthCore with the path
 preserved, `/api/ledger/**` to ledger-service with `StripPrefix=1` and `X-API-Key` removed). A caller
