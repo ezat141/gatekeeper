@@ -85,7 +85,7 @@ docker compose up -d redis   # from the authcore repo
 | Issuer pinning | Tokens from an unexpected `iss` are refused even when the signature is valid |
 | Identity propagation | Verified `sub`, `tenant`, and `permissions` stamped downstream as `X-GK-*`, for consumers that are not themselves resource servers |
 | Header anti-spoofing | Every inbound `X-GK-*` header removed before authentication runs — prefix-matched, case-insensitive, unconditional |
-| Stateless | No session, no CSRF token, no state in the process — rate-limit counts and the API-key cache live in Redis. Killable and restartable at any moment |
+| Stateless | No session, no CSRF token, and no durable state in the process — rate-limit counts and the API-key cache live in Redis. Killable and restartable at any moment |
 | Public health | `/actuator/health` reachable without a credential, so liveness can be probed |
 
 **Stack:** Java 21 · Spring Boot 4.0.7 · Spring Cloud 2025.1.2 (Gateway 5.0.2) · Spring Security 7 reactive · Netty · WireMock
@@ -212,7 +212,7 @@ Not validating it is acceptable *only* because of what the gateway decides and w
 
 Reading `aud` as the client's identity, which M5 does, is a different act from validating it, and it is safe: `aud` is inside the signed token and AuthCore sets it from the registered client, so a caller cannot name a bucket of its choosing. The limiter decides *how much* a client may send by who it is; nothing decides *whether* it may send by who it is.
 
-Two conditions would make skipping validation unacceptable, recorded so that a change happens deliberately rather than by inheritance: **the gateway admitting or refusing clients by their identity**, rather than by what they were granted; or **AuthCore issuing the same scope names for another resource server**, so that a scope granted for one audience would pass here — true before M5, and not made worse by it. And one change on AuthCore's side would break the reading: **adopting resource indicators or an audience customizer** — the route to real validation — would make `aud` name a resource server, alone or beside the client. `aud[0]` would then stop naming the client, every client would silently share one bucket, and the limiter's identity must change with it.
+Two conditions would make skipping validation unacceptable, recorded so that a change happens deliberately rather than by inheritance: **the gateway admitting or refusing clients by their identity**, rather than by what they were granted; or **AuthCore issuing the same scope names for another resource server**, so that a scope granted for one audience would pass here — a risk that predates M5 and that M5 does not widen. And one change on AuthCore's side would break the reading: **adopting resource indicators or an audience customizer** — the route to real validation — would make `aud` name a resource server, alone or beside the client. `aud[0]` would then stop naming the client, every client would silently share one bucket, and the limiter's identity must change with it.
 
 ---
 
@@ -343,6 +343,20 @@ Authorization decides what a caller may reach. The rate limiter decides how much
 
 It is a **capacity control, not a security control**. Nothing about who may reach what depends on it — which is what lets it [fail open](#when-redis-fails-requests-go-through) when Redis does.
 
+### Whose bucket a request counts against
+
+| Caller | Identity |
+|---|---|
+| JWT carrying a `tenant` claim — every user token | `tenant:<slug>` |
+| JWT without one — client credentials | `client:<first aud>`, or `client:<sub>` when `aud` is missing or blank |
+| API key | `apikey:<name>`, the key's name from introspection |
+
+**Tenant where there is one, otherwise the client.** Every user of `acme` shares `acme`'s plan, which is what a plan for a tenant means; a bucket per user would give a hundred `acme` users a hundred times `acme`'s allowance. A client-credentials token has no tenant, so it counts against its client. There is one bucket and one quota per identity across all routes: a plan's rate is the caller's rate, not a rate per route.
+
+**The client is read from `aud`, which is not validated.** Spring Authorization Server sets an access token's `aud` to the id of the client it was issued to and writes no `client_id` claim, so `aud` is where the client's identity is. On a client-credentials token `sub` is the same client id, which is why it is the fallback. Reading `aud` is safe because it is signed and set by AuthCore from the registered client; why it is still not *validated*, and what would change that, is under [Authentication](#what-the-default-validator-checks-and-what-it-does-not).
+
+A tenant-less token whose `aud` and `sub` are both missing or blank has no identity, and is forwarded unlimited rather than limited. AuthCore cannot issue one, and a single shared bucket for all such tokens would let any one of them exhaust the others.
+
 ### Plans
 
 Plans, and who is on which, are gateway configuration in [`application.yml`](src/main/resources/application.yml):
@@ -374,27 +388,13 @@ gatekeeper:
 
 **Why configuration.** No plan data exists anywhere on the platform. A `plan` claim from AuthCore would make this a two-repo change, and a plan change would reach the gateway only as old tokens expired. A plan registry in Redis would have nothing to write it until a management API exists (M9). The cost is stated rather than discovered: the gateway holds business data — who is on which plan — and changing it is a redeploy until M9. The `PlanResolver` interface is where M9 will move that data without touching the limiter.
 
-**Validated at startup; a violation stops the boot:** at least one plan; the default plan exists; every assignment names an existing plan; every value is at least `1`, and burst and daily quota at most `10^12`, beyond which the script's arithmetic overflows; the timeout is positive; and no key under `gatekeeper.rate-limit` is unknown. The first rule catches a mistyped prefix, which would otherwise bind no plans and start a gateway that limits nothing. The last catches a misspelt `api-key:` for `api-keys:`, which would otherwise put its callers on the default plan without a word.
+**Validated at startup; a violation stops the boot:** at least one plan; the default plan exists; every assignment names an existing plan; every value is at least `1`, and burst and daily quota at most `10^12`, a safe ceiling — values near `Long.MAX_VALUE` overflow the script's arithmetic; the timeout is positive; and no key under `gatekeeper.rate-limit` is unknown. The first rule catches a mistyped prefix, which would otherwise bind no plans and start a gateway that limits nothing. The last catches a misspelt `api-key:` for `api-keys:`, which would otherwise put its callers on the default plan without a word.
 
 **Assignments cannot be set through environment variables.** Relaxed binding lowercases an environment variable and splits it on underscores, so a name like `demo-reporting-job` cannot be expressed. Use a mounted configuration file, `SPRING_APPLICATION_JSON`, or command-line arguments.
 
-### Whose bucket a request counts against
-
-| Caller | Identity |
-|---|---|
-| JWT carrying a `tenant` claim — every user token | `tenant:<slug>` |
-| JWT without one — client credentials | `client:<first aud>`, or `client:<sub>` when `aud` is missing or blank |
-| API key | `apikey:<name>`, the key's name from introspection |
-
-**Tenant where there is one, otherwise the client.** Every user of `acme` shares `acme`'s plan, which is what a plan for a tenant means; a bucket per user would give a hundred `acme` users a hundred times `acme`'s allowance. A client-credentials token has no tenant, so it counts against its client. There is one bucket and one quota per identity across all routes: a plan's rate is the caller's rate, not a rate per route.
-
-**The client is read from `aud`, which is not validated.** Spring Authorization Server sets an access token's `aud` to the id of the client it was issued to and writes no `client_id` claim, so `aud` is where the client's identity is. On a client-credentials token `sub` is the same client id, which is why it is the fallback. Reading `aud` is safe because it is signed and set by AuthCore from the registered client; why it is still not *validated*, and what would change that, is under [Authentication](#what-the-default-validator-checks-and-what-it-does-not).
-
-A tenant-less token whose `aud` and `sub` are both missing or blank has no identity, and is forwarded unlimited rather than limited. AuthCore cannot issue one, and a single shared bucket for all such tokens would let any one of them exhaust the others.
-
 ### Where it runs
 
-`RateLimitFilter` is a `GlobalFilter`, so it runs after Spring Security's whole chain — just after `IdentityStampFilter`, ahead of every routing filter, on all three routes with no route configuration. **Only a request that would reach a downstream is counted.** A `401` or `403` never touches Redis and never spends a caller's allowance, and the identity above exists only after authentication anyway.
+`RateLimitFilter` is a `GlobalFilter`, so it runs after Spring Security's whole chain — just after `IdentityStampFilter`, ahead of every routing filter, on all three routes with no route configuration. **Only a request that would reach a downstream is counted.** A `401` or `403` never reaches the limiter's script and never spends a caller's allowance, and the identity above exists only after authentication anyway.
 
 What that does not do, stated: it offers no protection against floods of unauthenticated or forbidden requests. Those cost gateway CPU — and, for random API keys, a negatively cached introspection call — but never reach a downstream. Per-IP flood protection is a different mechanism, and is [not built](#known-limitations).
 
@@ -443,7 +443,7 @@ The platform's error shape, with one of two fixed `detail` strings ([`RateLimitR
 - **The downstream is never contacted.**
 - **Written in one place.** [`TooManyRequestsWriter`](src/main/java/com/gatekeeper/error/TooManyRequestsWriter.java) renders it through the same `ErrorBody` as the `401` and `403`, and the filter completes the response itself — no exception, no detour through the global error handler.
 
-**Allowed responses carry the same six `X-RateLimit-*` and `X-Quota-*` headers**, so a well-behaved client can slow down before it is refused. The bucket headers keep Spring's names; the quota headers are the gateway's own, since Spring has no quota. `X-Quota-Reset` is the seconds until the quota resets. **Responses the limiter never saw carry none:** `401` and `403`, which it runs after; the health probe, which is not routed; and requests let through while Redis is failing.
+**Allowed responses carry the same six `X-RateLimit-*` and `X-Quota-*` headers**, so a well-behaved client can slow down before it is refused. The bucket headers keep Spring's names; the quota headers are the gateway's own, since Spring has no quota. `X-Quota-Reset` is the seconds until the quota resets. **Responses carrying none of these headers:** `401` and `403`, which it runs after; the health probe, which is not routed; and requests let through while Redis is failing.
 
 ### When Redis fails, requests go through
 
@@ -461,20 +461,20 @@ API-key callers are a separate matter. M3's introspection cache reads the same R
 
 ### Two gateways, one limit
 
-`TwoGatewaysShareOneLimitTest` starts two application contexts on their own ports, sharing one Redis and one WireMock downstream. Requests alternate between them, and the combined burst and the combined quota trip on whichever instance receives the next request. A store counting per instance fails both tests, which is the point of them.
+`TwoGatewaysShareOneLimitTest` starts two application contexts on their own ports, sharing one Redis and one WireMock downstream. Requests alternate between them, and the combined burst and the combined quota trip on whichever instance receives the next request. A store counting per instance fails both limit tests, which is the point of them.
 
 It was also run against the real platform: two GateKeeper processes on `:8081` and `:8083`, real AuthCore and ledger-service, one Redis.
 
 - **One quota.** The demo key on a tiny plan (1 per second, burst 3, quota 6): six requests alternating between the instances were allowed, `X-Quota-Remaining` counting 5, 4, 3, 2, 1, 0 across both. The seventh was refused `QUOTA_EXCEEDED` with `Retry-After: 49515` — exactly the seconds to UTC midnight at that moment — and `X-RateLimit-Remaining` stayed at 3, because the refused request took no token.
-- **One burst.** A machine token on a burst-3 plan, four requests alternating in 714 ms: `200`, `200`, `200`, then `429 RATE_LIMITED` with `Retry-After: 1` from `:8083`, which had itself seen only one earlier request. A first attempt took 1.7 s and never tripped: each gateway fetched AuthCore's JWKS on its first token, and a token refilled meanwhile. Demonstrating a burst needs the cold path paid first.
+- **One burst.** A machine token, its client reassigned for this step to a tiny plan with a burst of 3, four requests alternating in 714 ms: `200`, `200`, `200`, then `429 RATE_LIMITED` with `Retry-After: 1` from `:8083`, which had itself seen only one earlier request. A first attempt took 1.7 s and never tripped: each gateway fetched AuthCore's JWKS on its first token, and a token refilled meanwhile. Demonstrating a burst needs the cold path paid first.
 - **Plans differ.** The machine client on `pro` showed `X-RateLimit-Burst-Capacity: 100`, `X-RateLimit-Replenish-Rate: 50` and `X-Quota-Limit: 100000`; the demo key on the tiny plan showed a burst of 3.
 - **Redis stopped.** The breaker logged one warning after a 200 ms timeout, and requests to ledger answered `200` in 22–26 ms with no rate-limit headers. Requests to the AuthCore routes hung for about 60 seconds and ended `401` — but that was AuthCore, which itself hangs when Redis is down (called directly, it gave no answer in 15 seconds). An API-key caller hung too, on M3's cache.
 - **Redis restarted.** Limiting resumed about 15 seconds later — Lettuce's reconnect backoff plus the breaker's window — and the breaker logged one line saying so.
 
-To run two instances yourself, build the jar and start it twice; on Windows, `spring-boot:run` with `-Dspring-boot.run.arguments` fails when the project path contains spaces:
+To run two instances yourself, build the jar and start it twice:
 
 ```bash
-./mvnw -o -q package -DskipTests
+./mvnw -q package -DskipTests
 java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar --server.port=8081
 java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar --server.port=8083
 ```
@@ -511,7 +511,7 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 ./mvnw test
 ```
 
-**233 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services, so most of the suite runs offline. The tests that exercise an API key or the rate limiter's script are the exception: they need a real Redis, started as shown in the [Quickstart](#quickstart). Without it (measured with `-Dspring.data.redis.port=1`), the run reports `Tests run: 231, Failures: 25, Errors: 17`: 41 tests fail on Redis connection failures, and `TwoGatewaysShareOneLimitTest` fails in its setup, which is reported as one failure in place of its three tests. So 44 of the 233 do not pass — a missing container, not a defect in this repo. (Before M5 the number was 23.) The fail-open tests pass either way, since they bring their own dead or silent Redis.
+**233 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services, so most of the suite runs offline. The tests that exercise an API key or the rate limiter's script are the exception: they need a real Redis, started as shown in the [Quickstart](#quickstart). Without Redis, 44 of the 233 fail or never run (23 before M5) — a missing container, not a defect; the fail-open tests pass either way because they bring their own dead or silent Redis.
 
 **Routing and startup**
 
@@ -608,7 +608,7 @@ The M5 tests were checked the same way. Deleting the quota check from the script
 
 ## Known limitations
 
-Honest about what this is not, yet. Several of these are the direct consequence of M0–M5 being a deliberately narrow slice. The handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5) keeps the full list of open items, with an owner for each.
+Honest about what this is not, yet. Several of these are the direct consequence of M0–M5 being a deliberately narrow slice. The handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5) keeps the full list of open items the milestones' reviews and runs found, with an owner for each.
 
 - **Identity headers are informational, not authoritative.** They are stamped from verified claims and inbound ones are stripped — see [the section above](#the-identity-headers-it-stamps) — but no downstream should authorize on them, and ledger-service deliberately does not. Treating `X-GK-*` as a trust signal would make every service behind this gateway depend on the gateway being unbypassable, which it is not.
 
@@ -625,7 +625,7 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 
 - ~~**No unified error shape.**~~ **Fixed.** `GlobalErrorWebExceptionHandler` renders one JSON shape — `error`, `status`, `path` — whichever layer refused the request, and ledger-service matches it one hop downstream. `ErrorShapeTest` pins it.
 
-- **Audience is not validated**, as described under [Authentication](#authentication). Since M5 it is *read*, as the client's identity for rate limiting, which is safe because it is signed and set by AuthCore. Not validating it stays safe while the gateway admits and refuses callers only by the scopes their client was granted; it would not be for a gateway that admits or refuses clients by identity, or once AuthCore issues the same scope names for another resource server. And if AuthCore ever names a resource server in `aud`, `aud[0]` stops naming the client and the limiter's identity must change with it.
+- **Audience is read but not validated** — why that is safe, and what would change it, is under [Authentication](#what-the-default-validator-checks-and-what-it-does-not).
 
 - **An OIDC ID token picks its own bucket.** An ID token carries the client as `aud`, the username as `sub`, and no `tenant`, and — the open M4 item — it may authenticate here. So it counts against its client rather than the user's tenant: a user holding both tokens can choose which of two buckets to spend, and ID-token callers from every tenant share one. Stopping ID tokens from authenticating here closes both.
 
@@ -665,7 +665,7 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 | M6 | Revocation check against AuthCore's deny-list | planned |
 | M7 | Resilience — circuit breaker, timeout, retry, bulkhead | planned |
 | M8 | Audit events to Kafka, observability | planned |
-| M9 | Dynamic route administration | planned |
+| M9 | Dynamic route and plan administration | planned |
 | M10 | Hardening, load test, CI/CD | planned |
 
 ---

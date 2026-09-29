@@ -279,7 +279,7 @@ reconnects, without a bound, and a cancelled command stays buffered. The limiter
   (which would change the API-key cache's behaviour during a reconnect) and over a separate Redis client
   for the limiter (a second connection and duplicated configuration). After a store failure or timeout,
   the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and
-  a success closes the breaker. This bounds what the limiter can add to Lettuce's buffer to about one
+  the probe's success closes the breaker. This bounds what the limiter can add to Lettuce's buffer to about one
   command per window, keeps workers free, and turns an outage into one warning when the breaker opens
   and one line when it closes, instead of a stack trace per request.
 - **The cost, stated:** after any Redis failure, limiting is suspended for up to five seconds even if

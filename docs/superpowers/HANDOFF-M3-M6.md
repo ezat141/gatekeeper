@@ -55,9 +55,9 @@ a user token, else `client:<aud[0]>` (falling back to `sub`), else `apikey:<name
 validated. Plans and assignments are `gatekeeper.rate-limit.*` in `application.yml`, strictly bound and
 validated at startup. One atomic Lua script per request checks a token bucket
 (`gatekeeper:rl:{id}`) and then a daily quota (`gatekeeper:quota:{id}`) on Redis's clock, so every
-instance sharing the Redis enforces one limit. A refusal is a 429 in the platform shape with a
-`detail` (`RATE_LIMITED` or `QUOTA_EXCEEDED`), a computed `Retry-After`, and `X-RateLimit-*` and
-`X-Quota-*` headers, which allowed responses carry too. A Redis failure **fails open** within 200 ms:
+instance sharing the Redis enforces one limit. A refusal is a 429 in the platform shape, with the
+fixed `detail` of its reason (`RATE_LIMITED` or `QUOTA_EXCEEDED`), a computed `Retry-After`, and
+`X-RateLimit-*` and `X-Quota-*` headers, which allowed responses carry too. A Redis failure **fails open** within 200 ms:
 a single-flight connection off the event loop, a warm-up before the port binds, and a five-second
 circuit breaker keep it from hanging or leaking connections. The M5 design
 (`specs/2026-09-27-gatekeeper-m5-design.md`) is the reference, section 7 especially.
@@ -71,7 +71,9 @@ why M5 failed open, and how it avoided hanging — Lettuce's first connection bl
 `subscribe()` before any timeout's clock starts, cancelling that wait leaks a connection per request,
 and Lettuce buffers commands without bound while disconnected. A fail-closed check needs the same
 single-flight connection and bounded wait, or it turns a Redis outage into a hung gateway rather than
-a prompt refusal; which status that refusal carries is M6's to decide. The contract is in §4 below. Any endpoint M6 adds needs its own row in
+a prompt refusal; which status that refusal carries is M6's to decide. If M6 uses a circuit breaker,
+an open breaker must mean *refuse*, not *skip the check*: copying the limiter's pattern would silently
+fail open. The contract is in §4 below. Any endpoint M6 adds needs its own row in
 `RouteScopeAuthorizationManager`, or it is refused `NO_RULE`.
 
 Design and plan documents are in `docs/superpowers/specs/` and `docs/superpowers/plans/`. Milestone
@@ -167,7 +169,9 @@ every alternative is worse and one of them destroys what this platform exists to
   The design claim, stated in the responsibility matrix and all three READMEs, is that these services
   couple by a wire contract with no shared code and no shared database, and that GateKeeper is
   stateless and owns no business data. A JDBC connection into AuthCore's schema quietly deletes the
-  most distinctive property of the project.
+  most distinctive property of the project. (M5 has since made the gateway hold one kind of business
+  data — which tenant, client or key is on which plan — in its configuration, deliberately and until
+  M9; the M5 design, section 3.)
 - *A shared Redis cache* only appears to dodge the question. Nothing populates such a cache today —
   AuthCore hits Postgres per request — so adding that population **is itself an AuthCore change**. It
   does not avoid modifying AuthCore; it makes the contract implicit and undocumented instead of
@@ -307,6 +311,10 @@ Found during M5, by its reviews and its live run:
   (`REJECT_COMMANDS` as the disconnected behaviour, or a bounded `requestQueueSize`) was considered and
   not adopted, because it changes M3's API-key cache behaviour during a reconnect.
 - **The M4 ID-token item above — ID tokens pick their bucket.** Recorded there; fixing it closes this.
+- **Unowned, natural home M10 or later — no per-IP flood protection.** The limiter counts only
+  authenticated, authorized requests. Floods of unauthenticated or forbidden requests never reach a
+  downstream, but cost gateway CPU and, for random API keys, negatively cached introspection calls
+  (M5 design, sections 5 and 12).
 - **Whoever changes AuthCore's `aud` — `aud[0]` stops naming the client if AuthCore adopts resource
   indicators or an audience customizer.** `aud` would then name a resource server, alone or beside the
   client, and every client would silently share one bucket. That change must change
