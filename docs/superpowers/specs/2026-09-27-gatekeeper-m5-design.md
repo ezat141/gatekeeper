@@ -284,9 +284,28 @@ reconnects, without a bound, and a cancelled command stays buffered. The limiter
   the probe's success closes the breaker. This bounds what the limiter can add to Lettuce's buffer to about one
   command per window, keeps workers free, and turns an outage into one warning when the breaker opens
   and one line when it closes, instead of a stack trace per request.
-- **The cost, stated:** after any Redis failure, limiting is suspended for up to five seconds even if
+- **The cost, stated:** once the breaker opens, limiting is suspended for up to five seconds even if
   Redis recovers sooner. That is the fail-open choice of this section applied to a window rather than a
   single request.
+
+**The breaker opens on three consecutive failures, not one — decided with the repo owner after the
+milestone's final review.** A single timeout is not evidence that Redis is down: the 200 ms is measured
+in the gateway, so a GC pause or CPU starvation under a flood — exactly when a capacity control matters
+— times out requests the same way a dead Redis does. Opening on the first one would switch limiting off
+for everyone in five-second windows under overload, a feedback loop. So:
+
+- A failure while the breaker is closed fails that request open and counts it (DEBUG, no stack trace).
+- **Three failures in a row open the breaker**, with the one WARN. Any success while closed resets the
+  count, so isolated slow answers never open it.
+- While open, nothing changes: requests skip Redis, and one probe per window decides. **A failed probe
+  re-opens it at once** — the evidence is already in — and only the probe's success closes it.
+- The threshold is a constant, like the five-second window and the two-second warm-up.
+
+A hard outage still opens the breaker within the first few requests: concurrent requests time out
+together, and against a silent Redis they all wait on the same single connection attempt, so the
+count reaches three without adding a connection. A Redis that answers slowly but intermittently now
+keeps the breaker closed; each slow request fails open on its own, which is this section's choice per
+request.
 
 ---
 
