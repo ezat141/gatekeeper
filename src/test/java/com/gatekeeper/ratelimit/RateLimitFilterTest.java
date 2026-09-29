@@ -2,6 +2,7 @@ package com.gatekeeper.ratelimit;
 
 import com.gatekeeper.error.TooManyRequestsWriter;
 import com.gatekeeper.ratelimit.RateLimitProperties.PlanLimits;
+import com.gatekeeper.ratelimit.RedisCircuitBreaker.Permit;
 import org.junit.jupiter.api.Test;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.http.HttpHeaders;
@@ -15,9 +16,15 @@ import org.springframework.security.core.context.ReactiveSecurityContextHolder;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 
 import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -141,7 +148,37 @@ class RateLimitFilterTest {
                 .hasMessageContaining("downstream failed");
 
         assertThat(chainCalls).hasValue(1);
-        assertThat(breaker.allowCall()).isTrue();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
+    }
+
+    /**
+     * A request in flight when another's failure opened the breaker answers afterwards: it is
+     * served with its decision, but its success does not close the breaker — only a probe's does.
+     */
+    @Test
+    void aLateAnswerDoesNotCloseTheBreaker() throws Exception {
+        Sinks.One<Decision> late = Sinks.one();
+        Queue<Mono<Decision>> answers = new ArrayDeque<>(List.of(
+                late.asMono(),
+                Mono.error(new IllegalStateException("redis down")),
+                Mono.just(new Decision(true, null, 9, 999, 0, 3600))));
+        RateLimitFilter filter = filter((identity, plan) -> {
+            storeCalls.incrementAndGet();
+            return answers.remove();
+        }, freshBreaker());
+        CompletableFuture<Void> inFlight = filter.filter(exchange(), chain)
+                .contextWrite(ReactiveSecurityContextHolder.withAuthentication(ACME))
+                .toFuture();
+        run(filter, exchange(), ACME);
+
+        late.tryEmitValue(new Decision(true, null, 9, 999, 0, 3600));
+        inFlight.get(5, TimeUnit.SECONDS);
+        MockServerWebExchange next = exchange();
+        run(filter, next, ACME);
+
+        assertThat(storeCalls).hasValue(2);
+        assertThat(chainCalls).hasValue(3);
+        assertThat(next.getResponse().getHeaders().getFirst("X-RateLimit-Remaining")).isNull();
     }
 
     private static MockServerWebExchange exchange() {

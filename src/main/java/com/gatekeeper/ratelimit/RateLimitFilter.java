@@ -1,6 +1,7 @@
 package com.gatekeeper.ratelimit;
 
 import com.gatekeeper.error.TooManyRequestsWriter;
+import com.gatekeeper.ratelimit.RedisCircuitBreaker.Permit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
@@ -72,7 +73,8 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
     }
 
     private Mono<Void> limit(ServerWebExchange exchange, GatewayFilterChain chain, RateLimitIdentity caller) {
-        if (!breaker.allowCall()) {
+        Permit permit = breaker.allowCall();
+        if (permit == Permit.DENIED) {
             log.debug("Rate limiter's breaker is open; forwarding {} unlimited", caller.key());
             return chain.filter(exchange);
         }
@@ -81,9 +83,11 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                 .timeout(timeout)
                 .map(Optional::of)
                 .switchIfEmpty(Mono.error(() -> new IllegalStateException("store answered nothing")))
-                .doOnNext(decision -> breaker.recordSuccess())
+                // The permit taken before the call, not the breaker's state now: only a probe's
+                // success may close it.
+                .doOnNext(decision -> breaker.recordSuccess(permit))
                 .onErrorResume(error -> {
-                    breaker.recordFailure(error);
+                    breaker.recordFailure(permit, error);
                     return Mono.just(Optional.<Decision>empty());
                 })
                 // From here the chain continues on Lettuce's or the timeout's thread, as Spring Cloud

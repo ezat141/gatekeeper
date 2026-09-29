@@ -17,6 +17,12 @@ import java.util.function.LongSupplier;
  * unbounded reconnect buffer to about one command per window, and turns an outage into one
  * warning when the breaker opens and one line when it closes, instead of a stack trace per request.
  *
+ * <p><strong>Only the probe closes it.</strong> Each call takes a {@link Permit} before it asks
+ * Redis and reports its outcome with that permit. A request already in flight when the breaker
+ * opened holds a {@link Permit#CLOSED} permit; its late success says nothing about Redis now, so
+ * it does not close the breaker. Otherwise a Redis answering around the timeout would open and
+ * close it hundreds of times a second.
+ *
  * <p>The cost: after any Redis failure, limiting stays suspended for up to one window even if Redis
  * recovers sooner.
  */
@@ -25,6 +31,16 @@ public class RedisCircuitBreaker {
     static final Duration OPEN_FOR = Duration.ofSeconds(5);
 
     private static final Logger log = LoggerFactory.getLogger(RedisCircuitBreaker.class);
+
+    /** What a caller may do, decided once per call, and reported back with its outcome. */
+    public enum Permit {
+        /** The breaker was closed: call Redis. */
+        CLOSED,
+        /** The breaker was open and its window had passed: call Redis as the one probe. */
+        PROBE,
+        /** The breaker is open: do not call Redis. */
+        DENIED
+    }
 
     private final Duration openFor;
     private final long openForNanos;
@@ -39,38 +55,44 @@ public class RedisCircuitBreaker {
     }
 
     /**
-     * True while closed. While open, false until the window has passed; then true for exactly one
-     * caller — the probe, which claims the next window — and false for the rest.
+     * {@link Permit#CLOSED} while closed. While open, {@link Permit#DENIED} until the window has
+     * passed; then {@link Permit#PROBE} for exactly one caller — the one that claims the next window
+     * — and {@link Permit#DENIED} for the rest.
      */
-    public boolean allowCall() {
+    public Permit allowCall() {
         if (!open.get()) {
-            return true;
+            return Permit.CLOSED;
         }
         long until = openUntil.get();
         long now = nanoTime.getAsLong();
         if (now - until < 0) {
-            return false;
+            return Permit.DENIED;
         }
-        return openUntil.compareAndSet(until, now + openForNanos);
+        return openUntil.compareAndSet(until, now + openForNanos) ? Permit.PROBE : Permit.DENIED;
     }
 
-    /** Closes the breaker. True only when this call closed an open breaker. */
-    public boolean recordSuccess() {
-        if (open.compareAndSet(true, false)) {
+    /** Closes the breaker, but only for the probe's success. True only when this call closed it. */
+    public boolean recordSuccess(Permit permit) {
+        if (permit == Permit.PROBE && open.compareAndSet(true, false)) {
             log.info("Rate limiter's Redis answered again; limiting resumed");
             return true;
         }
         return false;
     }
 
-    /** Opens the breaker for a window from now. Warns, with the cause, only when it was closed. */
-    public void recordFailure(Throwable error) {
+    /**
+     * Opens the breaker for a window from now, or, if it is already open — a failed probe, or a
+     * late failure from before the opening — extends it. Warns, with the cause, only on the
+     * opening. True only when this call opened it.
+     */
+    public boolean recordFailure(Permit permit, Throwable error) {
         openUntil.set(nanoTime.getAsLong() + openForNanos);
         if (open.compareAndSet(false, true)) {
             log.warn("Rate limiter's Redis failed; forwarding requests unlimited for {} s at a time until it answers",
                     openFor.toSeconds(), error);
-        } else {
-            log.debug("Rate limiter's Redis still failing: {}", error.toString());
+            return true;
         }
+        log.debug("Rate limiter's Redis still failing ({} call): {}", permit, error.toString());
+        return false;
     }
 }

@@ -1,5 +1,6 @@
 package com.gatekeeper.ratelimit;
 
+import com.gatekeeper.ratelimit.RedisCircuitBreaker.Permit;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -11,65 +12,100 @@ import static org.assertj.core.api.Assertions.assertThat;
 class RedisCircuitBreakerTest {
 
     static final Duration WINDOW = Duration.ofSeconds(5);
+    static final IllegalStateException DOWN = new IllegalStateException("redis down");
 
     final AtomicLong now = new AtomicLong(1_000_000_000L);
     final RedisCircuitBreaker breaker = new RedisCircuitBreaker(WINDOW, now::get);
 
     @Test
     void allowsEveryCallWhileClosed() {
-        assertThat(breaker.allowCall()).isTrue();
-        assertThat(breaker.allowCall()).isTrue();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
     }
 
     @Test
     void aFailureOpensItForTheWindow() {
-        breaker.recordFailure(new IllegalStateException("redis down"));
+        assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isTrue();
 
-        assertThat(breaker.allowCall()).isFalse();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
         advance(WINDOW.minusMillis(1));
-        assertThat(breaker.allowCall()).isFalse();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
     }
 
     @Test
     void afterTheWindowExactlyOneCallerProbes() {
-        breaker.recordFailure(new IllegalStateException("redis down"));
+        breaker.recordFailure(breaker.allowCall(), DOWN);
         advance(WINDOW);
 
-        assertThat(breaker.allowCall()).isTrue();
-        assertThat(breaker.allowCall()).isFalse();
-        assertThat(breaker.allowCall()).isFalse();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.PROBE);
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
     }
 
     @Test
-    void aSuccessfulProbeClosesIt() {
-        breaker.recordFailure(new IllegalStateException("redis down"));
+    void onlyTheProbeClosesIt() {
+        breaker.recordFailure(breaker.allowCall(), DOWN);
         advance(WINDOW);
-        assertThat(breaker.allowCall()).isTrue();
+        Permit probe = breaker.allowCall();
+        assertThat(probe).isEqualTo(Permit.PROBE);
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
 
-        assertThat(breaker.recordSuccess()).isTrue();
+        assertThat(breaker.recordSuccess(probe)).isTrue();
 
-        assertThat(breaker.allowCall()).isTrue();
-        assertThat(breaker.allowCall()).isTrue();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
+    }
+
+    /** A request already in flight when the breaker opened answers late: that is not a recovery. */
+    @Test
+    void aLateSuccessFromBeforeTheOpeningDoesNotCloseIt() {
+        Permit inFlight = breaker.allowCall();
+        assertThat(inFlight).isEqualTo(Permit.CLOSED);
+        breaker.recordFailure(breaker.allowCall(), DOWN);
+
+        assertThat(breaker.recordSuccess(inFlight)).isFalse();
+
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
     }
 
     @Test
     void aFailedProbeReopensItForAnotherWindow() {
-        breaker.recordFailure(new IllegalStateException("redis down"));
+        breaker.recordFailure(breaker.allowCall(), DOWN);
         advance(WINDOW);
-        assertThat(breaker.allowCall()).isTrue();
+        Permit probe = breaker.allowCall();
+        assertThat(probe).isEqualTo(Permit.PROBE);
 
-        breaker.recordFailure(new IllegalStateException("still down"));
+        assertThat(breaker.recordFailure(probe, new IllegalStateException("still down"))).isFalse();
 
         advance(WINDOW.minusMillis(1));
-        assertThat(breaker.allowCall()).isFalse();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
         advance(Duration.ofMillis(1));
-        assertThat(breaker.allowCall()).isTrue();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.PROBE);
     }
 
     @Test
     void aSuccessWhileClosedIsNotARecovery() {
-        assertThat(breaker.recordSuccess()).isFalse();
-        assertThat(breaker.allowCall()).isTrue();
+        assertThat(breaker.recordSuccess(breaker.allowCall())).isFalse();
+        assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
+    }
+
+    /**
+     * A Redis answering around the timeout: requests from before the opening keep succeeding and
+     * failing late. Only one opening may come of it — not one per late success.
+     */
+    @Test
+    void lateAnswersAroundTheTimeoutOpenItOnlyOnce() {
+        int openings = breaker.recordFailure(breaker.allowCall(), DOWN) ? 1 : 0;
+
+        for (int i = 0; i < 100; i++) {
+            breaker.recordSuccess(Permit.CLOSED);
+            if (breaker.recordFailure(Permit.CLOSED, DOWN)) {
+                openings++;
+            }
+        }
+
+        assertThat(openings).isEqualTo(1);
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
     }
 
     private void advance(Duration by) {

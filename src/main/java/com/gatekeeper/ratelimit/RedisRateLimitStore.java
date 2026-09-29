@@ -68,6 +68,12 @@ public class RedisRateLimitStore implements RateLimitStore {
         this.redis = redis;
         // cache(value, error, empty): a success is kept forever, an error or an empty answer not at
         // all; and unlike cacheInvalidateIf, subscribers cancelling never cancel the attempt.
+        //
+        // "Forever" is the factory's lifetime. That holds because LettuceConnectionFactory drops its
+        // shared connection only in resetConnection() — called by stop() and initConnection(), or by
+        // validateConnection() when setValidateConnection(true), which Spring Boot does not set —
+        // and normal operation calls none of them; Lettuce itself reconnects in the background.
+        // After a lifecycle stop and restart, the first check would connect on the calling thread.
         this.connected = Mono.defer(ping)
                 .subscribeOn(Schedulers.boundedElastic())
                 .thenReturn(Boolean.TRUE)
