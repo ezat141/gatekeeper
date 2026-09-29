@@ -279,8 +279,8 @@ reconnects, without a bound, and a cancelled command stays buffered. The limiter
   startup warm-up subscribes to the same step.
 - **A circuit breaker in the filter** — chosen with the repo owner over rejecting commands client-wide
   (which would change the API-key cache's behaviour during a reconnect) and over a separate Redis client
-  for the limiter (a second connection and duplicated configuration). After a store failure or timeout,
-  the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and
+  for the limiter (a second connection and duplicated configuration). After three consecutive store
+  failures or timeouts (see below), the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and
   the probe's success closes the breaker. This bounds what the limiter can add to Lettuce's buffer to about one
   command per window, keeps workers free, and turns an outage into one warning when the breaker opens
   and one line when it closes, instead of a stack trace per request.
@@ -306,6 +306,13 @@ together, and against a silent Redis they all wait on the same single connection
 count reaches three without adding a connection. A Redis that answers slowly but intermittently now
 keeps the breaker closed; each slow request fails open on its own, which is this section's choice per
 request.
+
+**What three does not cover, stated.** The count has no time or rate basis. A gateway pause longer than
+200 ms under a flood times out every in-flight request at once — far more than three — so that case
+still opens the breaker; three mainly protects low-concurrency traffic. And at high throughput,
+independent failures line up three in a row often enough to open it repeatedly (roughly throughput × p³
+per second for a failure rate p). A failure ratio over a sliding window with a minimum call count is
+the fuller answer; it is left as a follow-up.
 
 ---
 
