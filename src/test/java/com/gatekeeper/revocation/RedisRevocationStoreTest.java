@@ -81,7 +81,8 @@ class RedisRevocationStoreTest {
     /** Writes the entry the way AuthCore's RevocationService does: value "revoked", with a TTL. */
     private String revoke(Duration ttl) {
         String jti = UUID.randomUUID().toString();
-        String key = RedisRevocationStore.key(jti);
+        // Literal on purpose: pins AuthCore's contract, not the store's own key function.
+        String key = "authcore:revoked:jti:" + jti;
         written.add(key);
         redis.opsForValue().set(key, "revoked", ttl).block();
         return jti;
