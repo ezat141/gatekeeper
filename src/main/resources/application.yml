@@ -85,6 +85,12 @@ gatekeeper:
         authcore-machine: pro
       api-keys:
         demo-reporting-job: free
+  revocation:
+    # How long the revocation check waits for Redis. A revoked token getting through is a security
+    # failure, so an unanswered check refuses (503 with Retry-After) rather than admitting — the
+    # opposite of rate-limit.redis-timeout above — and it must refuse fast, not hang. See the M6
+    # design, sections 4 and 7.
+    redis-timeout: 200ms
 
 management:
   endpoints:
