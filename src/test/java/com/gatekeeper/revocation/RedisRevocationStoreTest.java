@@ -59,8 +59,9 @@ class RedisRevocationStoreTest {
     /** AuthCore's entries expire with the token: an expired entry is no longer a revocation. */
     @Test
     void anExpiredEntryIsNotRevoked() throws InterruptedException {
-        String jti = revoke(Duration.ofMillis(100));
-        Thread.sleep(300);
+        String jti = revoke(Duration.ofSeconds(1));
+        assertThat(store().isRevoked(jti).block()).isTrue();
+        Thread.sleep(1500);
 
         assertThat(store().isRevoked(jti).block()).isFalse();
     }
