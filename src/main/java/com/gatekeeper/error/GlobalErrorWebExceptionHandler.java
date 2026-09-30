@@ -1,6 +1,7 @@
 package com.gatekeeper.error;
 
 import com.gatekeeper.apikey.IntrospectionUnavailableException;
+import com.gatekeeper.revocation.RevocationUnavailableException;
 import org.springframework.boot.autoconfigure.web.WebProperties;
 import org.springframework.boot.web.error.ErrorAttributeOptions;
 import org.springframework.boot.webflux.autoconfigure.error.AbstractErrorWebExceptionHandler;
@@ -81,7 +82,9 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
             builder = builder.header(HttpHeaders.RETRY_AFTER, "5");
         }
 
-        return builder.bodyValue(ErrorBody.of(status, request.path()));
+        // Only the revocation 503 carries a detail, so it can be told from M3's introspection 503.
+        String detail = error instanceof RevocationUnavailableException ? RevocationUnavailableException.DETAIL : null;
+        return builder.bodyValue(ErrorBody.of(status, request.path(), detail));
     }
 
     /**
@@ -117,12 +120,18 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
      * everyday use of it that an unrelated bug elsewhere could collide with, so narrowing
      * on message text as well would add ceremony without removing any real risk of
      * mislabelling something else. It maps to 503, not 401 — see its own Javadoc for why.
+     *
+     * <p>{@link RevocationUnavailableException} gets the same bare type match and the same 503, for
+     * the same reasons: declared here, thrown from one place ({@code RevocationCheckingJwtDecoder})
+     * for one reason — whether the token is revoked could not be established. A 401 would send a
+     * caller holding a very likely valid token to refresh it, against an AuthCore that is itself
+     * stuck while Redis is down (the M6 design, section 4).
      */
     private HttpStatus statusFor(ServerRequest request, Throwable error) {
         if (isUnreachableJwks(error) || isRejectedOutboundHeader(error)) {
             return HttpStatus.UNAUTHORIZED;
         }
-        if (error instanceof IntrospectionUnavailableException) {
+        if (error instanceof IntrospectionUnavailableException || error instanceof RevocationUnavailableException) {
             return HttpStatus.SERVICE_UNAVAILABLE;
         }
 
