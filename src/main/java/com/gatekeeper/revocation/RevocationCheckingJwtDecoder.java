@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.oauth2.jwt.BadJwtException;
 import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.jwt.JwtClaimNames;
 import org.springframework.security.oauth2.jwt.JwtException;
 import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
 import org.springframework.util.StringUtils;
@@ -60,7 +61,7 @@ public class RevocationCheckingJwtDecoder implements ReactiveJwtDecoder {
             // Only the issuer can sign a token without one, so this is an issuer bug, and an
             // outsider cannot flood this line.
             log.warn("Refused a validly signed token with no jti, which could never be revoked: sub={}, iss={}",
-                    jwt.getSubject(), jwt.getIssuer());
+                    jwt.getSubject(), jwt.getClaimAsString(JwtClaimNames.ISS));
             return Mono.error(new BadJwtException("The token has no jti, so it cannot be revoked"));
         }
         return Mono.defer(() -> isRevoked(jti))

@@ -7,6 +7,7 @@ import org.springframework.security.oauth2.jwt.BadJwtException;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import reactor.test.StepVerifier;
 
 import java.time.Duration;
@@ -114,7 +115,9 @@ class RevocationCheckingJwtDecoderTest {
         answer.set(Mono.empty());
 
         StepVerifier.create(decoder(jwt("j-1")).decode("t"))
-                .expectError(RevocationUnavailableException.class)
+                .expectErrorSatisfies(error -> assertThat(error)
+                        .isInstanceOf(RevocationUnavailableException.class)
+                        .hasCauseInstanceOf(IllegalStateException.class))
                 .verify();
     }
 
@@ -176,6 +179,27 @@ class RevocationCheckingJwtDecoderTest {
         StepVerifier.create(decoder.decode("t")).expectNextCount(1).verifyComplete();
 
         assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
+    }
+
+    /**
+     * Only the probe's success may close the breaker. A call that took its CLOSED permit before the
+     * breaker opened, and answers after, is a late success from before the opening: it must not
+     * close the breaker again.
+     */
+    @Test
+    void aLateSuccessDoesNotCloseTheBreaker() {
+        Sinks.One<Boolean> late = Sinks.one();
+        answer.set(late.asMono());
+        RevocationCheckingJwtDecoder decoder = decoder(jwt("j-1"));
+        decoder.decode("t").subscribe(jwt -> { }, error -> { });
+        answer.set(Mono.error(DOWN));
+        for (int i = 0; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
+            decoder.decode("t").onErrorResume(error -> Mono.empty()).block();
+        }
+
+        late.tryEmitValue(false);
+
+        assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
     }
 
     /**
