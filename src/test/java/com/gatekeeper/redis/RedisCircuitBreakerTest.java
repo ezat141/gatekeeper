@@ -28,7 +28,7 @@ class RedisCircuitBreakerTest {
         assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
     }
 
-    /** A single timeout may be the gateway's own slowness: it fails its request open, no more. */
+    /** A single timeout may be the gateway's own slowness: it affects only its own request, no more. */
     @Test
     void oneFailureDoesNotOpenIt() {
         assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
@@ -185,24 +185,37 @@ class RedisCircuitBreakerTest {
         assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
     }
 
-    /** Two consumers share this class: each line must say whose Redis, and what happens meanwhile. */
+    /**
+     * Two consumers share this class: each line must say whose Redis, and what happens meanwhile.
+     * The output is captured for the whole class, so each log test uses a name no other test does.
+     */
     @Test
     void itsOpeningNamesItsConsumerAndWhatHappensWhileOpen(CapturedOutput output) {
-        open();
+        RedisCircuitBreaker own = new RedisCircuitBreaker("Opening consumer", "doing the test thing",
+                WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
+
+        for (int i = 0; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
+            own.recordFailure(own.allowCall(), DOWN);
+        }
 
         assertThat(output).contains(
-                "Test consumer: Redis failed 3 times in a row; doing the test thing for 5 s at a time until it answers");
+                "Opening consumer: Redis failed 3 times in a row; doing the test thing for 5 s at a time until it answers");
     }
 
     @Test
     void itsClosingNamesItsConsumer(CapturedOutput output) {
-        open();
+        RedisCircuitBreaker own = new RedisCircuitBreaker("Closing consumer", "doing the test thing",
+                WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
+        for (int i = 0; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
+            own.recordFailure(own.allowCall(), DOWN);
+        }
         advance(WINDOW);
 
-        assertThat(breaker.recordSuccess(breaker.allowCall())).isTrue();
+        assertThat(own.recordSuccess(own.allowCall())).isTrue();
 
-        assertThat(output).contains("Test consumer: Redis answered again; breaker closed");
+        assertThat(output).contains("Closing consumer: Redis answered again; breaker closed");
     }
+
     /** Opens it the only way it opens: consecutive failures, the last of which reports the opening. */
     private void open() {
         for (int i = 1; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {

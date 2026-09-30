@@ -11,7 +11,7 @@ import java.util.function.LongSupplier;
 
 /**
  * Stops one consumer asking a Redis that is not answering. The M5 design, section 7; used by the
- * rate limiter and, since M6, by the revocation check (its section 7), one instance each.
+ * rate limiter and, since M6, by the revocation check (the M6 design, section 7), one instance each.
  *
  * <p>After {@link #FAILURES_TO_OPEN} consecutive failures or timeouts the breaker opens: for
  * {@link #OPEN_FOR} its consumer does not call Redis at all. What the consumer does instead is its
@@ -68,7 +68,7 @@ public class RedisCircuitBreaker {
     /**
      * @param name      the consumer, as its log lines name it: "Rate limiter", "Revocation check"
      * @param whileOpen what the consumer does while the breaker is open, as the opening warning says
-     *                  it: "forwarding requests unlimited"
+     *                  it: "forwarding requests unlimited", "refusing bearer-token requests with 503"
      */
     public RedisCircuitBreaker(String name, String whileOpen, Duration openFor, int failuresToOpen,
                                LongSupplier nanoTime) {
