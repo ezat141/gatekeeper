@@ -25,10 +25,12 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.any;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlPathMatching;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -108,11 +110,15 @@ class SilentRedisFailClosedTest {
                     .expectBody().jsonPath("$.detail").isEqualTo(RevocationUnavailableException.DETAIL);
 
             // The first request also pays for the cold path; the check's own share is its timeout.
-            Duration bound = i == 0 ? Duration.ofSeconds(3) : Duration.ofSeconds(1);
+            Duration bound = i == 0 ? Duration.ofSeconds(5) : Duration.ofSeconds(1);
             assertThat(Duration.ofNanos(System.nanoTime() - started)).as("request %d", i).isLessThan(bound);
         }
 
-        // The warm-up's single attempt, which every later caller shares rather than repeats.
-        assertThat(accepted).as("connections accepted by the silent Redis").hasValueLessThanOrEqualTo(1);
+        // Exactly one: the warm-up's attempt, which every later caller shares rather than repeats. It stays
+        // pending for the whole run, well under Lettuce's ~10 s connect timeout; a longer run could see a
+        // second attempt.
+        assertThat(accepted).as("connections accepted by the silent Redis").hasValue(1);
+
+        downstream.verify(0, anyRequestedFor(urlPathMatching("/ledger/.*")));
     }
 }

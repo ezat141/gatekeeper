@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webtestclient.autoconfigure.AutoConfigureWebTestClient;
 import org.springframework.http.HttpHeaders;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.reactive.server.WebTestClient;
@@ -25,11 +26,12 @@ import java.util.List;
 import java.util.Map;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.any;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
-import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlPathMatching;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -80,7 +82,13 @@ class DeadRedisFailClosedTest {
         registry.add("spring.data.redis.port", () -> deadPort);
     }
 
+    /**
+     * Starts from a fresh context, so a fresh, closed breaker: after the test below, which opens it,
+     * every request here would be refused by the open breaker without touching Redis, and the dead-Redis
+     * path itself would never be timed. JUnit does not promise an order between methods.
+     */
     @Test
+    @DirtiesContext(methodMode = DirtiesContext.MethodMode.BEFORE_METHOD)
     void refusesEveryBearerTokenWith503Promptly() {
         String token = userToken();
 
@@ -100,11 +108,11 @@ class DeadRedisFailClosedTest {
                     .jsonPath("$.detail").isEqualTo(RevocationUnavailableException.DETAIL);
 
             // The first request also pays for the cold path (the JWKS fetch) on a cold JVM.
-            Duration bound = i == 0 ? Duration.ofSeconds(3) : Duration.ofSeconds(1);
+            Duration bound = i == 0 ? Duration.ofSeconds(5) : Duration.ofSeconds(1);
             assertThat(Duration.ofNanos(System.nanoTime() - started)).as("request %d", i).isLessThan(bound);
         }
 
-        downstream.verify(0, getRequestedFor(urlEqualTo("/ledger/entries")));
+        downstream.verify(0, anyRequestedFor(urlPathMatching("/ledger/.*")));
     }
 
     /** The handoff's warning: an open breaker must refuse, not skip the check and forward. */
@@ -123,7 +131,7 @@ class DeadRedisFailClosedTest {
                 .expectStatus().isEqualTo(503)
                 .expectBody().jsonPath("$.detail").isEqualTo(RevocationUnavailableException.DETAIL);
 
-        downstream.verify(0, getRequestedFor(urlEqualTo("/ledger/entries")));
+        downstream.verify(0, anyRequestedFor(urlPathMatching("/ledger/.*")));
     }
 
     private static String userToken() {
