@@ -1,22 +1,26 @@
-package com.gatekeeper.ratelimit;
+package com.gatekeeper.redis;
 
-import com.gatekeeper.ratelimit.RedisCircuitBreaker.Permit;
+import com.gatekeeper.redis.RedisCircuitBreaker.Permit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** The limiter's breaker, on a fake clock. The M5 design, section 7. */
+/** The breaker, on a fake clock. The M5 design, section 7; the M6 design, section 7. */
+@ExtendWith(OutputCaptureExtension.class)
 class RedisCircuitBreakerTest {
 
     static final Duration WINDOW = Duration.ofSeconds(5);
     static final IllegalStateException DOWN = new IllegalStateException("redis down");
 
     final AtomicLong now = new AtomicLong(1_000_000_000L);
-    final RedisCircuitBreaker breaker =
-            new RedisCircuitBreaker(WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
+    final RedisCircuitBreaker breaker = new RedisCircuitBreaker("Test consumer", "doing the test thing",
+            WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
 
     @Test
     void allowsEveryCallWhileClosed() {
@@ -181,6 +185,24 @@ class RedisCircuitBreakerTest {
         assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
     }
 
+    /** Two consumers share this class: each line must say whose Redis, and what happens meanwhile. */
+    @Test
+    void itsOpeningNamesItsConsumerAndWhatHappensWhileOpen(CapturedOutput output) {
+        open();
+
+        assertThat(output).contains(
+                "Test consumer: Redis failed 3 times in a row; doing the test thing for 5 s at a time until it answers");
+    }
+
+    @Test
+    void itsClosingNamesItsConsumer(CapturedOutput output) {
+        open();
+        advance(WINDOW);
+
+        assertThat(breaker.recordSuccess(breaker.allowCall())).isTrue();
+
+        assertThat(output).contains("Test consumer: Redis answered again; breaker closed");
+    }
     /** Opens it the only way it opens: consecutive failures, the last of which reports the opening. */
     private void open() {
         for (int i = 1; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {

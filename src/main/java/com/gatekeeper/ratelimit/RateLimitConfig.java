@@ -1,5 +1,6 @@
 package com.gatekeeper.ratelimit;
 
+import com.gatekeeper.redis.RedisCircuitBreaker;
 import com.gatekeeper.redis.RedisConnectionStep;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -18,9 +19,10 @@ public class RateLimitConfig {
         return new RedisRateLimitStore(redis, connection);
     }
 
+    /** The limiter's own breaker; the revocation check has another. Injected by this name. */
     @Bean
-    public RedisCircuitBreaker redisCircuitBreaker() {
-        return new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, RedisCircuitBreaker.FAILURES_TO_OPEN,
-                System::nanoTime);
+    public RedisCircuitBreaker rateLimitBreaker() {
+        return new RedisCircuitBreaker("Rate limiter", "forwarding requests unlimited",
+                RedisCircuitBreaker.OPEN_FOR, RedisCircuitBreaker.FAILURES_TO_OPEN, System::nanoTime);
     }
 }

@@ -1,9 +1,11 @@
 package com.gatekeeper.ratelimit;
 
 import com.gatekeeper.error.TooManyRequestsWriter;
-import com.gatekeeper.ratelimit.RedisCircuitBreaker.Permit;
+import com.gatekeeper.redis.RedisCircuitBreaker;
+import com.gatekeeper.redis.RedisCircuitBreaker.Permit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
@@ -50,7 +52,8 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
     private final RedisCircuitBreaker breaker;
 
     public RateLimitFilter(PlanResolver plans, RateLimitStore store, TooManyRequestsWriter writer,
-                           RateLimitProperties properties, RedisCircuitBreaker breaker) {
+                           RateLimitProperties properties,
+                           @Qualifier("rateLimitBreaker") RedisCircuitBreaker breaker) {
         this.plans = plans;
         this.store = store;
         this.writer = writer;
