@@ -60,6 +60,7 @@ class RedisRevocationStoreTest {
     @Test
     void anExpiredEntryIsNotRevoked() throws InterruptedException {
         String jti = revoke(Duration.ofMillis(100));
+        assertThat(store().isRevoked(jti).block()).isTrue();
         Thread.sleep(300);
 
         assertThat(store().isRevoked(jti).block()).isFalse();
