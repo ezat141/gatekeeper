@@ -88,8 +88,8 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
     }
 
     /**
-     * Three failures reach here as raw runtime exceptions rather than anything Spring
-     * Security recognises, and all three would otherwise read as a server fault.
+     * Four failures reach here as raw runtime exceptions rather than anything Spring
+     * Security recognises, and all four would otherwise read as a server fault.
      *
      * <p>An unreachable JWKS arrives as {@code IllegalStateException("Could not obtain the
      * keys", ...)} from the remote key source — {@code JwtReactiveAuthenticationManager}
@@ -122,10 +122,10 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
      * mislabelling something else. It maps to 503, not 401 — see its own Javadoc for why.
      *
      * <p>{@link RevocationUnavailableException} gets the same bare type match and the same 503, for
-     * the same reasons: declared here, thrown from one place ({@code RevocationCheckingJwtDecoder})
-     * for one reason — whether the token is revoked could not be established. A 401 would send a
-     * caller holding a very likely valid token to refresh it, against an AuthCore that is itself
-     * stuck while Redis is down (the M6 design, section 4).
+     * the same reasons: declared by this gateway, thrown from one place ({@code
+     * RevocationCheckingJwtDecoder}) for one reason — whether the token is revoked could not be
+     * established. A 401 would send a caller holding a very likely valid token to refresh it,
+     * against an AuthCore that is itself stuck while Redis is down (the M6 design, section 4).
      */
     private HttpStatus statusFor(ServerRequest request, Throwable error) {
         if (isUnreachableJwks(error) || isRejectedOutboundHeader(error)) {
