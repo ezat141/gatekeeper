@@ -9,10 +9,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.support.GenericApplicationContext;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.client.ReactorResourceFactory;
 import org.springframework.test.web.reactive.server.WebTestClient;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
@@ -28,7 +30,7 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The proof that the limit is distributed: two gateway instances, as separate application
+ * The proof that the limit — and, since M6, a revocation — is distributed: two gateway instances, as separate application
  * contexts on their own ports, sharing one Redis and one downstream. Requests alternate between
  * them and the combined count trips the limit on whichever instance receives the next one. The
  * M5 design, section 11.
@@ -122,6 +124,28 @@ class TwoGatewaysShareOneLimitTest {
         ledger(toSecond, token)
                 .expectStatus().isEqualTo(429)
                 .expectBody().jsonPath("$.detail").isEqualTo(RateLimitReason.RATE_LIMITED.detail());
+    }
+
+    /**
+     * A revocation reaches every instance on its next call: no instance remembers "not revoked"
+     * (the M6 design, section 5). Both are asked once before the revocation, so an in-process cache
+     * of that answer — the one the design rejected — would serve the next call a 200 and fail this.
+     */
+    @Test
+    void bothRefuseARevokedTokenOnTheNextCall() {
+        String token = userToken("r-" + UUID.randomUUID());
+        ledger(toFirst, token).expectStatus().isOk();
+        ledger(toSecond, token).expectStatus().isOk();
+
+        ReactiveStringRedisTemplate redis = first.getBean(ReactiveStringRedisTemplate.class);
+        String key = "authcore:revoked:jti:" + TestKey.jwtIdOf(token.substring("Bearer ".length()));
+        redis.opsForValue().set(key, "revoked", Duration.ofMinutes(5)).block();
+        try {
+            ledger(toFirst, token).expectStatus().isUnauthorized();
+            ledger(toSecond, token).expectStatus().isUnauthorized();
+        } finally {
+            redis.delete(key).block();
+        }
     }
 
     /**
