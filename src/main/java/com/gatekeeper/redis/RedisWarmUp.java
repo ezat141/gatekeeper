@@ -22,7 +22,8 @@ import java.time.Duration;
  * <p><strong>Bounded, and never fails the boot.</strong> It waits on the shared connection step —
  * which already runs on a worker thread — for at most {@link #WARM_UP_TIMEOUT}. Giving up stops the
  * waiting, not the attempt, which the first requests then share. A Redis that is down or silent
- * only logs a warning.
+ * only logs a warning. Until it answers, the rate limiter fails open and the revocation check
+ * refuses (the M6 design, section 8).
  */
 @Component
 public class RedisWarmUp implements SmartInitializingSingleton {
@@ -42,8 +43,8 @@ public class RedisWarmUp implements SmartInitializingSingleton {
         connection.ready()
                 .timeout(WARM_UP_TIMEOUT)
                 .onErrorResume(error -> {
-                    log.warn("Redis did not answer the startup warm-up; the rate limiter will fail open until it does",
-                            error);
+                    log.warn("Redis did not answer the startup warm-up; until it does, the rate limiter fails open"
+                            + " and the revocation check refuses bearer tokens with 503", error);
                     return Mono.empty();
                 })
                 .block();

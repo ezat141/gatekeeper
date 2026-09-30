@@ -11,6 +11,7 @@ import com.nimbusds.jose.jwk.gen.RSAKeyGenerator;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
 
+import java.text.ParseException;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Date;
@@ -52,13 +53,35 @@ public final class TestKey {
      */
     public String mintAdvertisingKeyId(String keyId, String issuer, String subject,
                                        Instant expiresAt, Map<String, Object> claims) {
+        return sign(keyId, UUID.randomUUID().toString(), issuer, subject, expiresAt, claims);
+    }
+
+    /** A token whose {@code jti} the test chooses; {@code null} leaves the claim out altogether. */
+    public String mintWithJwtId(String jwtId, String issuer, String subject,
+                                Instant expiresAt, Map<String, Object> claims) {
+        return sign(this.key.getKeyID(), jwtId, issuer, subject, expiresAt, claims);
+    }
+
+    /** The {@code jti} of a token this class minted, read without verifying it. */
+    public static String jwtIdOf(String token) {
+        try {
+            return SignedJWT.parse(token).getJWTClaimsSet().getJWTID();
+        } catch (ParseException ex) {
+            throw new IllegalArgumentException("not a signed JWT", ex);
+        }
+    }
+
+    private String sign(String keyId, String jwtId, String issuer, String subject,
+                        Instant expiresAt, Map<String, Object> claims) {
         try {
             JWTClaimsSet.Builder builder = new JWTClaimsSet.Builder()
                     .issuer(issuer)
                     .subject(subject)
-                    .jwtID(UUID.randomUUID().toString())
                     .issueTime(Date.from(Instant.now().minusSeconds(30)))
                     .expirationTime(Date.from(expiresAt));
+            if (jwtId != null) {
+                builder.jwtID(jwtId);
+            }
             claims.forEach(builder::claim);
 
             SignedJWT jwt = new SignedJWT(

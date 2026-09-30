@@ -92,7 +92,9 @@ class IntrospectionUnavailableTest {
                 .expectHeader().exists("Retry-After")
                 .expectBody()
                 .jsonPath("$.error").isEqualTo("service_unavailable")
-                .jsonPath("$.status").isEqualTo(503);
+                .jsonPath("$.status").isEqualTo(503)
+                // Only the revocation 503 carries a detail; M3's body is unchanged (M6 design, section 4).
+                .jsonPath("$.detail").doesNotExist();
     }
 
     /**
