@@ -169,8 +169,11 @@ class RedisCircuitBreakerTest {
 
         for (int i = 0; i < 100; i++) {
             breaker.recordSuccess(Permit.CLOSED);
-            if (breaker.recordFailure(Permit.CLOSED, DOWN)) {
-                openings++;
+            // enough late failures to reach the threshold if the success had wrongly closed it
+            for (int j = 0; j < RedisCircuitBreaker.FAILURES_TO_OPEN; j++) {
+                if (breaker.recordFailure(Permit.CLOSED, DOWN)) {
+                    openings++;
+                }
             }
         }
 
