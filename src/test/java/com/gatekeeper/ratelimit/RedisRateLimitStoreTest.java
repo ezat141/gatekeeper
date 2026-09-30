@@ -1,6 +1,7 @@
 package com.gatekeeper.ratelimit;
 
 import com.gatekeeper.ratelimit.RateLimitIdentity.Kind;
+import com.gatekeeper.redis.RedisConnectionStep;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -35,6 +36,9 @@ class RedisRateLimitStoreTest {
 
     @Autowired
     ReactiveStringRedisTemplate redis;
+
+    @Autowired
+    RedisConnectionStep connection;
 
     private final List<RateLimitIdentity> used = new ArrayList<>();
 
@@ -210,7 +214,7 @@ class RedisRateLimitStoreTest {
     void usesRedisTimeWhenNoTimeIsGiven() {
         RateLimitIdentity caller = fresh();
 
-        Decision decision = new RedisRateLimitStore(redis).check(caller, new Plan("t", 5, 10, 100)).block();
+        Decision decision = new RedisRateLimitStore(redis, connection).check(caller, new Plan("t", 5, 10, 100)).block();
 
         assertThat(decision.allowed()).isTrue();
         assertThat(decision.tokensRemaining()).isEqualTo(9);
@@ -218,7 +222,7 @@ class RedisRateLimitStoreTest {
     }
 
     private Decision check(RateLimitIdentity caller, Plan plan, double now) {
-        return new RedisRateLimitStore(redis).check(caller, plan, now).block();
+        return new RedisRateLimitStore(redis, connection).check(caller, plan, now).block();
     }
 
     private RateLimitIdentity fresh() {

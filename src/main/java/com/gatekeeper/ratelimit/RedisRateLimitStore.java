@@ -1,17 +1,15 @@
 package com.gatekeeper.ratelimit;
 
+import com.gatekeeper.redis.RedisConnectionStep;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.List;
-import java.util.function.Supplier;
 
 /**
  * One atomic script per request against two hashes per identity: the bucket and the daily
@@ -22,18 +20,9 @@ import java.util.function.Supplier;
  * a script must declare its keys before it runs, and the day is known only from Redis's clock,
  * read inside the script.
  *
- * <p><strong>Connected once, by one attempt no caller can cancel.</strong> The M5 design, section 7.
- * Lettuce opens its shared connection with a blocking wait inside {@code subscribe()}, before any
- * timeout downstream has started. So the store connects through a single cached step: a ping,
- * subscribed on a worker thread so the wait never holds an event loop, whose success is kept for
- * good and whose failure is not kept at all, so the next caller tries again. A caller waits on the
- * step within its own timeout, and timing out stops the caller waiting, never the attempt. That
- * matters: cancelling the worker interrupts it, and Lettuce then abandons its connection attempt
- * rather than cancelling it — each timed-out request against a silent Redis used to leave one
- * connection behind, all of them going live when Redis answered again.
- *
- * <p>Once connected, a check makes no thread hop: Lettuce's commands are non-blocking on an
- * established connection, and it reconnects in the background.
+ * <p><strong>Connects through the shared {@link RedisConnectionStep}</strong>, which never lets a
+ * blocking connect hold an event loop or leak a connection per timed-out request. The M5 design,
+ * section 7.
  */
 public class RedisRateLimitStore implements RateLimitStore {
 
@@ -53,41 +42,12 @@ public class RedisRateLimitStore implements RateLimitStore {
         }
     }
 
-    /** Keep a successful connection for good: exactly the value Reactor treats as "never expire". */
-    private static final Duration FOREVER = Duration.ofMillis(Long.MAX_VALUE);
-
     private final ReactiveStringRedisTemplate redis;
-    private final Mono<Boolean> connected;
+    private final RedisConnectionStep connection;
 
-    public RedisRateLimitStore(ReactiveStringRedisTemplate redis) {
-        this(redis, () -> redis.execute(connection -> connection.ping()).next());
-    }
-
-    /** For tests: any ping, to stand in for a Redis that answers, fails or never answers. */
-    RedisRateLimitStore(ReactiveStringRedisTemplate redis, Supplier<Mono<?>> ping) {
+    public RedisRateLimitStore(ReactiveStringRedisTemplate redis, RedisConnectionStep connection) {
         this.redis = redis;
-        // cache(value, error, empty): a success is kept forever, an error or an empty answer not at
-        // all; and unlike cacheInvalidateIf, subscribers cancelling never cancel the attempt.
-        //
-        // "Forever" is the factory's lifetime. That holds because LettuceConnectionFactory drops its
-        // shared connection only in resetConnection() — called by stop() and initConnection(), or by
-        // validateConnection() when setValidateConnection(true), which Spring Boot does not set —
-        // and normal operation calls none of them; Lettuce itself reconnects in the background.
-        // After a lifecycle stop and restart, the first check would connect on the calling thread.
-        //
-        // .single() turns an empty ping into an error too, so it is not cached as success either —
-        // cache's own "empty" branch only covers a Mono that completes with no error and no value
-        // reaching thenReturn, which never happens once thenReturn always supplies one.
-        this.connected = Mono.defer(ping)
-                .subscribeOn(Schedulers.boundedElastic())
-                .single()
-                .thenReturn(Boolean.TRUE)
-                .cache(ok -> FOREVER, error -> Duration.ZERO, () -> Duration.ZERO);
-    }
-
-    /** Completes once Redis has answered a ping; the startup warm-up waits on it. */
-    public Mono<Void> connect() {
-        return connected.then();
+        this.connection = connection;
     }
 
     static String bucketKey(RateLimitIdentity identity) {
@@ -109,7 +69,7 @@ public class RedisRateLimitStore implements RateLimitStore {
     }
 
     private Mono<Decision> run(RateLimitIdentity identity, Plan plan, String now) {
-        return connected
+        return connection.ready()
                 .then(Mono.defer(() -> redis.execute(SCRIPT,
                                 List.of(bucketKey(identity), quotaKey(identity)),
                                 List.of(Integer.toString(plan.requestsPerSecond()),
