@@ -2,7 +2,8 @@ package com.gatekeeper.ratelimit;
 
 import com.gatekeeper.error.TooManyRequestsWriter;
 import com.gatekeeper.ratelimit.RateLimitProperties.PlanLimits;
-import com.gatekeeper.ratelimit.RedisCircuitBreaker.Permit;
+import com.gatekeeper.redis.RedisCircuitBreaker;
+import com.gatekeeper.redis.RedisCircuitBreaker.Permit;
 import org.junit.jupiter.api.Test;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.http.HttpHeaders;
@@ -160,7 +161,8 @@ class RateLimitFilterTest {
      */
     @Test
     void propagatesADownstreamErrorWithoutForwardingTwice() {
-        RedisCircuitBreaker breaker = new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, 1, System::nanoTime);
+        RedisCircuitBreaker breaker = new RedisCircuitBreaker("Rate limiter", "forwarding requests unlimited",
+                RedisCircuitBreaker.OPEN_FOR, 1, System::nanoTime);
         RateLimitFilter filter = filter(store(Mono.just(new Decision(true, null, 9, 999, 0, 3600))), breaker);
         GatewayFilterChain failing = exchange -> {
             chainCalls.incrementAndGet();
@@ -196,7 +198,7 @@ class RateLimitFilterTest {
         CompletableFuture<Void> inFlight = filter.filter(exchange(), chain)
                 .contextWrite(ReactiveSecurityContextHolder.withAuthentication(ACME))
                 .toFuture();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
             run(filter, exchange(), ACME);
         }
 
@@ -222,8 +224,8 @@ class RateLimitFilterTest {
     }
 
     private static RedisCircuitBreaker freshBreaker() {
-        return new RedisCircuitBreaker(RedisCircuitBreaker.OPEN_FOR, RedisCircuitBreaker.FAILURES_TO_OPEN,
-                System::nanoTime);
+        return new RedisCircuitBreaker("Rate limiter", "forwarding requests unlimited",
+                RedisCircuitBreaker.OPEN_FOR, RedisCircuitBreaker.FAILURES_TO_OPEN, System::nanoTime);
     }
 
     private RateLimitFilter filter(RateLimitStore store) {

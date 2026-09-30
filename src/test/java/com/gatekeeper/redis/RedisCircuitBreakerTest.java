@@ -1,22 +1,26 @@
-package com.gatekeeper.ratelimit;
+package com.gatekeeper.redis;
 
-import com.gatekeeper.ratelimit.RedisCircuitBreaker.Permit;
+import com.gatekeeper.redis.RedisCircuitBreaker.Permit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** The limiter's breaker, on a fake clock. The M5 design, section 7. */
+/** The breaker, on a fake clock. The M5 design, section 7; the M6 design, section 7. */
+@ExtendWith(OutputCaptureExtension.class)
 class RedisCircuitBreakerTest {
 
     static final Duration WINDOW = Duration.ofSeconds(5);
     static final IllegalStateException DOWN = new IllegalStateException("redis down");
 
     final AtomicLong now = new AtomicLong(1_000_000_000L);
-    final RedisCircuitBreaker breaker =
-            new RedisCircuitBreaker(WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
+    final RedisCircuitBreaker breaker = new RedisCircuitBreaker("Test consumer", "doing the test thing",
+            WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
 
     @Test
     void allowsEveryCallWhileClosed() {
@@ -24,7 +28,7 @@ class RedisCircuitBreakerTest {
         assertThat(breaker.allowCall()).isEqualTo(Permit.CLOSED);
     }
 
-    /** A single timeout may be the gateway's own slowness: it fails its request open, no more. */
+    /** A single timeout may be the gateway's own slowness: it affects only its own request, no more. */
     @Test
     void oneFailureDoesNotOpenIt() {
         assertThat(breaker.recordFailure(breaker.allowCall(), DOWN)).isFalse();
@@ -179,6 +183,37 @@ class RedisCircuitBreakerTest {
 
         assertThat(openings).isEqualTo(1);
         assertThat(breaker.allowCall()).isEqualTo(Permit.DENIED);
+    }
+
+    /**
+     * Two consumers share this class: each line must say whose Redis, and what happens meanwhile.
+     * The output is captured for the whole class, so each log test uses a name no other test does.
+     */
+    @Test
+    void itsOpeningNamesItsConsumerAndWhatHappensWhileOpen(CapturedOutput output) {
+        RedisCircuitBreaker own = new RedisCircuitBreaker("Opening consumer", "doing the test thing",
+                WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
+
+        for (int i = 0; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
+            own.recordFailure(own.allowCall(), DOWN);
+        }
+
+        assertThat(output).contains(
+                "Opening consumer: Redis failed 3 times in a row; doing the test thing for 5 s at a time until it answers");
+    }
+
+    @Test
+    void itsClosingNamesItsConsumer(CapturedOutput output) {
+        RedisCircuitBreaker own = new RedisCircuitBreaker("Closing consumer", "doing the test thing",
+                WINDOW, RedisCircuitBreaker.FAILURES_TO_OPEN, now::get);
+        for (int i = 0; i < RedisCircuitBreaker.FAILURES_TO_OPEN; i++) {
+            own.recordFailure(own.allowCall(), DOWN);
+        }
+        advance(WINDOW);
+
+        assertThat(own.recordSuccess(own.allowCall())).isTrue();
+
+        assertThat(output).contains("Closing consumer: Redis answered again; breaker closed");
     }
 
     /** Opens it the only way it opens: consecutive failures, the last of which reports the opening. */
