@@ -1,4 +1,4 @@
-package com.gatekeeper.ratelimit;
+package com.gatekeeper.redis;
 
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
@@ -15,10 +15,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 /**
- * The store's connection step: one attempt at a time, which no caller can cancel; a success kept
- * for good, a failure not kept at all. The M5 design, section 7.
+ * The shared connection step: one attempt at a time, which no caller can cancel; a success kept
+ * for good, a failure not kept at all. The M5 design, section 7; shared since M6 (its section 7).
  */
-class RedisRateLimitStoreConnectTest {
+class RedisConnectionStepTest {
 
     final AtomicInteger pings = new AtomicInteger();
 
@@ -26,7 +26,7 @@ class RedisRateLimitStoreConnectTest {
     void callersWhoGiveUpNeitherCancelNorRepeatTheAttempt() throws InterruptedException {
         CountDownLatch answer = new CountDownLatch(1);
         AtomicInteger interrupted = new AtomicInteger();
-        RedisRateLimitStore store = new RedisRateLimitStore(null, () -> Mono.fromCallable(() -> {
+        RedisConnectionStep step = new RedisConnectionStep(() -> Mono.fromCallable(() -> {
             pings.incrementAndGet();
             try {
                 // blocks inside subscribe, as Lettuce's connect does
@@ -41,12 +41,12 @@ class RedisRateLimitStoreConnectTest {
         // Preemptive, so a step that blocked its caller inside subscribe fails rather than hangs.
         assertTimeoutPreemptively(Duration.ofSeconds(3), () -> {
             for (int i = 0; i < 3; i++) {
-                assertThatThrownBy(() -> store.connect().timeout(Duration.ofMillis(50)).block())
+                assertThatThrownBy(() -> step.ready().timeout(Duration.ofMillis(50)).block())
                         .hasCauseInstanceOf(TimeoutException.class);
             }
         });
         CountDownLatch connected = new CountDownLatch(1);
-        store.connect().subscribe(null, error -> { }, connected::countDown);
+        step.ready().subscribe(null, error -> { }, connected::countDown);
         answer.countDown();
 
         assertThat(connected.await(2, TimeUnit.SECONDS)).isTrue();
@@ -56,13 +56,13 @@ class RedisRateLimitStoreConnectTest {
 
     @Test
     void keepsASuccess() {
-        RedisRateLimitStore store = new RedisRateLimitStore(null, () -> Mono.fromCallable(() -> {
+        RedisConnectionStep step = new RedisConnectionStep(() -> Mono.fromCallable(() -> {
             pings.incrementAndGet();
             return "PONG";
         }));
 
-        store.connect().block(Duration.ofSeconds(2));
-        store.connect().block(Duration.ofSeconds(2));
+        step.ready().block(Duration.ofSeconds(2));
+        step.ready().block(Duration.ofSeconds(2));
 
         assertThat(pings).hasValue(1);
     }
@@ -70,30 +70,30 @@ class RedisRateLimitStoreConnectTest {
     /** An empty ping is not a success: it must not be cached, so the next caller pings again. */
     @Test
     void anEmptyPingIsRetried() {
-        RedisRateLimitStore store = new RedisRateLimitStore(null, () -> {
+        RedisConnectionStep step = new RedisConnectionStep(() -> {
             int attempt = pings.incrementAndGet();
             return attempt == 1 ? Mono.empty() : Mono.just("PONG");
         });
 
-        assertThatThrownBy(() -> store.connect().block(Duration.ofSeconds(2)))
+        assertThatThrownBy(() -> step.ready().block(Duration.ofSeconds(2)))
                 .isInstanceOf(NoSuchElementException.class);
-        store.connect().block(Duration.ofSeconds(2));
+        step.ready().block(Duration.ofSeconds(2));
 
         assertThat(pings).hasValue(2);
     }
 
     @Test
     void triesAgainAfterAFailure() {
-        RedisRateLimitStore store = new RedisRateLimitStore(null, () -> Mono.fromCallable(() -> {
+        RedisConnectionStep step = new RedisConnectionStep(() -> Mono.fromCallable(() -> {
             if (pings.incrementAndGet() == 1) {
                 throw new IllegalStateException("connection refused");
             }
             return "PONG";
         }));
 
-        assertThatThrownBy(() -> store.connect().block(Duration.ofSeconds(2)))
+        assertThatThrownBy(() -> step.ready().block(Duration.ofSeconds(2)))
                 .hasMessageContaining("connection refused");
-        store.connect().block(Duration.ofSeconds(2));
+        step.ready().block(Duration.ofSeconds(2));
 
         assertThat(pings).hasValue(2);
     }

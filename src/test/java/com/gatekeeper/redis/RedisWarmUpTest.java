@@ -1,4 +1,4 @@
-package com.gatekeeper.ratelimit;
+package com.gatekeeper.redis;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.RedisConnectionFailureException;
@@ -13,14 +13,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 /**
- * The startup warm-up waits a bounded time on the store's connection step and never fails the
+ * The startup warm-up waits a bounded time on the shared connection step and never fails the
  * boot. The M5 design, section 7.
  */
 class RedisWarmUpTest {
 
     /**
      * A ping that blocks inside subscribe, as Lettuce does while it opens its shared connection on
-     * a Redis that accepts and never answers. Without the store's worker thread the timeout would
+     * a Redis that accepts and never answers. Without the step's worker thread the timeout would
      * never start; without the timeout the wait would never end.
      */
     @Test
@@ -54,8 +54,8 @@ class RedisWarmUpTest {
         assertThat(pings).hasValue(1);
     }
 
-    /** The real composition: the warm-up on a store whose ping stands in for Redis. */
+    /** The real composition: the warm-up on a connection step whose ping stands in for Redis. */
     private static RedisWarmUp warmUp(Supplier<Mono<?>> ping) {
-        return new RedisWarmUp(new RedisRateLimitStore(null, ping));
+        return new RedisWarmUp(new RedisConnectionStep(ping));
     }
 }

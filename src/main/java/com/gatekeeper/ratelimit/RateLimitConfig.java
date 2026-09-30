@@ -1,5 +1,6 @@
 package com.gatekeeper.ratelimit;
 
+import com.gatekeeper.redis.RedisConnectionStep;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
@@ -12,10 +13,9 @@ public class RateLimitConfig {
         return new ConfiguredPlanResolver(properties);
     }
 
-    /** Declared as the concrete type so {@link RedisWarmUp} can use its connection step. */
     @Bean
-    public RedisRateLimitStore rateLimitStore(ReactiveStringRedisTemplate redis) {
-        return new RedisRateLimitStore(redis);
+    public RedisRateLimitStore rateLimitStore(ReactiveStringRedisTemplate redis, RedisConnectionStep connection) {
+        return new RedisRateLimitStore(redis, connection);
     }
 
     @Bean
