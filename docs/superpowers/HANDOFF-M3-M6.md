@@ -20,7 +20,7 @@ real AuthCore with Redis stopped and restarted.
 |---|---|---|---|
 | [authcore](https://github.com/ezat141/authcore) | `f345f8d` | 78 | public |
 | [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
-| [gatekeeper](https://github.com/ezat141/gatekeeper) | `<hash>` — M6's last code merge; the merge of M6's documentation follows it | 278 | public |
+| [gatekeeper](https://github.com/ezat141/gatekeeper) | `b0921d5` — M6's last code merge; the merge of M6's documentation follows it | 278 | public |
 
 All three clean, and all three counts confirmed by running the suites. ledger-service was not changed
 by M4, M5 or M6. AuthCore's code was not changed either; its one M6 commit, `f345f8d`, is a README
