@@ -569,7 +569,7 @@ There is no default in code, as for the limiter: a missing, zero or negative tim
 - **If Redis is down at boot, JWT callers are answered `503` until it answers.** The warm-up still runs before the port binds and still never fails the boot; its warning names both consequences.
 - **During a Redis outage, JWT callers get fast `503`s while API-key callers still hang**, on M3's introspection cache — observed below, and recorded under [Known limitations](#known-limitations).
 - **A bearer token sent to `/actuator/health` is authenticated** even though the path is public, so during an outage it is answered `503`. An anonymous health probe is unaffected.
-- **Recovery waits for Lettuce to reconnect**, which can take several times the breaker's window — observed below.
+- **Recovery waits for Lettuce to reconnect**, which can take several times the breaker's window — observed below. This applies to a connection that was established and then lost: if Redis is down at boot, nothing was ever connected, so the connection step's next attempt opens a fresh connection, and recovery takes at most one breaker window.
 
 ### Against the real platform
 
@@ -683,8 +683,8 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 | `RedisRevocationStoreTest` | 5 | The store against **real Redis**: an entry written with AuthCore's literal key reads as revoked, an unknown `jti` does not, an expired entry does not — after first proving it was revoked — and the store waits on the connection step |
 | `RevocationTest` | 6 | End to end through WireMock and real Redis: a revoked token gets the ordinary `401` in the platform shape with `WWW-Authenticate: Bearer`, the downstream never called and nothing counted against the tenant; a token not revoked is served; a missing or blank `jti` is `401`; an expired token and an API-key caller never reach the store |
 | `RevocationPropertiesTest` | 5 | `gatekeeper.revocation.redis-timeout` binds; a missing, zero or negative timeout, or an unknown key, stops the boot |
-| `DeadRedisFailClosedTest` | 2 | A Redis port nobody listens on: a bearer token gets `503` with `Retry-After: 5`, the `REVOCATION_UNAVAILABLE` detail and no `WWW-Authenticate`, each in well under a second, from a fresh context so the breaker starts closed; still `503`, never forwarded, once the breaker is open |
-| `SilentRedisFailClosedTest` | 1 | A Redis that accepts and never answers: every bearer token refused `503` within about the timeout, nothing forwarded, and exactly one connection accepted |
+| `DeadRedisFailClosedTest` | 2 | A Redis port nobody listens on: a bearer token gets `503` with `Retry-After: 5`, the `REVOCATION_UNAVAILABLE` detail and no `WWW-Authenticate`, the first within 5 seconds (it pays the cold JWKS fetch) and each later one within 1 second, from a fresh context so the breaker starts closed; still `503`, never forwarded, once the breaker is open |
+| `SilentRedisFailClosedTest` | 1 | A Redis that accepts and never answers: every bearer token refused `503`, the first within 5 seconds and each later one within 1 second, nothing forwarded, and exactly one connection accepted; the 200 ms timeout itself is shown by the live run (0.228–0.247 seconds), not asserted here |
 
 **Redis connection handling**, shared by the limiter and the revocation check, in `com.gatekeeper.redis`
 
@@ -758,7 +758,7 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 
 - **The warm-up's two seconds, and both breakers' five-second window and threshold of three failures, are constants, not properties**, and the warm-up does not run under lazy initialisation.
 
-- **Recovering from a Redis outage takes as long as Lettuce takes to reconnect.** Lettuce backs off between reconnect attempts, by up to about 30 seconds as an outage lengthens, and neither breaker's probe can succeed until it has reconnected. In the M6 run JWT callers were refused `503` for 17.8 seconds after Redis came back, against a breaker window of five; the limiter lags the same way, where it costs only a longer unlimited stretch. A shorter reconnect delay would apply to the whole Redis client and was deliberately not set — see [Against the real platform](#against-the-real-platform).
+- **Recovering from a Redis outage takes as long as Lettuce takes to reconnect.** Lettuce backs off between reconnect attempts, by up to about 30 seconds as an outage lengthens, and neither breaker's probe can succeed until it has reconnected. That holds for a connection that was established and then lost; if Redis is down at boot, nothing was ever connected, so the connection step's next attempt opens a fresh connection, and recovery takes at most one breaker window. In the M6 run JWT callers were refused `503` for 17.8 seconds after Redis came back, against a breaker window of five; the limiter lags the same way, where it costs only a longer unlimited stretch. A shorter reconnect delay would apply to the whole Redis client and was deliberately not set — see [Against the real platform](#against-the-real-platform).
 
 - **Downstream URIs are static configuration.** Two hardcoded `localhost` URLs, no service discovery, no health-aware load balancing. Fine for a single-instance local platform, insufficient for more than one instance of anything.
 

@@ -30,9 +30,9 @@ Spring context against Testcontainers, at roughly 45 seconds each — so give it
 run it in the background rather than assume it has hung.
 
 **GateKeeper's suite requires Redis.** Without it (measured with `-Dspring.data.redis.port=1`), the run
-reports `Tests run: 275, Failures: 54, Errors: 20`: 74 tests fail, and `TwoGatewaysShareOneLimitTest`
-fails in its setup, reported as one failure in place of its four tests — 77 of 278 not passing, up
-from 45 of 242 before M6. Most of the increase is correct behaviour: without Redis the revocation
+reports `Tests run: 275, Failures: 54, Errors: 20`: 74 failures reported, one of them
+`TwoGatewaysShareOneLimitTest`'s setup standing for its four tests — 77 of 278 not passing, up from
+45 of 242 before M6. Most of the increase is correct behaviour: without Redis the revocation
 check refuses every bearer token with 503, so every test that expects a JWT to get through fails. By
 class: `AuthorizationTest` 13, `RedisRateLimitStoreTest` 11, `ApiKeyAuthenticationTest` 9,
 `RateLimitTest` 8, `IdentityPropagationTest` 7, `RedisApiKeyCacheTest` 5, `IntrospectionUnavailableTest`
@@ -76,8 +76,8 @@ Since M6 every bearer JWT is also checked for revocation, before any of that, in
 `RevocationCheckingJwtDecoder` wraps the Nimbus decoder, so only a token whose signature, `exp`, `nbf`
 and `iss` already passed reaches Redis, and a revoked token is never authorized, counted or forwarded.
 It asks `EXISTS authcore:revoked:jti:<jti>`, AuthCore's deny-list, on every request, and nothing is
-cached in the gateway, so a revoked token is refused on its next call at every instance. A revoked token, and one with no or a
-blank `jti`, is the ordinary 401 with `WWW-Authenticate: Bearer` and no `detail`. When Redis cannot
+cached in the gateway, so a revoked token is refused on its next call at every instance. A revoked
+token, and one with no or a blank `jti`, is the ordinary 401 with `WWW-Authenticate: Bearer` and no `detail`. When Redis cannot
 answer, the check **fails closed**: 503 with `Retry-After: 5` and `"detail":"REVOCATION_UNAVAILABLE"`,
 no `WWW-Authenticate`, because a 401 would send clients holding valid tokens to refresh against an
 AuthCore that is itself stuck. It refuses fast through the same pieces M5 built, now in
