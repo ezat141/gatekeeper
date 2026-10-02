@@ -16,3 +16,13 @@ gatekeeper:
         requests-per-second: 1000000
         burst: 1000000
         daily-quota: 1000000000
+
+# Each cached Spring test context closes when the JVM exits, one after another, and each close
+# blocks in ReactorResourceFactory.stop() for Reactor Netty's shutdown quiet period, 2 seconds by
+# default. With a dozen or more cached web contexts that overran Surefire's 30-second exit
+# allowance ("Surefire is going to kill self fork JVM"). Tests have no in-flight requests to wait
+# for, so don't wait.
+spring:
+  reactor:
+    netty:
+      shutdown-quiet-period: 0s

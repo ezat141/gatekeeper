@@ -30,10 +30,10 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The proof that the limit — and, since M6, a revocation — is distributed: two gateway instances, as separate application
- * contexts on their own ports, sharing one Redis and one downstream. Requests alternate between
- * them and the combined count trips the limit on whichever instance receives the next one. The
- * M5 design, section 11.
+ * The proof that the limit — and, since M6, a revocation — is distributed: two gateway
+ * instances, as separate application contexts on their own ports, sharing one Redis and one
+ * downstream. Requests alternate between them and the combined count trips the limit on whichever
+ * instance receives the next one. The M5 design, section 11.
  *
  * <p>The quota test needs no timing and is the unconditional proof. The burst test relies on
  * four requests landing within the second one token takes to refill; both instances are warmed
@@ -199,6 +199,9 @@ class TwoGatewaysShareOneLimitTest {
     private static ReactorResourceFactory privateReactorResources() {
         ReactorResourceFactory factory = new ReactorResourceFactory();
         factory.setUseGlobalResources(false);
+        // Registered as a bean, so Boot's own factory, which reads spring.reactor.netty.*, is never
+        // created: the test configuration's shutdown-quiet-period does not reach this one.
+        factory.setShutdownQuietPeriod(Duration.ZERO);
         return factory;
     }
 

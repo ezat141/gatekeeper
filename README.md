@@ -2,13 +2,13 @@
 
 A reactive API gateway on Spring Cloud Gateway 5 and Netty, sitting in front of the AuthCore platform. It terminates unauthenticated and out-of-scope traffic at the edge and routes what survives to the service that owns the data.
 
-GateKeeper is the middle service of three. **AuthCore** (`:8080`) authenticates users and issues RS256-signed JWTs. **ledger-service** (`:8082`) owns ledger data and decides, per request, who may read or change it. This service (`:8081`) is the front door: it verifies that a request carries a genuine credential from AuthCore — an unexpired token or an API key — checks that the credential was granted the scope the route requires, holds the caller to its plan's rate and daily quota, and forwards it to the right downstream at the right path.
+GateKeeper is the middle service of three. **AuthCore** (`:8080`) authenticates users and issues RS256-signed JWTs. **ledger-service** (`:8082`) owns ledger data and decides, per request, who may read or change it. This service (`:8081`) is the front door: it verifies that a request carries a genuine credential from AuthCore — an unexpired, unrevoked token or an API key — checks that the credential was granted the scope the route requires, holds the caller to its plan's rate and daily quota, and forwards it to the right downstream at the right path.
 
 The thing worth understanding before anything else: **the gateway is a coarse first layer, not the security boundary.** It refuses traffic that obviously does not belong, which keeps unauthenticated and out-of-scope load off the services behind it. Nothing downstream takes its word for anything — ledger-service re-verifies every token against AuthCore's JWKS itself and enforces its own tenant and permission rules whether or not the gateway is in the path.
 
-That division is the whole design. A gateway that owns authorization becomes a single point of failure whose compromise unlocks everything behind it. This one enforces coarse, route-level authorization as defence in depth — **scope at the edge, permission and data ownership downstream** — and owns none of the decisions that matter to the data. Removing it costs a layer, not the boundary: the one security check that exists only here is whether the *client application* was granted the scope for a ledger call, described under [Authorization at the edge](#authorization-at-the-edge). The other thing that exists only here, [rate limiting](#rate-limiting), is a capacity control rather than a security one.
+That division is the whole design. A gateway that owns authorization becomes a single point of failure whose compromise unlocks everything behind it. This one enforces coarse, route-level authorization as defence in depth — **scope at the edge, permission and data ownership downstream** — and owns none of the decisions that matter to the data. Removing it costs a layer, not the boundary: two security checks exist only here for a ledger call — whether the *client application* was granted the scope, described under [Authorization at the edge](#authorization-at-the-edge), and whether the token has been [revoked](#revocation), which AuthCore enforces for its own routes and ledger-service does not check. The other thing that exists only here, [rate limiting](#rate-limiting), is a capacity control rather than a security one.
 
-**Scope:** this repository covers milestones M0–M5 — a reverse proxy that authenticates AuthCore-issued JWTs and API keys, authorizes each request against a route-to-scope rule table and the token's tenant, limits each caller to its plan's rate and daily quota across every gateway instance sharing one Redis, and propagates the verified caller identity to downstreams. Revocation is planned and **not built**. [Known limitations](#known-limitations) and [Roadmap](#roadmap) say exactly where the line is.
+**Scope:** this repository covers milestones M0–M6 — a reverse proxy that authenticates AuthCore-issued JWTs and API keys, refuses a revoked JWT on its next request at every instance, authorizes each request against a route-to-scope rule table and the token's tenant, limits each caller to its plan's rate and daily quota across every gateway instance sharing one Redis, and propagates the verified caller identity to downstreams. Resilience toward downstreams (M7) is planned and **not built**. [Known limitations](#known-limitations) and [Roadmap](#roadmap) say exactly where the line is.
 
 ---
 
@@ -24,6 +24,7 @@ That division is the whole design. A gateway that owns authorization becomes a s
 - [Issuer pinning, and the trap it exists to catch](#issuer-pinning-and-the-trap-it-exists-to-catch)
 - [The identity headers it stamps](#the-identity-headers-it-stamps)
 - [Rate limiting](#rate-limiting)
+- [Revocation](#revocation)
 - [Why reactive here, when ledger-service is not](#why-reactive-here-when-ledger-service-is-not)
 - [Testing](#testing)
 - [Known limitations](#known-limitations)
@@ -47,7 +48,7 @@ The gateway listens on `:8081`. Health is public:
 curl http://localhost:8081/actuator/health
 ```
 
-**It starts without AuthCore running.** `NimbusReactiveJwtDecoder.withJwkSetUri(...)` builds its key source lazily — nothing is fetched until the first request that actually needs a signature checked. An unreachable AuthCore is a per-request failure, not a startup failure, which is also why every test in this repository points `jwk-set-uri` at a WireMock stub rather than a real server. **It starts without Redis too**: the rate limiter's startup warm-up waits at most two seconds for Redis, logs a warning if it does not answer, and the limiter then [fails open](#when-redis-fails-requests-go-through) until it does.
+**It starts without AuthCore running.** `NimbusReactiveJwtDecoder.withJwkSetUri(...)` builds its key source lazily — nothing is fetched until the first request that actually needs a signature checked. An unreachable AuthCore is a per-request failure, not a startup failure, which is also why every test in this repository points `jwk-set-uri` at a WireMock stub rather than a real server. **It starts without Redis too**: the startup warm-up waits at most two seconds for Redis and logs a warning if it does not answer. Until it does, the limiter [fails open](#when-redis-fails-requests-go-through) and the revocation check [refuses every bearer token with `503`](#when-redis-cannot-answer-503).
 
 Any request that is not health, with no token, is refused before routing is consulted:
 
@@ -58,7 +59,7 @@ curl -i http://localhost:8081/api/ledger/entries
 
 To exercise the proxy for real you need the other two services on `:8080` and `:8082`, and a token from AuthCore's authorization-code flow carrying the scope the route requires — `payments:read` for a ledger read, `payments:write` for a write; see [Authorization at the edge](#authorization-at-the-edge). **Obtain it through `localhost`, not `127.0.0.1`** — see [Issuer pinning](#issuer-pinning-and-the-trap-it-exists-to-catch), which is the single most likely reason a valid-looking token gets a `401` here.
 
-Run the suite. WireMock stands in for AuthCore and the downstreams, but the API-key and rate-limit tests need a real Redis — this repo has no compose file of its own and shares AuthCore's container:
+Run the suite. WireMock stands in for AuthCore and the downstreams, but the suite needs a real Redis: the API-key, rate-limit and revocation tests read it, and without it the revocation check refuses every bearer token with `503`. This repo has no compose file of its own and shares AuthCore's container:
 
 ```bash
 docker compose up -d redis   # from the authcore repo
@@ -74,6 +75,8 @@ docker compose up -d redis   # from the authcore repo
 | Reverse proxy | Three routes to two downstreams, path predicates, prefix rewriting |
 | Path rewriting | `StripPrefix=1` on the ledger route only — deliberately not on the others |
 | JWT authentication | Every non-health request must carry a valid, unexpired AuthCore token — or an API key, below |
+| Revocation check | Every JWT's `jti` checked against AuthCore's Redis deny-list after its signature and claims pass, so a revoked token is refused `401` on its next request at every instance |
+| Fail-closed revocation | When Redis cannot answer, a bearer token is refused `503` after a 200 ms timeout, and at once while the check's own breaker is open — never admitted |
 | API-key authentication | `X-API-Key` checked against AuthCore's introspection endpoint, the answer cached in Redis |
 | Route authorization | An ordered rule table: each route and method requires authentication, a scope, or a JWT and a scope. Anything the table does not cover is refused |
 | Tenant check | Every tenant a request names must equal the token's `tenant` claim |
@@ -85,7 +88,7 @@ docker compose up -d redis   # from the authcore repo
 | Issuer pinning | Tokens from an unexpected `iss` are refused even when the signature is valid |
 | Identity propagation | Verified `sub`, `tenant`, and `permissions` stamped downstream as `X-GK-*`, for consumers that are not themselves resource servers |
 | Header anti-spoofing | Every inbound `X-GK-*` header removed before authentication runs — prefix-matched, case-insensitive, unconditional |
-| Stateless | No session, no CSRF token, and no durable state in the process — rate-limit counts and the API-key cache live in Redis. Killable and restartable at any moment |
+| Stateless | No session, no CSRF token, and no durable state in the process — rate-limit counts and the API-key cache live in Redis, and nothing about revocation is remembered at all. Killable and restartable at any moment |
 | Public health | `/actuator/health` reachable without a credential, so liveness can be probed |
 
 **Stack:** Java 21 · Spring Boot 4.0.7 · Spring Cloud 2025.1.2 (Gateway 5.0.2) · Spring Security 7 reactive · Netty · WireMock
@@ -105,7 +108,7 @@ One packaging note that costs an hour if you hit it: the starter is **`spring-cl
 | Service | Port | Owns | Repo |
 |---|---|---|---|
 | **AuthCore** | `:8080` | Authenticating users, issuing and signing JWTs, publishing JWKS | [ezat141/authcore](https://github.com/ezat141/authcore) |
-| **GateKeeper** | `:8081` | Routing, edge rejection of unauthenticated and out-of-scope traffic, per-plan rate limiting, identity propagation | this repo |
+| **GateKeeper** | `:8081` | Routing, edge rejection of unauthenticated, revoked and out-of-scope traffic, per-plan rate limiting, identity propagation | this repo |
 | **ledger-service** | `:8082` | Ledger data, and fine-grained authorization over it | [ezat141/ledger-service](https://github.com/ezat141/ledger-service) |
 
 Each service holds only the public half of AuthCore's signing keys, fetched from JWKS. Only AuthCore holds a private key, and only AuthCore decides anyone's roles or permissions. GateKeeper never issues a token, never mints a claim, and never overrules a downstream's refusal.
@@ -121,7 +124,7 @@ graph TB
     subgraph GK["GateKeeper :8081 — Netty / WebFlux, stateless"]
         STRIP["InboundHeaderStripFilter<br/>WebFilter · HIGHEST_PRECEDENCE<br/>drops every inbound X-GK-*"]
         SEC["SecurityWebFilterChain<br/>health public · everything else authenticated,<br/>then the rule table and tenant check"]
-        DEC["ReactiveJwtDecoder<br/>signature · exp · issuer"]
+        DEC["ReactiveJwtDecoder<br/>signature · exp · issuer<br/>then the jti against the deny-list"]
         STAMP["IdentityStampFilter<br/>GlobalFilter · reads the verified Jwt<br/>sets X-GK-Subject · -Tenant · -Permissions"]
         RATE["RateLimitFilter<br/>GlobalFilter · the caller's plan<br/>token bucket + daily quota"]
         ROUTE["Route predicates<br/>/api/accounts · /api/machine · /api/ledger"]
@@ -129,18 +132,20 @@ graph TB
 
     A["AuthCore :8080<br/>issuer · JWKS"]
     L["ledger-service :8082<br/>resource server"]
-    RD["Redis<br/>one script per request<br/>shared by every instance"]
+    RD["Redis<br/>one EXISTS and one script per request<br/>shared by every instance and AuthCore"]
 
     C -->|"Bearer JWT<br/>+ any X-GK-* the client invented"| STRIP
     STRIP --> SEC
     SEC --> DEC
     DEC -.->|"GET /oauth2/jwks<br/>cached, refetched on unknown kid"| A
-    DEC -->|"valid"| STAMP
+    DEC -.->|"EXISTS authcore:revoked:jti:…<br/>200 ms timeout · fails closed"| RD
+    DEC -->|"valid, not revoked"| STAMP
+    DEC -->|"Redis cannot answer"| R503["503 with Retry-After: 5<br/>detail REVOCATION_UNAVAILABLE"]
     STAMP --> RATE
     RATE -.->|"200 ms timeout<br/>fails open"| RD
     RATE -->|"within the plan"| ROUTE
     RATE -->|"over the rate or the day's quota"| R429["429 with Retry-After<br/>downstream never contacted"]
-    SEC -->|"missing / invalid"| R401["401<br/>WWW-Authenticate: Bearer"]
+    SEC -->|"missing / invalid / revoked"| R401["401<br/>WWW-Authenticate: Bearer"]
     SEC -->|"authenticated, not permitted"| R403["403 with a detail<br/>no WWW-Authenticate"]
 
     ROUTE -->|"/api/accounts/** · /api/machine/**<br/>path unchanged"| A
@@ -154,7 +159,7 @@ Two things in that diagram are load-bearing.
 
 **The strip and the stamp sit on opposite sides of the security chain**, which is why they are two classes rather than one. Stripping has to happen before authentication, on the untouched request, so that no forged header survives into an error path. Stamping cannot happen until after, because the verified `Jwt` does not exist any earlier. No single filter position satisfies both.
 
-**The dashed line from the client straight to ledger-service is a supported path.** Bypassing the gateway gets a caller past none of ledger-service's tenant and permission rules, but it does skip the edge's client-scope check — see [below](#scope-and-permission-who-checks-which) — and the rate limit, which exists only here.
+**The dashed line from the client straight to ledger-service is a supported path.** Bypassing the gateway gets a caller past none of ledger-service's tenant and permission rules, but it does skip the edge's client-scope check — see [below](#scope-and-permission-who-checks-which) — the revocation check, which ledger-service does not make, and the rate limit, which exists only here.
 
 ---
 
@@ -201,6 +206,8 @@ CSRF, HTTP Basic, and form login are all off. A credential arrives on every requ
 **Authentication answers one question: is this a genuine, unexpired credential from AuthCore.** Whether the caller may reach a particular route is a separate question, answered by the two managers passed to `access(...)`, which live in a package of their own (`com.gatekeeper.authz`) rather than inside this method — see [Authorization at the edge](#authorization-at-the-edge).
 
 Trust is anchored on AuthCore's JWKS rather than a public key copied into configuration ([`JwtDecoderConfig`](src/main/java/com/gatekeeper/config/JwtDecoderConfig.java)). That is what lets AuthCore rotate its signing key without a redeploy here — and AuthCore does support live rotation, so this matters in practice rather than in principle.
+
+Since M6 the decoder that bean returns is a wrapper: a token that passes the signature and claim checks below is then checked against AuthCore's revocation deny-list — see [Revocation](#revocation).
 
 ### What the default validator checks, and what it does not
 
@@ -438,7 +445,7 @@ The platform's error shape, with one of two fixed `detail` strings ([`RateLimitR
 | `RATE_LIMITED` | `the request rate exceeds the caller's plan` |
 | `QUOTA_EXCEEDED` | `the caller's daily quota is used up` |
 
-- **`Retry-After` is computed**, in whole seconds and at least `1`: the time to one token for `RATE_LIMITED`, the time to the next UTC midnight for `QUOTA_EXCEEDED`. A caller can act on it, unlike the fixed `5` on the `503` the gateway returns when AuthCore cannot answer an introspection.
+- **`Retry-After` is computed**, in whole seconds and at least `1`: the time to one token for `RATE_LIMITED`, the time to the next UTC midnight for `QUOTA_EXCEEDED`. A caller can act on it, unlike the fixed `5` on the `503`s the gateway returns when AuthCore cannot answer an introspection or Redis cannot answer a revocation check.
 - **No `WWW-Authenticate`.** The caller is authenticated; the answer is to wait.
 - **The downstream is never contacted.**
 - **Written in one place.** [`TooManyRequestsWriter`](src/main/java/com/gatekeeper/error/TooManyRequestsWriter.java) renders it through the same `ErrorBody` as the `401` and `403`, and the filter completes the response itself — no exception, no detour through the global error handler.
@@ -449,15 +456,15 @@ The platform's error shape, with one of two fixed `detail` strings ([`RateLimitR
 
 The Redis call has its own timeout, `redis-timeout`, 200 ms. On an error or a timeout the request proceeds unlimited, a warning is logged once per outage, and the response carries **no** rate-limit headers rather than invented ones. The rule table and the tenant check use no Redis and keep working, so a Redis outage costs unlimited traffic for its duration, not a platform outage. Refusing with `503` instead would make Redis a hard dependency of every request, JWT callers included.
 
-**M6 will decide the opposite, deliberately.** Its revocation check will read the same Redis, and there a failure must refuse: a revoked token getting through is a security failure; an unlimited request is not.
+**M6 decides the opposite, deliberately.** Its [revocation check](#revocation) reads the same Redis, and there a failure refuses: a revoked token getting through is a security failure; an unlimited request is not.
 
-Failing open *fast* took more than a timeout. Each of the following was found by a test or a review, and the design's section 7 records how:
+Failing open *fast* took more than a timeout. Each of the following was found by a test or a review, and the M5 design's section 7 records how. Since M6 the connection step and the warm-up live in `com.gatekeeper.redis`, shared with the revocation check, and the breaker class does too, with one instance per consumer:
 
-- **The first connection is made once, off the event loop, by an attempt no request can cancel.** Lettuce opens its shared connection with a blocking wait inside `subscribe()`, before any timeout's clock has started — up to 60 seconds against a Redis that accepts connections and never answers, on whatever thread subscribed. So the store connects through a single cached step: a ping on a worker thread, whose success is kept for good and whose failure is not kept at all. A request waits on it within its own timeout; giving up stops the waiting, never the attempt. Cancelling the attempt used to leave one abandoned connection behind per timed-out request — 146 in five seconds of silence, every one going live when Redis answered. Once connected, a check makes no thread hop.
-- **A warm-up before traffic.** Before the port binds, the gateway waits up to two seconds on that step and carries on with a warning if Redis does not answer. Without it, the first request after boot would pay for opening the connection, exceed 200 ms, and go through unlimited. The warm-up only opens the connection, not the script: the first request still pays one extra round trip, `EVALSHA` answered `NOSCRIPT` then `EVAL`, which is small.
-- **A circuit breaker.** After three consecutive failures or timeouts, the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and only the probe's success closes the breaker, while its failure re-opens it at once. Three, not one, because the timeout is measured in the gateway: a single one may be the gateway's own slowness under the very overload a capacity control exists for, and opening on it would switch limiting off for everyone. An isolated failure fails only its own request open, and any success resets the count. This bounds what the limiter adds to Lettuce's unbounded reconnect buffer to about one command per window, keeps worker threads free, and turns an outage into one warning when the breaker opens and one line when it closes, rather than a stack trace per request. **The cost:** once the breaker opens, limiting stays suspended for up to five seconds even if Redis recovers sooner.
+- **The first connection is made once, off the event loop, by an attempt no request can cancel.** Lettuce opens its shared connection with a blocking wait inside `subscribe()`, before any timeout's clock has started — up to 60 seconds against a Redis that accepts connections and never answers, on whatever thread subscribed. So every Redis consumer connects through a single cached step, `RedisConnectionStep`: a ping on a worker thread, whose success is kept for good and whose failure is not kept at all. A request waits on it within its own timeout; giving up stops the waiting, never the attempt. Cancelling the attempt used to leave one abandoned connection behind per timed-out request — 146 in five seconds of silence, every one going live when Redis answered. Once connected, a check makes no thread hop.
+- **A warm-up before traffic.** Before the port binds, `RedisWarmUp` waits up to two seconds on that step and carries on with a warning if Redis does not answer. Without it, the first request after boot would pay for opening the connection, exceed 200 ms, and go through unlimited. The warm-up only opens the connection, not the script: the first request still pays one extra round trip, `EVALSHA` answered `NOSCRIPT` then `EVAL`, which is small.
+- **A circuit breaker of its own**, the `rateLimitBreaker` bean; the revocation check has another, which refuses while open. After three consecutive failures or timeouts, the limiter stops calling Redis for five seconds and forwards unlimited; then one request probes, and only the probe's success closes the breaker, while its failure re-opens it at once. Three, not one, because the timeout is measured in the gateway: a single one may be the gateway's own slowness under the very overload a capacity control exists for, and opening on it would switch limiting off for everyone. An isolated failure fails only its own request open, and any success resets the count. This bounds what the limiter adds to Lettuce's unbounded reconnect buffer to about one command per window, keeps worker threads free, and turns an outage into one warning when the breaker opens and one line when it closes, rather than a stack trace per request. **The cost:** once the breaker opens, limiting stays suspended for up to five seconds even if Redis recovers sooner.
 
-API-key callers are a separate matter. M3's introspection cache reads the same Redis and does not fail open — see [Known limitations](#known-limitations).
+API-key callers are a separate matter. M3's introspection cache reads the same Redis and neither fails open nor fails fast — see [Known limitations](#known-limitations).
 
 ### Two gateways, one limit
 
@@ -478,6 +485,100 @@ To run two instances yourself, build the jar and start it twice:
 java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar --server.port=8081
 java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar --server.port=8083
 ```
+
+---
+
+## Revocation
+
+AuthCore can revoke a token before it expires, at `POST /oauth2/revoke`, and records the revocation in Redis. Before M6 the gateway did not look, so a revoked token passed the edge until it expired — up to ten minutes for AuthCore's access tokens. Now every bearer JWT is checked against AuthCore's deny-list, and a revoked one is refused on its next request, at every gateway instance. The M6 design (`docs/superpowers/specs/2026-09-30-gatekeeper-m6-design.md`) is the reference for all of it.
+
+It is a **security control**, the opposite of the rate limiter, and that decides its failure mode: when the gateway cannot tell whether a token is revoked, it **refuses**.
+
+### The contract: one key per revoked token
+
+AuthCore's `RevocationService` writes `authcore:revoked:jti:<jti>`, value `"revoked"`, with a TTL equal to the token's remaining lifetime. One `EXISTS` answers the question, and an entry disappears exactly when the token would have expired anyway. The gateway only reads the key; [`RedisRevocationStore`](src/main/java/com/gatekeeper/revocation/RedisRevocationStore.java) owns the prefix, and AuthCore's README names the key as a cross-service contract.
+
+**Nothing is cached in the gateway.** Every JWT request makes one `EXISTS`. A cache of "not revoked" answers would break "refused on the next request" for up to its TTL, at each instance separately, to save one sub-millisecond command on a connection already open for the limiter — and during an outage it would only be a window in which a revoked token gets through. The milestone plan asked for a brief cache; this departs from it deliberately. `TwoGatewaysShareOneLimitTest` asks both instances about a token once, revokes it, and requires both to refuse it next, so it fails the day such a cache is added.
+
+**Only `jti`.** AuthCore records refresh-token families in Postgres and deny-lists nothing for them in Redis, so there is no family key to check: an access token issued from a revoked family runs to its expiry unless it is revoked itself. That is AuthCore's contract to extend, not the gateway's to infer. API keys are not deny-listed either; disabling one in AuthCore takes effect when the gateway's introspection cache expires.
+
+### Where it runs
+
+Inside JWT decoding. [`RevocationCheckingJwtDecoder`](src/main/java/com/gatekeeper/revocation/RevocationCheckingJwtDecoder.java) wraps the Nimbus decoder, and `JwtDecoderConfig` returns the wrapper as the bean.
+
+- **After every other check.** The signature, `exp`, `nbf` and the pinned `iss` are verified first. Only a token that passes all of them reaches Redis, so a forged or expired token — whose `jti` an outsider picks freely — cannot generate Redis load.
+- **Before authorization and rate limiting.** A revoked token is not authenticated, so it never receives a `403` that would describe the rule table, never spends a bucket, and is never stamped or forwarded.
+- **Where AuthCore checks too**, inside its own JWT validation: a revoked token is one more reason a token is invalid, not a separate concern. There is no new filter, and no filter order to keep.
+
+The milestone plan's `RevocationCheckFilter`, a `GlobalFilter` like the limiter, was rejected: it would run after authorization, so a revoked token could still be answered `403`.
+
+### A revoked token is the ordinary 401
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer
+Content-Type: application/json
+
+{"error":"unauthorized","status":401,"path":"/api/machine/payments"}
+```
+
+The decoder raises a `BadJwtException`, which Spring Security answers exactly as it answers an expired or forged token. The gateway does not tell a caller why a token was rejected, and revocation is not made the exception.
+
+**A token with no `jti`, or a blank one, gets the same `401`.** It could never be revoked, so it does not pass a gateway that enforces revocation. That costs nothing today — every JWT AuthCore issues carries one — and it is logged at WARN with the token's `sub` and `iss`, because only the issuer can sign such a token. AuthCore's own validator lets such a token through; the two differ deliberately. A revoked token is logged at DEBUG only: its holder can replay it as fast as they like, and the limiter never sees it.
+
+### When Redis cannot answer: 503
+
+An error, a timeout, an empty answer or an open breaker is a `RevocationUnavailableException`. It is deliberately neither a `JwtException` nor an `AuthenticationException`, so Spring Security lets it pass untouched to `GlobalErrorWebExceptionHandler` — the route M3's introspection failure already takes — which answers:
+
+```http
+HTTP/1.1 503 Service Unavailable
+Retry-After: 5
+Content-Type: application/json
+
+{"error":"service_unavailable","status":503,"path":"/api/ledger/entries","detail":"REVOCATION_UNAVAILABLE"}
+```
+
+No `WWW-Authenticate`: the token is not the problem. Either status would be a refusal, so the security property holds either way; `503` is the refusal that does least collateral damage.
+
+- **The token is very likely valid.** A `401` tells a well-behaved OAuth client to discard its token and refresh. During this outage a refresh means AuthCore's token endpoint, and AuthCore itself hangs with Redis down: a `401` would turn a Redis outage into a refresh storm against a service that is already stuck. A `503` tells the client to back off and retry the same token.
+- **It is M3's precedent** for the same situation — the gateway cannot complete a check that depends on another component — and M3 answers it `503` with `Retry-After: 5`.
+- **The `detail` tells the two `503`s apart.** M3's introspection `503` keeps its body unchanged, with no `detail`, and `IntrospectionUnavailableTest` pins that.
+
+`Retry-After: 5` is the breaker's window. The [live run](#against-the-real-platform) found that recovering from an outage can take several times that.
+
+### Failing closed, fast
+
+AuthCore, with Redis stopped, hangs about 60 seconds before answering. A fail-closed check built without care would do the same, so this one reuses what M5 built to [fail open fast](#when-redis-fails-requests-go-through):
+
+- **The shared connection step.** `RedisRevocationStore` waits on the same `RedisConnectionStep` as the limiter and the warm-up, so one Redis still costs one connection attempt at a time, and a silent Redis can neither block an event loop nor leak a connection per timed-out request.
+- **A bounded wait:** `gatekeeper.revocation.redis-timeout`, 200 ms, on the store call.
+- **A breaker of its own, which refuses.** Failing closed does not stop Lettuce buffering every command without bound while disconnected, so something must stop issuing them. After three consecutive failures the `revocationBreaker` opens, and for five seconds every bearer token is refused `503` without touching Redis; then one request probes, and only its success closes it. **An open breaker refuses; it never skips the check** — copying the limiter's handling of an open breaker would silently fail open. An isolated failure still refuses its own request. Three rather than one matters more here than for the limiter: a breaker that opened on one GC-pause timeout would answer every JWT caller `503` for five seconds.
+
+**Two breakers, one class.** `RedisCircuitBreaker` lives in `com.gatekeeper.redis` and carries a name and a phrase for what its consumer does while it is open, so each log line says truthfully what is happening. The limiter's `rateLimitBreaker` and the check's `revocationBreaker` are injected by qualifier. Each bounds its own consumer's share of Lettuce's buffer to about one command per window, logs its own outage, and counts only its own failures — a request makes one call for each, so a shared count would make "three in a row" mean one and a half requests. A revoked token is Redis answering, so it never counts as a failure.
+
+```yaml
+gatekeeper:
+  revocation:
+    redis-timeout: 200ms
+```
+
+There is no default in code, as for the limiter: a missing, zero or negative timeout, or an unknown key under `gatekeeper.revocation`, stops the boot.
+
+### What failing closed costs
+
+- **If Redis is down at boot, JWT callers are answered `503` until it answers.** The warm-up still runs before the port binds and still never fails the boot; its warning names both consequences.
+- **During a Redis outage, JWT callers get fast `503`s while API-key callers still hang**, on M3's introspection cache — observed below, and recorded under [Known limitations](#known-limitations).
+- **A bearer token sent to `/actuator/health` is authenticated** even though the path is public, so during an outage it is answered `503`. An anonymous health probe is unaffected.
+- **Recovery waits for Lettuce to reconnect**, which can take several times the breaker's window — observed below. This applies to a connection that was established and then lost: if Redis is down at boot, nothing was ever connected, so the connection step's next attempt opens a fresh connection, and recovery takes at most one breaker window.
+
+### Against the real platform
+
+Run on 2026-10-02 against the real AuthCore, with the gateway started with `java -jar`.
+
+- **Revoked, then refused.** A client-credentials token for `authcore-machine` with `payments:read` (`jti` `9a23e3ae-…`, a 600-second lifetime) got `200` on `GET /api/machine/payments`. `POST /oauth2/revoke` answered `200`, and the next call got `401` with `WWW-Authenticate: Bearer` and the body [above](#a-revoked-token-is-the-ordinary-401). Redis held `authcore:revoked:jti:9a23e3ae-6488-47bd-9b58-3c06018cf32c` with a TTL of about 588 seconds.
+- **Redis stopped.** Ten JWT calls were all `503`: the first three in 0.247, 0.229 and 0.228 seconds — the 200 ms timeout — and the next seven in 9–32 ms, with the breaker open. The ledger route answered `503` with `Retry-After: 5`, no `WWW-Authenticate`, and the `REVOCATION_UNAVAILABLE` body [above](#when-redis-cannot-answer-503). The breaker logged one warning — `Revocation check: Redis failed 3 times in a row; refusing bearer-token requests with 503 for 5 s at a time until it answers` — with the `TimeoutException` stack trace as its cause, by design. An API-key caller hung until curl's 15-second limit, as M3's open item predicts.
+- **Redis restarted: recovery took 17.8 seconds, not about five.** JWT calls stayed `503` until 17.8 seconds after Redis was up. The breaker probed every five seconds as designed, but its probes at 6.4 and 12.1 seconds each timed out at about 220 ms, because the gateway had not yet reconnected. Lettuce's `ConnectionWatchdog` backs off between reconnect attempts — during this outage they came about 9, 8, 17 and then 30 seconds apart — and the last one reconnected 17 seconds after Redis was up. The breaker closed right after it, logging `Revocation check: Redis answered again; breaker closed`. **So recovery is Lettuce's reconnect delay, which grows with the outage's length up to about 30 seconds, plus up to one breaker window, and JWT callers are refused `503` throughout.** The limiter has the same delay — M5's run saw limiting resume about 15 seconds after a restart — but there it only means requests go unlimited a little longer; here it means refusals. A shorter reconnect delay, Lettuce's `ClientResources.reconnectDelay`, would shorten it; it applies to the whole client, and was deliberately not changed in M6.
+- **After recovery**, the token revoked earlier was still `401`: the deny-list survived the Redis restart.
 
 ---
 
@@ -511,7 +612,7 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 ./mvnw test
 ```
 
-**242 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services, so most of the suite runs offline. The tests that exercise an API key or the rate limiter's script are the exception: they need a real Redis, started as shown in the [Quickstart](#quickstart). Without Redis, 45 of the 242 fail or never run (23 before M5) — a missing container, not a defect; the fail-open tests pass either way because they bring their own dead or silent Redis.
+**278 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services. Redis does not have a stand-in: the tests that exercise an API key, the rate limiter's script or the deny-list need a real one, started as shown in the [Quickstart](#quickstart), and since M6 so does every test that sends a bearer token, because without Redis the revocation check refuses it `503`. Without Redis, 77 of the 278 fail or never run (45 of 242 before M6, 23 before M5) — a missing container, not a defect, and the new failures are the check refusing correctly. The fail-open and fail-closed tests pass either way, because they bring their own dead or silent Redis.
 
 **Routing and startup**
 
@@ -535,7 +636,7 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 | `ApiKeyAuthenticationTest` | 10 | The request shape M2 never had to consider: an `X-API-Key` and an `Authorization` header on the same request, and which one wins |
 | `ApiKeyReactiveAuthenticationManagerTest` | 11 | The manager against fakes rather than mocks, including TTL clamping and negative TTLs |
 | `IntrospectionClientTest` | 7 | The introspection client against a fake AuthCore, each test varying the timeout and resetting stubs so none can see another's state |
-| `IntrospectionUnavailableTest` | 4 | An unreachable AuthCore raises a non-`AuthenticationException`, so the filter cannot quietly turn an outage into a `401` |
+| `IntrospectionUnavailableTest` | 4 | An unreachable AuthCore raises a non-`AuthenticationException`, so the filter cannot quietly turn an outage into a `401`; its `503` carries no `detail`, so the revocation check's cannot leak onto it |
 | `RedisApiKeyCacheTest` | 5 | The cache against **real Redis** — random keys per test, deleted afterwards, so a shared instance is never polluted |
 | `ApiKeyAuthenticationConverterTest` | 5 | Header parsing into a credential |
 | `ApiKeyIntrospectionTest` | 1 | What the record's constructor does with a specific wire shape — needs neither Spring nor Redis |
@@ -568,16 +669,32 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 | `ConfiguredPlanResolverTest` | 5 | Each kind of assignment, the default plan, and a tenant and a client of the same name kept apart |
 | `RateLimitIdentityTest` | 17 | Tenant, then `aud`, then `sub`; blank values treated as absent; no identity for an anonymous or unauthenticated caller or a blank API-key name; percent-encoding of the key |
 | `RedisRateLimitStoreTest` | 11 | The script against **real Redis** with a fixed `now`: the burst, refill at the plan's rate and never past the burst, the quota until UTC midnight and its reset across it, the bucket checked first, refusals that write nothing, quota remaining never negative, key names and expiries, and Redis's own clock when no time is given |
-| `RedisRateLimitStoreConnectTest` | 4 | One connection attempt at a time: callers who give up neither cancel nor repeat it; a success is kept, a failure is retried, an empty ping is retried |
-| `RedisCircuitBreakerTest` | 13 | Opens on three consecutive failures and not on one, any success resetting the count and the count starting again after it closes; denies for the window, lets exactly one caller probe, closes only on the probe's success, re-opens at once on a failed probe, and opens once — not hundreds of times — when answers arrive around the timeout |
-| `RedisWarmUpTest` | 3 | The startup ping returns within its bound when Redis never answers, quietly when it fails, and after one ping when it answers |
 | `RateLimitFilterTest` | 10 | Allowed requests forwarded once with the headers; refusals never forwarded; a failing, silent or empty store fails open; no identity skips the store; an open breaker skips it, and an isolated failure does not skip it for the next caller; a downstream error is not mistaken for Redis failing and forwarded twice; a late answer does not close the breaker |
 | `RateLimitTest` | 8 | End to end through WireMock: the `429` after the burst and after the quota, headers on allowed responses, `free` and `pro` differing, one tenant's users sharing a bucket, two clients not, `401`/`403` carrying no headers and touching no Redis, and the health probe carrying none either |
-| `TwoGatewaysShareOneLimitTest` | 3 | Two application contexts, one Redis: one combined burst and one combined quota |
-| `DeadRedisFailOpenTest` | 1 | A Redis port nobody listens on: `200`, no rate-limit headers |
-| `SilentRedisFailOpenTest` | 1 | A Redis that accepts and never answers: every request served within about the timeout, and at most one connection ever opened |
+| `TwoGatewaysShareOneLimitTest` | 4 | Two application contexts, one Redis: one combined burst and one combined quota; and a token both instances have already served, once revoked, refused by both on their next call |
+| `DeadRedisFailOpenTest` | 1 | A Redis port nobody listens on: `200`, no rate-limit headers. The revocation check is stubbed to "not revoked", so the limiter is the only consumer of the dead Redis |
+| `SilentRedisFailOpenTest` | 1 | A Redis that accepts and never answers: every request served within about the timeout, and at most one connection ever opened. The revocation check is stubbed here too |
 
-Current run, with Redis up: `Tests run: 242, Failures: 0, Errors: 0, Skipped: 0`.
+**Revocation**
+
+| Class | Tests | Covers |
+|---|---|---|
+| `RevocationCheckingJwtDecoderTest` | 14 | The check with a fake inner decoder, a fake store, and a breaker on a fake clock: a token not revoked passes unchanged, and the store is asked about its own `jti`; revoked, missing and blank `jti` are a `BadJwtException`, the last two without asking the store; a token the inner decoder rejects never reaches the store; an error, an empty answer or a timeout is a `RevocationUnavailableException`; an open breaker refuses without asking the store; a revoked token is not a Redis failure; only the probe's success closes the breaker, and a late success does not; the permit is taken when the check runs, not when the decode is assembled |
+| `RedisRevocationStoreTest` | 5 | The store against **real Redis**: an entry written with AuthCore's literal key reads as revoked, an unknown `jti` does not, an expired entry does not — after first proving it was revoked — and the store waits on the connection step |
+| `RevocationTest` | 6 | End to end through WireMock and real Redis: a revoked token gets the ordinary `401` in the platform shape with `WWW-Authenticate: Bearer`, the downstream never called and nothing counted against the tenant; a token not revoked is served; a missing or blank `jti` is `401`; an expired token and an API-key caller never reach the store |
+| `RevocationPropertiesTest` | 5 | `gatekeeper.revocation.redis-timeout` binds; a missing, zero or negative timeout, or an unknown key, stops the boot |
+| `DeadRedisFailClosedTest` | 2 | A Redis port nobody listens on: a bearer token gets `503` with `Retry-After: 5`, the `REVOCATION_UNAVAILABLE` detail and no `WWW-Authenticate`, the first within 5 seconds (it pays the cold JWKS fetch) and each later one within 1 second, from a fresh context so the breaker starts closed; still `503`, never forwarded, once the breaker is open |
+| `SilentRedisFailClosedTest` | 1 | A Redis that accepts and never answers: every bearer token refused `503`, the first within 5 seconds and each later one within 1 second, nothing forwarded, and exactly one connection accepted; the 200 ms timeout itself is shown by the live run (0.228–0.247 seconds), not asserted here |
+
+**Redis connection handling**, shared by the limiter and the revocation check, in `com.gatekeeper.redis`
+
+| Class | Tests | Covers |
+|---|---|---|
+| `RedisConnectionStepTest` | 4 | One connection attempt at a time: callers who give up neither cancel nor repeat it; a success is kept, a failure is retried, an empty ping is retried |
+| `RedisCircuitBreakerTest` | 15 | Opens on three consecutive failures and not on one, any success resetting the count and the count starting again after it closes; denies for the window, lets exactly one caller probe, closes only on the probe's success, re-opens at once on a failed probe, and opens once — not hundreds of times — when answers arrive around the timeout; its opening and closing lines name its consumer and what that consumer does while it is open |
+| `RedisWarmUpTest` | 3 | The startup ping returns within its bound when Redis never answers, quietly when it fails, and after one ping when it answers |
+
+Current run, with Redis up: `Tests run: 278, Failures: 0, Errors: 0, Skipped: 0`.
 
 Five earlier tests are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
 
@@ -604,11 +721,13 @@ The M4 tests were checked the same way — each change below was made on purpose
 
 The M5 tests were checked the same way. Deleting the quota check from the script fails the quota tests; checking the quota before the bucket fails `checksTheBucketBeforeTheQuota` and `neverReportsANegativeQuotaRemaining`; a store counting per instance fails both two-gateway limit tests; removing the fail-open path fails the fail-open tests; a constant `Retry-After` fails three `429` tests; ignoring the tenant fails `aUserTokenCountsAgainstItsTenant` and `usersOfOneTenantShareABucket`; a breaker that any success closes fails three breaker and filter tests; a threshold of one fails `oneFailureDoesNotOpenIt`, a success that does not reset the count fails `aSuccessResetsTheCount`, and a failed probe that counts toward three fails `aFailedProbeReopensAtOnce`; and an uncached connection step fails two connect tests. One check found a gap: `usersOfOneTenantShareABucket` sent both users through the same client, so it passed whether the bucket belonged to the tenant or the client. It now sends every request through a fresh client, so the tenant is the only thing they share, and it fails when the tenant is ignored.
 
+The M6 tests were checked the same way, with ten mutations, and every one turned at least one test red: the store always answering "not revoked"; a token with no `jti` admitted; an open breaker skipping the check instead of refusing; the unavailable check mapped to `401`; a store failure admitting the token; the check made before the inner decoder rather than after it; a five-second in-process cache of "not revoked"; `JwtDecoderConfig` returning the Nimbus decoder unwrapped; the revocation `503` without its `detail`; and that `detail` leaking onto M3's introspection `503`. Two gaps were found and closed before the sweep. The dead-Redis timing test could run after its sibling had already opened the breaker, so every request it timed was refused without touching Redis, and a mutation delaying each refusal by 1.5 seconds passed; it now starts from a fresh context, and that mutation fails it. And the silent-Redis test accepted *at most* one connection, which zero also satisfies; it now requires exactly one.
+
 ---
 
 ## Known limitations
 
-Honest about what this is not, yet. Several of these are the direct consequence of M0–M5 being a deliberately narrow slice. The handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5) keeps the open items the milestones' reviews and runs found, with an owner for each.
+Honest about what this is not, yet. Several of these are the direct consequence of M0–M6 being a deliberately narrow slice. The handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5) keeps the open items the milestones' reviews and runs found, with an owner for each.
 
 - **Identity headers are informational, not authoritative.** They are stamped from verified claims and inbound ones are stripped — see [the section above](#the-identity-headers-it-stamps) — but no downstream should authorize on them, and ledger-service deliberately does not. Treating `X-GK-*` as a trust signal would make every service behind this gateway depend on the gateway being unbypassable, which it is not.
 
@@ -631,21 +750,23 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 
 - **No per-IP flood protection.** The limiter counts only authenticated, authorized requests, by the caller's identity. A flood of unauthenticated or forbidden requests is refused without reaching a downstream, but costs gateway CPU and, for random API keys, negatively cached introspection calls. Limiting by IP before authentication is a different mechanism, and is not built.
 
-- **API-key callers do not fail open when Redis does.** M3's introspection cache reads the same Redis through the same client. Observed live with Redis stopped: an API-key caller hung, waiting in Lettuce's reconnect buffer up to the command timeout, and a Redis that accepts connections and never answers could block an event loop on the cache's first connection. The limiter bounds only its own share; Lettuce buffers commands without limit while disconnected, and rejecting them client-wide would change M3's behaviour, so it was not done here. Separately, AuthCore itself hangs when Redis is down, so its routes answer late whatever the gateway does.
+- **API-key callers neither fail open nor fail fast when Redis does.** M3's introspection cache reads the same Redis through the same client. Observed live with Redis stopped: an API-key caller hung, waiting in Lettuce's reconnect buffer up to the command timeout, and a Redis that accepts connections and never answers could block an event loop on the cache's first connection. The contrast since M6 is stark: in the M6 run, JWT callers were refused `503` in 9–247 ms while an API-key caller hung until curl gave up at 15 seconds. The limiter and the revocation check bound only their own shares; Lettuce buffers commands without limit while disconnected, and rejecting them client-wide would change M3's behaviour, so it was not done here. Separately, AuthCore itself hangs when Redis is down, so its routes answer late whatever the gateway does.
 
 - **Redis's clock stepping backwards.** Refill is never negative, so after a backward step a drained bucket stays drained — refused with `Retry-After: 1` — until Redis's clock passes the stored time again, and a step back across midnight resets the day's count. The triggers are an NTP step on the Redis host or a failover to a replica with a skewed clock.
 
 - **A downstream's own `X-RateLimit-*` or `X-Quota-*` headers would be duplicated.** Spring Cloud Gateway appends a downstream's response headers to those the gateway set, so a downstream sending the same names would produce two of each. None does today; setting the headers in `beforeCommit` would fix it.
 
-- **The warm-up's two seconds, the breaker's five and its threshold of three failures are constants, not properties**, and the warm-up does not run under lazy initialisation.
+- **The warm-up's two seconds, and both breakers' five-second window and threshold of three failures, are constants, not properties**, and the warm-up does not run under lazy initialisation.
+
+- **Recovering from a Redis outage takes as long as Lettuce takes to reconnect.** Lettuce backs off between reconnect attempts, by up to about 30 seconds as an outage lengthens, and neither breaker's probe can succeed until it has reconnected. That holds for a connection that was established and then lost; if Redis is down at boot, nothing was ever connected, so the connection step's next attempt opens a fresh connection, and recovery takes at most one breaker window. In the M6 run JWT callers were refused `503` for 17.8 seconds after Redis came back, against a breaker window of five; the limiter lags the same way, where it costs only a longer unlimited stretch. A shorter reconnect delay would apply to the whole Redis client and was deliberately not set — see [Against the real platform](#against-the-real-platform).
 
 - **Downstream URIs are static configuration.** Two hardcoded `localhost` URLs, no service discovery, no health-aware load balancing. Fine for a single-instance local platform, insufficient for more than one instance of anything.
 
-- **No resilience toward downstreams.** No circuit breaker, no timeout, no retry, no bulkhead on a routed call. A downstream that hangs will hold gateway connections until the client gives up. (The rate limiter's timeout and breaker guard only its own Redis call.)
+- **No resilience toward downstreams.** No circuit breaker, no timeout, no retry, no bulkhead on a routed call. A downstream that hangs will hold gateway connections until the client gives up. (The rate limiter's and the revocation check's timeouts and breakers guard only their own Redis calls.) Nor does the JWKS fetch have a response timeout: Spring Security builds its `WebClient` bare, so an AuthCore that accepts the connection and never answers hangs the request. M7 owns both.
 
 - ~~**No rate limiting or quotas.**~~ **Built in M5** — see [Rate limiting](#rate-limiting).
 
-- **No revocation check.** AuthCore maintains a Redis deny-list of revoked `jti` values and refuses revoked tokens at its own endpoints. This gateway does not consult it, so a revoked-but-unexpired token still passes the edge. The downstreams are unaffected in the sense that they re-verify — but they do not consult the deny-list either, so revocation currently takes effect only at AuthCore. M6 adds the check, on the same Redis the rate limiter uses, and will fail closed where the limiter fails open.
+- ~~**No revocation check.**~~ **Built in M6** — see [Revocation](#revocation). What remains: **ledger-service does not consult the deny-list**, so a revoked token sent straight to it, bypassing the gateway, is accepted until it expires. Revocation takes effect at AuthCore and at the edge. Only individual tokens are deny-listed — a revoked refresh-token family leaves the access tokens already issued from it valid until they expire — and API keys revoke through AuthCore's `enabled` flag and M3's cache TTL, not the deny-list.
 
 - **The `gateway` actuator endpoint is off.** Not an oversight, and not fixable by adding it to `management.endpoints.web.exposure.include` — Spring Cloud Gateway annotates that endpoint `@RestControllerEndpoint(defaultAccess = NONE)`, and the access check short-circuits before exposure is consulted, so it would still never register. Turning it on needs `management.endpoint.gateway.access: read-only`, and then a rule of its own in the authorization table, which today refuses every `/actuator` path except health and info with `NO_RULE`. There is now an authorization model to hang such a rule off; deciding who may read the full route table is still its own decision, so the endpoint stays off.
 
@@ -662,7 +783,7 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 | M3 | API-key authentication, with Redis-cached introspection | ✅ |
 | M4 | Route → scope authorization, tenant enforcement at the edge | ✅ |
 | M5 | Distributed rate limiting and per-plan quotas (Redis) | ✅ |
-| M6 | Revocation check against AuthCore's deny-list | planned |
+| M6 | Revocation check against AuthCore's deny-list | ✅ |
 | M7 | Resilience — circuit breaker, timeout, retry, bulkhead | planned |
 | M8 | Audit events to Kafka, observability | planned |
 | M9 | Dynamic route and plan administration | planned |

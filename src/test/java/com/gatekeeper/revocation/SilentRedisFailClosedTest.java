@@ -115,8 +115,8 @@ class SilentRedisFailClosedTest {
         }
 
         // Exactly one: the warm-up's attempt, which every later caller shares rather than repeats. It stays
-        // pending for the whole run, well under Lettuce's ~10 s connect timeout; a longer run could see a
-        // second attempt.
+        // pending for the whole run, well under the 60 s handshake timeout (the TCP connect succeeds, so
+        // Lettuce's bound is RedisURI's timeout); a longer run could see a second attempt.
         assertThat(accepted).as("connections accepted by the silent Redis").hasValue(1);
 
         downstream.verify(0, anyRequestedFor(urlPathMatching("/ledger/.*")));
