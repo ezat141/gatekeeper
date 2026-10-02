@@ -314,6 +314,45 @@ writes nothing.
 
 The suite grows by about 25 from 242, and the no-Redis failure count is remeasured.
 
+**As built:** the suite grew by 36, to 278. `RevocationCheckingJwtDecoderTest` gained a fourteenth
+case, `aLateSuccessDoesNotCloseTheBreaker`. The 503's shape is asserted in `DeadRedisFailClosedTest`,
+where the exception really arises, rather than in `ErrorShapeTest`; `IntrospectionUnavailableTest`
+now asserts that M3's 503 still has no `detail`. Without Redis (`-Dspring.data.redis.port=1`) the run
+reports `Tests run: 275, Failures: 54, Errors: 20` — `TwoGatewaysShareOneLimitTest` folds its four
+tests into one setup failure — so 77 of 278 do not pass, up from 45 of 242: every bearer-token test
+is now answered 503, which is correct. The mutation sweep made all seven mutations above and three
+more — `JwtDecoderConfig` returning the Nimbus decoder unwrapped, the revocation 503 without its
+`detail`, and that `detail` leaking onto M3's 503 — and each of the ten turned at least one test red.
+
+**Live run, 2026-10-02**, against the real AuthCore, with the gateway started with `java -jar`:
+
+- **Revocation.** A client-credentials token for `authcore-machine` with `payments:read` (`jti`
+  `9a23e3ae-…`, a 600-second lifetime) got 200 on `GET /api/machine/payments`. `POST /oauth2/revoke`
+  answered 200, and the next call got **401**, with `WWW-Authenticate: Bearer` and
+  `{"error":"unauthorized","status":401,"path":"/api/machine/payments"}`. Redis held
+  `authcore:revoked:jti:9a23e3ae-6488-47bd-9b58-3c06018cf32c` with a TTL of about 588 s.
+- **Redis stopped.** Ten JWT calls, all **503**: the first three in 0.247, 0.229 and 0.228 s — the
+  200 ms timeout — and the next seven in 0.009–0.032 s, with the breaker open. The ledger route
+  answered 503 with `Retry-After: 5`, no `WWW-Authenticate`, and
+  `{"error":"service_unavailable","status":503,"path":"/api/ledger/entries","detail":"REVOCATION_UNAVAILABLE"}`.
+  The breaker logged one WARN — `Revocation check: Redis failed 3 times in a row; refusing
+  bearer-token requests with 503 for 5 s at a time until it answers` — with the `TimeoutException`
+  as its cause. An API-key caller hung until curl's 15-second limit, as M3's open item predicts.
+- **Redis restarted: recovery took 17.8 s, not the five or so item 4 expected.** JWT calls stayed 503
+  until 17.8 s after Redis was up. The breaker probed every five seconds as designed, but the probes
+  at 6.4 s and 12.1 s each timed out at about 220 ms: the gateway had not reconnected. Lettuce's
+  `ConnectionWatchdog` backs off between reconnect attempts — during this outage they came about 9,
+  8, 17 and then 30 s apart — and the last one reconnected 17 s after Redis was up. The breaker
+  closed straight after it: `Revocation check: Redis answered again; breaker closed`. So recovery is
+  Lettuce's reconnect delay, which grows with the outage's length up to about 30 s, plus up to one
+  breaker window, and JWT callers are refused 503 throughout. The limiter has the same delay, where
+  it only means requests go unlimited a little longer; here it means refusals. A shorter reconnect
+  delay would shorten it — in Lettuce 6.8 that is `ClientResources.reconnectDelay`, not a
+  `ClientOptions` setting — and it would apply client-wide. That was deliberately not done in M6,
+  and the handoff (§5) records it as open.
+- **After recovery** the token revoked earlier was still 401: the deny-list survived the Redis
+  restart.
+
 ---
 
 ## 12. Out of scope, and departures from the milestone plan
