@@ -34,8 +34,8 @@ import java.util.Optional;
  * {@link RedisCircuitBreaker}. Three in a row open it: for its window no request calls Redis at all,
  * and the breaker logs the outage once when it opens and once when it closes. An isolated failure
  * fails only its own request open. Rate limiting is a capacity control; a Redis outage must not
- * become a gateway outage. M6's revocation check will fail closed on the same Redis, deliberately —
- * see the M5 design, section 7.
+ * become a gateway outage. M6's revocation check fails closed on the same Redis, deliberately —
+ * see the M6 design, section 4.
  *
  * <p>The fail-open branch covers only the store call, never the downstream chain: an error from
  * the downstream must not be mistaken for Redis failing and forward the request a second time.

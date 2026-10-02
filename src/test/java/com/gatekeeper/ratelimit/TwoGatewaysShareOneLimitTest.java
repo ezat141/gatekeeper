@@ -199,6 +199,9 @@ class TwoGatewaysShareOneLimitTest {
     private static ReactorResourceFactory privateReactorResources() {
         ReactorResourceFactory factory = new ReactorResourceFactory();
         factory.setUseGlobalResources(false);
+        // Registered as a bean, so Boot's own factory, which reads spring.reactor.netty.*, is never
+        // created: the test configuration's shutdown-quiet-period does not reach this one.
+        factory.setShutdownQuietPeriod(Duration.ZERO);
         return factory;
     }
 
