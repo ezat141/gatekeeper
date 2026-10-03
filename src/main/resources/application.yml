@@ -35,6 +35,24 @@ spring:
                   args:
                     name: authcore
                     statusCodes: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
+                # After the breaker, so the breaker sees one outcome per client request, and nothing
+                # is retried while it is open. GET only, once, after 100 ms, on 502, 503 and connect
+                # errors. series is empty so only the listed statuses count, and exceptions is set
+                # explicitly because the default list includes the gateway's TimeoutException — every
+                # response timeout would be retried. Never a POST, a timeout or a 500.
+                # The M7 design, section 9.
+                - name: Retry
+                  args:
+                    retries: 1
+                    methods: GET
+                    statuses: BAD_GATEWAY,SERVICE_UNAVAILABLE
+                    series:
+                    exceptions: java.net.ConnectException
+                    backoff:
+                      firstBackoff: 100ms
+                      maxBackoff: 100ms
+                      factor: 1
+                      basedOnPreviousValue: false
             - id: authcore-machine
               uri: ${gatekeeper.downstream.authcore}
               metadata:
@@ -50,6 +68,24 @@ spring:
                   args:
                     name: authcore
                     statusCodes: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
+                # After the breaker, so the breaker sees one outcome per client request, and nothing
+                # is retried while it is open. GET only, once, after 100 ms, on 502, 503 and connect
+                # errors. series is empty so only the listed statuses count, and exceptions is set
+                # explicitly because the default list includes the gateway's TimeoutException — every
+                # response timeout would be retried. Never a POST, a timeout or a 500.
+                # The M7 design, section 9.
+                - name: Retry
+                  args:
+                    retries: 1
+                    methods: GET
+                    statuses: BAD_GATEWAY,SERVICE_UNAVAILABLE
+                    series:
+                    exceptions: java.net.ConnectException
+                    backoff:
+                      firstBackoff: 100ms
+                      maxBackoff: 100ms
+                      factor: 1
+                      basedOnPreviousValue: false
             - id: ledger
               uri: ${gatekeeper.downstream.ledger}
               metadata:
@@ -65,6 +101,24 @@ spring:
                   args:
                     name: ledger
                     statusCodes: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
+                # After the breaker, so the breaker sees one outcome per client request, and nothing
+                # is retried while it is open. GET only, once, after 100 ms, on 502, 503 and connect
+                # errors. series is empty so only the listed statuses count, and exceptions is set
+                # explicitly because the default list includes the gateway's TimeoutException — every
+                # response timeout would be retried. Never a POST, a timeout or a 500.
+                # The M7 design, section 9.
+                - name: Retry
+                  args:
+                    retries: 1
+                    methods: GET
+                    statuses: BAD_GATEWAY,SERVICE_UNAVAILABLE
+                    series:
+                    exceptions: java.net.ConnectException
+                    backoff:
+                      firstBackoff: 100ms
+                      maxBackoff: 100ms
+                      factor: 1
+                      basedOnPreviousValue: false
                 - StripPrefix=1
                 # ledger-service is JWT-only, and a key caller is refused before reaching it
                 # (RouteScopeAuthorizationManager). What remains is a JWT caller sending a
