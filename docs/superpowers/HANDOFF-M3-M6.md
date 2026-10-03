@@ -163,7 +163,8 @@ scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up from
   contains spaces (`'D:\courses\My' is not recognized`). To start GateKeeper with arguments — two
   instances on different ports, say — build with `.\mvnw.cmd -o -q package -DskipTests` and run
   `java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar --server.port=… …`.
-- **Never add a `Co-Authored-By` line.** Standing preference: it keeps Claude out of the contributors graph.
+- **Never add a `Co-Authored-By` line, or any tool attribution.** Standing rule: the repo owner is the
+  only contributor.
 - **Docker Desktop must be running** for AuthCore (Postgres + Redis):
   `docker compose up -d postgres redis` from the authcore directory. It stops often.
 - Heredocs with markdown content fail in this shell often enough that a file-writing tool is the
