@@ -57,14 +57,14 @@ gatekeeper:
     # Shorter: caching a rejection absorbs a retry storm from a misconfigured client,
     # while a short window limits how much an enumeration attempt is amplified.
     negative-cache-ttl: 10s
-    # The JWKS fetch has no timeout and that is filed as an M7 defect. Do not repeat it:
-    # a host that accepts the connection and never answers must fail, not hang.
+    # Do not leave a remote call without a timeout: a host that accepts the connection and never
+    # answers must fail, not hang. (The JWKS fetch has one since M7: gatekeeper.resilience.jwks-timeout.)
     timeout: 2s
   rate-limit:
     # How long a request waits for Redis before going through unlimited. Rate limiting is a
     # capacity control, not a security control, so a Redis failure must not become a gateway
-    # outage — and it must fail fast, not hang (the JWKS fetch's missing timeout is an open M7
-    # item; this call does not repeat it). See the M5 design, section 7.
+    # outage — and it must fail fast, not hang (as every remote call here has). See the M5
+    # design, section 7.
     redis-timeout: 200ms
     default-plan: free
     plans:

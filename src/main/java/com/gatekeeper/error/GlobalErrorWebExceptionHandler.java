@@ -2,6 +2,7 @@ package com.gatekeeper.error;
 
 import com.gatekeeper.apikey.IntrospectionUnavailableException;
 import com.gatekeeper.revocation.RevocationUnavailableException;
+import org.jspecify.annotations.Nullable;
 import org.springframework.boot.autoconfigure.web.WebProperties;
 import org.springframework.boot.web.error.ErrorAttributeOptions;
 import org.springframework.boot.webflux.autoconfigure.error.AbstractErrorWebExceptionHandler;
@@ -39,10 +40,16 @@ import reactor.core.publisher.Mono;
  * never reaches this class at all — see {@link JsonServerAuthenticationEntryPoint}, wired in
  * {@code GatewaySecurityConfig}, which renders the identical {@link ErrorBody} shape for
  * that path instead.
+ *
+ * <p>Each failure it recognises maps to one {@link Answer}: a status, a fixed {@code detail} and a
+ * {@code Retry-After}. The M7 design, section 8, has the table.
  */
 @Component
 @Order(-2)
 public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHandler {
+
+    /** AuthCore's key set could not be fetched. The M7 design, section 4. */
+    public static final String KEYS_UNAVAILABLE = "KEYS_UNAVAILABLE";
 
     public GlobalErrorWebExceptionHandler(ErrorAttributes errorAttributes,
                                           WebProperties webProperties,
@@ -53,6 +60,10 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
         setMessageReaders(codecConfigurer.getReaders());
     }
 
+    /** What the caller is told: status, the fixed {@code detail} if any, and {@code Retry-After} if any. */
+    record Answer(HttpStatus status, @Nullable String detail, @Nullable String retryAfter) {
+    }
+
     @Override
     protected RouterFunction<ServerResponse> getRoutingFunction(ErrorAttributes errorAttributes) {
         return RouterFunctions.route(RequestPredicates.all(), this::render);
@@ -60,96 +71,74 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
 
     private Mono<ServerResponse> render(ServerRequest request) {
         Throwable error = getError(request);
-        HttpStatus status = statusFor(request, error);
+        Answer answer = answerFor(request, error);
 
-        ServerResponse.BodyBuilder builder = ServerResponse.status(status)
+        ServerResponse.BodyBuilder builder = ServerResponse.status(answer.status())
                 .contentType(MediaType.APPLICATION_JSON);
 
-        if (status == HttpStatus.UNAUTHORIZED) {
-            // RFC 6750 requires it on a 401 from a bearer-token resource.
-            // JsonServerAuthenticationEntryPoint already sets it on the path it owns (no
-            // credential at all); omitting it here would mean the other two ways this
-            // gateway says "unauthorized" - an unreachable JWKS, a rejected outbound header -
-            // fail to tell the caller how to authenticate, contradicting that class's own
-            // reasoning about the same header. Not unconditional: a 503 or 404 carrying
-            // WWW-Authenticate would be wrong and confusing.
+        if (answer.status() == HttpStatus.UNAUTHORIZED) {
+            // RFC 6750 requires it on a 401 from a bearer-token resource. Not unconditional: a 503
+            // or 404 carrying WWW-Authenticate would be wrong and confusing.
             builder = builder.header(HttpHeaders.WWW_AUTHENTICATE, "Bearer");
         }
-
-        if (status == HttpStatus.SERVICE_UNAVAILABLE) {
-            // Tells the caller this is worth retrying, which is the whole reason this path is a
-            // 503 and not a 401 — their credential may be perfectly good.
-            builder = builder.header(HttpHeaders.RETRY_AFTER, "5");
+        if (answer.retryAfter() != null) {
+            builder = builder.header(HttpHeaders.RETRY_AFTER, answer.retryAfter());
         }
-
-        // Only the revocation 503 carries a detail, so it can be told from M3's introspection 503.
-        String detail = error instanceof RevocationUnavailableException ? RevocationUnavailableException.DETAIL : null;
-        return builder.bodyValue(ErrorBody.of(status, request.path(), detail));
+        return builder.bodyValue(ErrorBody.of(answer.status(), request.path(), answer.detail()));
     }
 
     /**
-     * Four failures reach here as raw runtime exceptions rather than anything Spring
-     * Security recognises, and all four would otherwise read as a server fault.
+     * Several failures reach here as raw exceptions rather than anything Spring Security or Boot
+     * recognises, and each would otherwise read as a server fault.
      *
-     * <p>An unreachable JWKS arrives as {@code IllegalStateException("Could not obtain the
-     * keys", ...)} from the remote key source — {@code JwtReactiveAuthenticationManager}
-     * maps only {@code JwtException}, so it passes through untouched. A claim carrying a
-     * control character arrives as {@code IllegalArgumentException("Validation failed for
-     * header '...'", ...)} from Netty's header validation, thrown inside the gateway's own
-     * routing filter when it copies the stamped header onto the outbound request.
+     * <p>A claim carrying a control character arrives as {@code IllegalArgumentException("Validation
+     * failed for header '...'", ...)} from Netty's header validation, thrown inside the gateway's own
+     * routing filter when it copies the stamped header onto the outbound request. The gateway cannot
+     * establish who the caller is, so it refuses the credential: 401. The match is on type and the
+     * fixed part of the message, deliberately narrower than any {@code IllegalArgumentException}: a
+     * blanket catch would relabel an unrelated bug as an authentication failure, and a 401 is not
+     * paged on the way a 500 is.
      *
-     * <p>Neither is a server fault from the caller's side: in both cases the gateway
-     * cannot establish who they are, so it refuses the credential. Answering 401 also
-     * avoids advertising that the identity provider is unreachable.
+     * <p>An unreachable key set arrives as {@code IllegalStateException("Could not obtain the keys",
+     * ...)} from the remote key source, matched the same narrow way. Until M7 it was a 401, so as not to
+     * advertise that the identity provider was down. Since M7 it is 503 {@link #KEYS_UNAVAILABLE}, like
+     * the two other "a dependency could not answer" cases: the token is very likely valid, and a 401
+     * would send the caller to discard it and refresh it against the very AuthCore that is unreachable
+     * (the M7 design, section 4).
      *
-     * <p>The match on those two is on exception type <em>and</em> the fixed part of the
-     * message each library uses for exactly this condition, deliberately narrower than "any
-     * {@code IllegalStateException} or {@code IllegalArgumentException}". Those two types are
-     * common enough that a genuine bug elsewhere in the gateway could easily throw one for
-     * an unrelated reason — bad internal state, a rejected argument in code M4 adds later —
-     * and a blanket catch here would relabel that bug as an authentication failure. A 401
-     * is not paged on the way a 500 is, so a masked bug could sit unnoticed for a long
-     * time. Both messages are confirmed against the actual stack traces this failure
-     * produces (see the two exception-shape tests), not assumed from the description.
-     *
-     * <p>{@link IntrospectionUnavailableException} gets a bare type match instead, with no
-     * message narrowing. The reasoning above for the other two does not transfer: it is a
-     * type this gateway declares for itself and throws from exactly one place ({@code
-     * IntrospectionClient.introspect}), for exactly one reason — AuthCore's introspection
-     * call could not be completed. Unlike a JDK exception type, there is no ambient,
-     * everyday use of it that an unrelated bug elsewhere could collide with, so narrowing
-     * on message text as well would add ceremony without removing any real risk of
-     * mislabelling something else. It maps to 503, not 401 — see its own Javadoc for why.
-     *
-     * <p>{@link RevocationUnavailableException} gets the same bare type match and the same 503, for
-     * the same reasons: declared by this gateway, thrown from one place ({@code
-     * RevocationCheckingJwtDecoder}) for one reason — whether the token is revoked could not be
-     * established. A 401 would send a caller holding a very likely valid token to refresh it,
-     * against an AuthCore that is itself stuck while Redis is down (the M6 design, section 4).
+     * <p>{@link IntrospectionUnavailableException} and {@link RevocationUnavailableException} get bare
+     * type matches, with no message narrowing: each is a type this gateway declares for itself and
+     * throws from exactly one place for exactly one reason, so there is no ambient use of it an
+     * unrelated bug could collide with. Both are 503 — see their own Javadoc for why.
      */
-    private HttpStatus statusFor(ServerRequest request, Throwable error) {
-        if (isUnreachableJwks(error) || isRejectedOutboundHeader(error)) {
-            return HttpStatus.UNAUTHORIZED;
+    private Answer answerFor(ServerRequest request, Throwable error) {
+        if (isRejectedOutboundHeader(error)) {
+            return new Answer(HttpStatus.UNAUTHORIZED, null, null);
         }
-        if (error instanceof IntrospectionUnavailableException || error instanceof RevocationUnavailableException) {
-            return HttpStatus.SERVICE_UNAVAILABLE;
+        if (isUnreachableJwks(error)) {
+            return new Answer(HttpStatus.SERVICE_UNAVAILABLE, KEYS_UNAVAILABLE, "5");
+        }
+        if (error instanceof IntrospectionUnavailableException) {
+            return new Answer(HttpStatus.SERVICE_UNAVAILABLE, null, "5");
+        }
+        if (error instanceof RevocationUnavailableException) {
+            return new Answer(HttpStatus.SERVICE_UNAVAILABLE, RevocationUnavailableException.DETAIL, "5");
         }
 
         int code = (int) getErrorAttributes(request, ErrorAttributeOptions.defaults())
                 .getOrDefault("status", 500);
         HttpStatus resolved = HttpStatus.resolve(code);
-        return resolved != null ? resolved : HttpStatus.INTERNAL_SERVER_ERROR;
+        HttpStatus status = resolved != null ? resolved : HttpStatus.INTERNAL_SERVER_ERROR;
+        // Any other 503 still tells the caller it is worth retrying.
+        return new Answer(status, null, status == HttpStatus.SERVICE_UNAVAILABLE ? "5" : null);
     }
 
     /**
-     * {@code NimbusReactiveJwtDecoder}'s fixed message when {@code
-     * ReactiveRemoteJWKSource.getJWKSet()} fails for any reason — connection refused, DNS
-     * failure, timeout, a non-2xx response, or malformed JSON from the JWKS endpoint. All of
-     * these surface through the same unconditional, single-argument {@code
-     * Mono#onErrorMap(Function)} wrapping the key-fetch pipeline (confirmed by reading the
-     * decoder's bytecode: the mapper is {@code t -> new IllegalStateException("Could not
-     * obtain the keys", t)} with no type check on {@code t}), so the message carries no
-     * variable text and an exact match is safe without also inspecting the cause chain.
+     * {@code NimbusReactiveJwtDecoder}'s fixed message when the key-set fetch fails for any reason —
+     * refused, timed out, a non-2xx response, or malformed JSON. All of these surface through the same
+     * unconditional {@code onErrorMap} wrapping the fetch (verified in Spring Security 7.0.6, including
+     * for M7's connect and response timeouts), so the message carries no variable text and an exact
+     * match is safe.
      */
     private static boolean isUnreachableJwks(Throwable error) {
         return error instanceof IllegalStateException
@@ -158,12 +147,7 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
 
     /**
      * Netty's {@code DefaultHeaders.validateValue} message when a header value fails
-     * validation, prefix-matched because the message interpolates the header name (e.g.
-     * {@code X-GK-Permissions}, but any {@code X-GK-*} header stamped from a verified claim
-     * could in principle carry the same kind of poisoned value). Matching the prefix rather
-     * than the full message, and not the specific header name, is deliberate: which header
-     * triggered it does not change the response, only that this filter's header-copy step
-     * is where it happened.
+     * validation, prefix-matched because the message interpolates the header name.
      */
     private static boolean isRejectedOutboundHeader(Throwable error) {
         return error instanceof IllegalArgumentException
