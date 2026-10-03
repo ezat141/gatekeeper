@@ -110,25 +110,36 @@ a `ConnectException`, the gateway's response timeout, and a downstream 502/503/5
 downstream 502/503/504 is an availability signal, counted, and replaced by the gateway's shape with
 `DOWNSTREAM_ERROR`, headers included; a 500 is the downstream's own answer and passes through untouched,
 never counted, so one caller cannot cut a service off for everyone — at the stated cost that an
-all-500 downstream never opens its breaker (§5). One retry, for GET only, 100 ms later, on a connect
-error, 502 or 503, inside the breaker and costing no second rate-limit token. A semaphore bulkhead per
-downstream, 50 in flight, refusing 503 `DOWNSTREAM_BUSY` with `Retry-After: 1`; a refusal never counts,
-guarded twice by design (the record predicate and `ignoreExceptions(BulkheadFullException)`). The JWKS
-fetch has a 2 s connect and response timeout, and an unreachable key set is now 503 `KEYS_UNAVAILABLE`,
-not 401 — a change from M2, made for the reason M3 and M6 already gave. `JwksFetchLogging` logs it once
-per outage, judging a fetch by its body. Lettuce reconnects with full jitter from 100 ms up to 2 s. The
-M7 design (`specs/2026-10-03-gatekeeper-m7-design.md`) is the reference; its section 11 records what was
-built beyond the plan and the live run: ledger cut off after nine 502s and recovering on its own, a
-silent downstream answered 504 at about 5 s, a silent key set answered 503 at about 2 s, and recovery
-from a Redis restart in 0.55–5.96 s against M6's 17.8 s.
+all-500 downstream never opens its breaker (§5). Everything else is neutral: the breaker records only
+availability failures and ignores every other exception, so a caller's own error or a bulkhead refusal
+counts neither for nor against the downstream — a final-review fix, since Resilience4j counts an
+exception it neither records nor ignores as a success. One retry, for GET only, 100 ms later, on a
+connect error, 502 or 503, inside the breaker and costing no second rate-limit token. A semaphore
+bulkhead per downstream, 50 in flight, refusing 503 `DOWNSTREAM_BUSY` with `Retry-After: 1`; a refusal
+has two guards, that ignore rule and an explicit `ignoreExceptions(BulkheadFullException)`, and removing
+either one alone is harmless by design. The JWKS fetch has a 2 s connect and response timeout, and an
+unreachable key set is now 503 `KEYS_UNAVAILABLE`, not 401 — a change from M2, made for the reason M3
+and M6 already gave. `JwksFetchLogging` logs it once per outage, judging a fetch by its body. Lettuce
+reconnects with full jitter from 100 ms up to 2 s. The M7 design
+(`specs/2026-10-03-gatekeeper-m7-design.md`) is the reference; its section 11 records what was built
+beyond the plan and the live run: ledger cut off after nine 502s and recovering on its own, a silent
+downstream answered 504 at about 5 s, a silent key set answered 503 at about 2 s, and recovery from a
+Redis restart in 0.55–5.96 s against M6's 17.8 s.
 
-**Next: M8 — audit and observability**, the milestone plan's per-request audit event (principal,
-tenant, route, status, latency) to Kafka `gateway.audit` through a reactive producer, Micrometer metrics
+**Next: M8 — audit and observability**, the milestone plan's per-request audit event (principal, tenant,
+route, status, latency) to Kafka `gateway.audit` through a reactive producer, Micrometer metrics
 (request rate, 401/403/429 counts, per-route latency percentiles, gateway overhead, circuit state), a
 Grafana dashboard, and W3C `traceparent` propagation so a trace spans gateway and downstream. Two open
-items in §5 are natural for it: counting what M7 deliberately does not log per request (timeouts,
-connect errors, retries, bulkhead refusals, breaker state), and quieting Reactor Netty's per-request
-WARN on a timed-out key-set fetch. Any endpoint M8 adds — a metrics scrape, say — needs its own row in
+items in §5 are natural for it. The first is counting what M7 logs per request only at DEBUG or TRACE:
+bulkhead refusals, response timeouts, connect errors, counted statuses and open-breaker refusals are
+each one DEBUG line per request from Boot's error handler, which `GlobalErrorWebExceptionHandler`
+inherits, enabled with
+`logging.level.org.springframework.boot.webflux.autoconfigure.error.AbstractErrorWebExceptionHandler=DEBUG`;
+and Resilience4j's `CircuitBreakerStateMachine` logs "recorded … as failure" or "ignored …" at DEBUG;
+retries are visible only at TRACE on
+`org.springframework.cloud.gateway.filter.factory.RetryGatewayFilterFactory`, several lines per GET;
+breaker state changes are already WARN and INFO. The second is quieting Reactor Netty's per-request WARN
+on a timed-out key-set fetch. Any endpoint M8 adds — a metrics scrape, say — needs its own row in
 `RouteScopeAuthorizationManager`, or it is refused `NO_RULE`.
 
 Design and plan documents are in `docs/superpowers/specs/` and `docs/superpowers/plans/`. Milestone
@@ -316,8 +327,8 @@ milestone plan, each in the M7 design:
 
 ## 5. Deferred items these milestones inherit
 
-Found during M0–M7 and recorded rather than fixed, or closed by a later milestone and marked so. Each names the milestone that owns it, or says it
-has none.
+Found during M0–M7 and recorded rather than fixed, or closed by a later milestone and marked so. Each
+names the milestone that owns it, or says it has none.
 
 - ~~**M4 — the 403 path still has the empty-body gap that 401 lost.**~~ **Closed in M4.**
   `JsonServerAccessDeniedHandler` renders every 403 in the platform shape with a fixed `detail` and no
@@ -515,26 +526,38 @@ rather than in the implementation.** Two techniques did most of the work:
 
 **Mutation testing.** Delete the line a test claims to cover, in a scratch copy, and confirm the test
 fails. This caught a key-rotation test that would have passed against a decoder with refresh-on-miss
-removed, and an anti-spoofing suite where four of five tests still passed with the strip filter
-deleted entirely. In M5 it caught a shared-tenant test that sent every user through one client, and so
-could not tell a tenant's bucket from a client's. In M6 all ten mutations were caught, one of them —
-the revocation `detail` leaking onto M3's 503 — by an assertion M6 added to M3's test; before the
-sweep, a dead-Redis timing test was found timing an already-open breaker, and passed a mutation that
-delayed every refusal by 1.5 s. In M7 fourteen mutations were run, the bulkhead one in two variants:
-all were caught except the variant removing one of the two guards that keep a bulkhead refusal from
-counting, which survives by design — the other guard still holds, and removing both is caught. One
-mutation, counting a 500 on an AuthCore route, is caught only by `ProductionValuesTest`, because the
-behavioural 500 test exercises the ledger route.
+removed, and an anti-spoofing suite where four of five tests still passed with the strip filter deleted
+entirely. In M5 it caught a shared-tenant test that sent every user through one client, and so could not
+tell a tenant's bucket from a client's. In M6 all ten mutations were caught, one of them — the
+revocation `detail` leaking onto M3's 503 — by an assertion M6 added to M3's test; before the sweep, a
+dead-Redis timing test was found timing an already-open breaker, and passed a mutation that delayed
+every refusal by 1.5 s. In M7 fourteen mutations were run, the bulkhead one in two variants, and all
+were caught but one: 6a, removing `ignoreExceptions(BulkheadFullException)` alone. It was recorded as
+surviving by design, the record predicate taken for a second guard. The final review found it was not
+one: without the explicit ignore, a refusal was neither recorded nor ignored, so it counted as a
+success, and no test looked at successes. The breaker now ignores every exception that is not an
+availability failure, the tests pin success counts, and three more mutations were run: removing only the
+new ignore predicate is caught by the CR/LF test (four successes, not none), the bulkhead test surviving
+it; removing both ignores is caught by the bulkhead test (four successes, not two); and removing only
+the explicit ignore survives by design, the two guards now genuinely equivalent. One mutation, counting
+a 500 on an AuthCore route, is caught only by `ProductionValuesTest`, because the behavioural 500 test
+exercises the ledger route.
 
-M7's reviews found two defects, each fixed with a test that pins it:
+M7's reviews found three defects, each fixed with a test that pins it:
 
 - **The breaker counted every exception thrown inside the chain**, because Resilience4j records all of
   them unless told otherwise — so a caller's own bad request, a claim with CR/LF answered 401, counted
   against the downstream, and ten could have opened it for everyone. Fixed by `DownstreamFailures`
   and `recordException(DownstreamFailures::isAvailabilityFailure)`.
+- **A caller's own error then counted as a success**, found in the final review: Resilience4j counts an
+  exception it neither records nor ignores as a success, so the same 401s padded the window and, in
+  half-open, could have closed the breaker without the downstream being reached; a bulkhead refusal
+  would have too, without its explicit ignore. Fixed by an ignore predicate, everything that
+  `DownstreamFailures.isAvailabilityFailure` does not match: a caller's own error is neutral. The CR/LF
+  test pins no successes, the bulkhead test exactly two.
 - **The JWKS logging judged a fetch by its status, not its body**, so a 200 carrying a login page was
-  refused 503 by the decoder with nothing logged, and could even log "answered again". `JwksFetchLogging`
-  now parses a 2xx body as a key set before calling it an answer.
+  refused 503 by the decoder with nothing logged, and could even log "answered again".
+  `JwksFetchLogging` now parses a 2xx body as a key set before calling it an answer.
 
 **Running the thing.** Booting the service and hitting it with `curl` found what reading the diff
 could not: a cross-tenant leak that the tests asserted was correct, a missing `WWW-Authenticate` on

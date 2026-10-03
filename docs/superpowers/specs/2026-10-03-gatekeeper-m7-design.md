@@ -122,6 +122,14 @@ instance judges a downstream from its own traffic, deliberately.
 **What counts as a failure:** a connect error, a response timeout, and a downstream **502, 503 or 504**.
 **A downstream 500 does not count** and passes through untouched (§7).
 
+**Everything else is neutral**, a refinement made during the final review on §7's reasoning: a
+caller's own error says nothing about the downstream's health either way, so it counts neither for nor
+against the downstream. The breaker records only those three availability failures and ignores every
+other exception, a bulkhead refusal (§10) included. Ignoring matters as much as not recording:
+Resilience4j treats an exception it neither records nor ignores as a success, which would pad the window
+and, in half-open, could close the breaker without the downstream ever being reached. A response the
+downstream gave, a passed-through 500 included, is a success.
+
 **Values** (properties, §10): a count-based window of the last **20** calls, judged only after at least
 **10**; opens at **50 %** failures; stays open **10 s**; then lets **3** trial calls through to decide.
 
@@ -239,8 +247,9 @@ connections with waiting requests while the other downstream starves.
 - A Resilience4j **semaphore** bulkhead per downstream, named like the breakers: `authcore`, `ledger`.
 - At most **50** concurrent requests per downstream; beyond that, refused at once without waiting:
   **503** `DOWNSTREAM_BUSY`, `Retry-After: 1`.
-- **A refusal does not count as a breaker failure** — the downstream did not fail; the gateway chose not
-  to call it. The breaker is configured to ignore `BulkheadFullException`.
+- **A refusal counts neither as a breaker failure nor as a success** — the downstream did not fail; the
+  gateway chose not to call it. The breaker ignores `BulkheadFullException` explicitly, and §6's rule,
+  which ignores everything that is not an availability failure, ignores it too.
 - Implemented through Spring Cloud CircuitBreaker's own reactive bulkhead support
   (`ReactiveResilience4jBulkheadProvider`, verified in the 5.0.2 source): enabled by default, keyed by
   the breaker's name, and applied inside the breaker. It requires `resilience4j-bulkhead` on the
@@ -268,10 +277,10 @@ typo fails the boot.
 |---|---|
 | `ReconnectDelayTest` | The configured `Delay` never exceeds 2 s for any attempt and varies (jitter); the context's `LettuceConnectionFactory` uses it |
 | `JwksTimeoutTest` | A key set that accepts and never answers → 503 `KEYS_UNAVAILABLE` in about 2 s, not a hang; refused → the same; WARN once, DEBUG after, INFO on recovery. `UnreachableJwksErrorShapeTest` moves from 401 to 503 |
-| `DownstreamTimeoutTest` | A slow downstream → 504 `DOWNSTREAM_TIMEOUT` within the bound; a POST times out once and is not retried |
+| `DownstreamTimeoutTest` | A slow downstream → 504 `DOWNSTREAM_TIMEOUT` within the bound, for a GET and for a POST. That a POST is never retried is pinned by `DownstreamRetryTest.aPostIsNeverRetried` |
 | `DownstreamCircuitBreakerTest` | Downstream 503s open the breaker; then every request is answered 503 `DOWNSTREAM_UNAVAILABLE` at once with `Retry-After`, and the downstream's request count stops growing. Repeated **500s never open it**, and each 500's body reaches the caller byte-identical. A downstream 502/503/504 comes back as the gateway's shape with its status and `DOWNSTREAM_ERROR`. After the open window a successful trial closes it. With `ledger`'s breaker open, the AuthCore routes still answer |
 | `DownstreamRetryTest` | GET 503 then 200 → 200, two downstream requests; 502 likewise; POST 503 → no retry; GET timeout and GET 500 → no retry; a retried GET costs one rate-limit token |
-| `DownstreamBulkheadTest` | With a limit of 2: two slow requests held, the third refused 503 `DOWNSTREAM_BUSY` at once; many refusals leave the breaker CLOSED; the other downstream is unaffected |
+| `DownstreamBulkheadTest` | With a limit of 2: two slow requests held, the third refused 503 `DOWNSTREAM_BUSY` at once; many refusals leave the breaker CLOSED, with no failure recorded and only the two held requests counted as successes; the other downstream is unaffected |
 | `ResiliencePropertiesTest` | Binding, validation and strict binding, as in M5 and M6 |
 | `ProductionValuesTest` | Loads the real `application.yml` with **no** test overrides and asserts the agreed values: 2 s connect and 5 s response on each route; breaker 20 / 10 / 50 % / 10 s / 3; bulkhead 50; retry GET-only, once, 100 ms, connect errors and 502/503; `CircuitBreaker` before `Retry` on every route; the TimeLimiter disabled. So small test values cannot hide a production change |
 
@@ -306,11 +315,19 @@ counted status (`CircuitBreakerStatusCodeException`). The breaker is configured 
 `recordException(DownstreamFailures::isAvailabilityFailure)`. Before that fix it counted every exception
 thrown inside the chain, so a caller's own bad request — a token claim with CR/LF, which fails Netty's
 header validation inside the routing filter and is answered 401 — could have opened the breaker for
-everyone; `aCallersBadRequestNeverCountsAgainstTheDownstream` pins that it no longer can. A bulkhead
-refusal is therefore kept from counting by **two independent guards**, the record predicate and
-`ignoreExceptions(BulkheadFullException)`, by design. **`com.gatekeeper.config.JwksFetchLogging`** judges a
-fetch by its **body**, parsed as a key set, not only by its status, so a 200 login page counts as a
-failure; the decoder is handed the same body either way. **`jwks-timeout` must be between 1 ms and
+everyone. The final review found the other half: an exception Resilience4j neither records nor ignores
+counts as a **success** (verified in 2.3.0's `CircuitBreakerStateMachine`), so the same bad request
+padded the success count and, in half-open, could have closed the breaker unreached. The breaker now
+also has `ignoreException(error -> !DownstreamFailures.isAvailabilityFailure(error))`: it records only
+availability failures and ignores everything else, so a caller's own error and a bulkhead refusal are
+neutral (§6). `aCallersBadRequestNeverCountsAgainstTheDownstream` pins no failures and no successes. A
+refusal has **two guards**, that predicate and the explicit `ignoreExceptions(BulkheadFullException)`,
+which Resilience4j ORs; removing either one alone is harmless by design. Before the final review the
+predicate guard did not exist, and the record predicate was taken for the second guard: it is not one,
+and without the explicit ignore, refusals would have counted as successes. `DownstreamBulkheadTest` now
+pins the success count, exactly the two held requests. **`com.gatekeeper.config.JwksFetchLogging`**
+judges a fetch by its **body**, parsed as a key set, not only by its status, so a 200 login page counts
+as a failure; the decoder is handed the same body either way. **`jwks-timeout` must be between 1 ms and
 60 s**: Netty treats a connect timeout of 0 as none, and takes whole milliseconds as an `int`. And
 `spring.cloud.circuitbreaker.resilience4j.blocking.enabled: false` turns off the unused blocking
 factory, which, run first for a downstream's name, would leave a default-configured breaker in the
@@ -323,10 +340,16 @@ since a cold context made a fixed sleep racy. The suite went from 278 to **323**
 `DownstreamFailuresTest` 5, `DownstreamRetryTest` 8, `DownstreamBulkheadTest` 1 and
 `ProductionValuesTest` 3; `UnreachableJwksErrorShapeTest` moved from 401 to 503. **Mutations:**
 fourteen, with the bulkhead mutation run in two variants, 6a (`ignoreExceptions` removed alone) and 6b
-(both guards removed). Every one was caught except 6a, which survives by design: the record predicate
-still keeps a refusal from counting, and 6b is caught. Mutation 1, a 500 added to an AuthCore route's
-`statusCodes`, is caught only by `ProductionValuesTest`, because the behavioural 500 test exercises the
-ledger route.
+(it and the record predicate removed). Every one was caught except 6a, which was taken to survive by
+design, the record predicate counted as a second guard. It was not one: with 6a, a refusal was neither
+recorded nor ignored, so it counted as a success, and no test looked at successes. The final review
+found this, added the ignore predicate and the success-count assertions, and ran three more: removing
+the ignore predicate is caught by `aCallersBadRequestNeverCountsAgainstTheDownstream` (four successes,
+not none), while `DownstreamBulkheadTest` survives it, the explicit ignore still holding; removing both
+ignores, 6a's configuration, is caught by both (`DownstreamBulkheadTest`: four successes, not two); and
+removing only the explicit `ignoreExceptions(BulkheadFullException)` survives by design, the predicate
+covering refusals too. Mutation 1, a 500 added to an AuthCore route's `statusCodes`, is caught only by
+`ProductionValuesTest`, because the behavioural 500 test exercises the ledger route.
 
 **Live run, 2026-10-03**, against the real AuthCore, ledger-service and Redis, with the production
 values.
@@ -378,8 +401,9 @@ New package **`com.gatekeeper.resilience`**:
   the breaker's window, minimum calls, failure-rate threshold, open duration and trial calls, and the
   bulkhead's limit.
 - **`ResilienceConfig`** — applies those values to the `authcore` and `ledger` breakers and bulkheads
-  through Spring Cloud CircuitBreaker's customizers; the breaker ignores `BulkheadFullException`; logs
-  breaker state transitions (§14).
+  through Spring Cloud CircuitBreaker's customizers; the breaker records only availability failures and
+  ignores everything else, `BulkheadFullException` named explicitly as well; logs breaker state
+  transitions (§14).
 
 Changed:
 
@@ -429,9 +453,16 @@ The rule of M5 and M6: log **state changes**, not requests.
 
 - **Breakers:** WARN when one opens, naming it and its failure rate; INFO when it goes half-open and
   when it closes.
-- **Bulkhead refusals, timeouts, connect errors and retries:** DEBUG per request. They happen under load
+- **Nothing per request above DEBUG.** Bulkhead refusals, timeouts and connect errors happen under load
   or during an outage, so per-request INFO would flood the log exactly when it matters; the breaker's
-  WARN reports the outage, and M8 will count them.
+  WARN reports the outage. As built (verified): bulkhead refusals, response timeouts, connect errors,
+  counted statuses and open-breaker refusals are each logged as one DEBUG line per request by Boot's
+  error handler, which `GlobalErrorWebExceptionHandler` inherits, enabled with
+  `logging.level.org.springframework.boot.webflux.autoconfigure.error.AbstractErrorWebExceptionHandler=DEBUG`;
+  Resilience4j's `CircuitBreakerStateMachine` also logs "recorded … as failure" or "ignored …" at
+  DEBUG. Retries are visible only at TRACE on
+  `org.springframework.cloud.gateway.filter.factory.RetryGatewayFilterFactory`, several lines per GET.
+  Counting them is M8's.
 - **The key set:** WARN on the first failed fetch after a success, DEBUG for further failures, INFO when
   a fetch succeeds again.
 
