@@ -1,5 +1,6 @@
 package com.gatekeeper.resilience;
 
+import io.github.resilience4j.bulkhead.BulkheadConfig;
 import io.github.resilience4j.bulkhead.BulkheadFullException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
@@ -8,9 +9,12 @@ import io.github.resilience4j.timelimiter.TimeLimiterConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.cloud.circuitbreaker.resilience4j.ReactiveResilience4JCircuitBreakerFactory;
+import org.springframework.cloud.circuitbreaker.resilience4j.ReactiveResilience4jBulkheadProvider;
 import org.springframework.cloud.client.circuitbreaker.Customizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
+import java.time.Duration;
 
 /**
  * The downstreams' breakers, from {@link ResilienceProperties}. The M7 design, sections 6, 7 and 14.
@@ -62,6 +66,21 @@ public class ResilienceConfig {
                             .onStateTransition(event -> logTransition(event, circuitBreaker)),
                     CircuitBreaker::getName), AUTHCORE, LEDGER);
         };
+    }
+
+    /**
+     * A semaphore bulkhead per downstream, inside its breaker (Spring Cloud CircuitBreaker applies it
+     * there, keyed by the breaker's name — verified in 5.0.2). Beyond the limit a request is refused at
+     * once, without waiting: 503 DOWNSTREAM_BUSY. The breaker ignores the refusal. The M7 design,
+     * section 10.
+     */
+    @Bean
+    public Customizer<ReactiveResilience4jBulkheadProvider> downstreamBulkheads(ResilienceProperties properties) {
+        BulkheadConfig config = BulkheadConfig.custom()
+                .maxConcurrentCalls(properties.bulkhead().maxConcurrentCalls())
+                .maxWaitDuration(Duration.ZERO)
+                .build();
+        return provider -> provider.configure(builder -> builder.bulkheadConfig(config), AUTHCORE, LEDGER);
     }
 
     /** WARN when one opens, INFO otherwise; never per request. The M7 design, section 14. */

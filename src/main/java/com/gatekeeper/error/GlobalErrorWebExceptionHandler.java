@@ -4,6 +4,7 @@ import com.gatekeeper.apikey.IntrospectionUnavailableException;
 import com.gatekeeper.resilience.DownstreamFailures;
 import com.gatekeeper.resilience.ResilienceProperties;
 import com.gatekeeper.revocation.RevocationUnavailableException;
+import io.github.resilience4j.bulkhead.BulkheadFullException;
 import org.jspecify.annotations.Nullable;
 import org.springframework.boot.autoconfigure.web.WebProperties;
 import org.springframework.boot.web.error.ErrorAttributeOptions;
@@ -67,6 +68,8 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
     public static final String DOWNSTREAM_UNAVAILABLE = "DOWNSTREAM_UNAVAILABLE";
     /** The downstream answered 502, 503 or 504 — an availability signal. The M7 design, section 7. */
     public static final String DOWNSTREAM_ERROR = "DOWNSTREAM_ERROR";
+    /** The downstream's bulkhead is full. The M7 design, section 10. */
+    public static final String DOWNSTREAM_BUSY = "DOWNSTREAM_BUSY";
 
     private final String breakerRetryAfter;
 
@@ -181,6 +184,9 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
         if (DownstreamFailures.isCountedStatus(error)) {
             return new Answer(HttpStatus.valueOf(((CircuitBreakerStatusCodeException) error).getStatusCode().value()),
                     DOWNSTREAM_ERROR, null);
+        }
+        if (error instanceof BulkheadFullException) {
+            return new Answer(HttpStatus.SERVICE_UNAVAILABLE, DOWNSTREAM_BUSY, "1");
         }
         if (DownstreamFailures.isTimeout(error)) {
             return new Answer(HttpStatus.GATEWAY_TIMEOUT, DOWNSTREAM_TIMEOUT, null);
