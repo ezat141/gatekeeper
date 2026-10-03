@@ -47,6 +47,12 @@ class ResiliencePropertiesTest {
                 .contains("gatekeeper.resilience"));
     }
 
+    /** Netty would read 0 ms as no connect timeout at all. */
+    @Test
+    void refusesASubMillisecondJwksTimeout() {
+        refuses("gatekeeper.resilience.jwks-timeout=500us", "gatekeeper.resilience.jwks-timeout");
+    }
+
     @Test
     void refusesANonPositiveRouteTimeout() {
         refuses("gatekeeper.resilience.response-timeout-millis.ledger=0", "response-timeout-millis");

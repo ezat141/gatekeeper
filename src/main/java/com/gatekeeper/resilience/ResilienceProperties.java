@@ -13,7 +13,7 @@ import java.util.Map;
  * would also bind but ignore a misspelt key and leave the breaker on its defaults. No defaults in code:
  * {@code application.yml} supplies every value, and a missing one fails the boot.
  *
- * @param jwksTimeout           connect and response timeout for fetching AuthCore's key set
+ * @param jwksTimeout           connect and response timeout for fetching AuthCore's key set (1 ms to 60 s)
  * @param responseTimeoutMillis each route's response timeout, by route id, in milliseconds. Plain
  *                              milliseconds because the routes' {@code metadata} refers to these values,
  *                              and Spring Cloud Gateway parses a route's {@code response-timeout} with
@@ -31,6 +31,11 @@ public record ResilienceProperties(
     public ResilienceProperties {
         if (jwksTimeout == null || jwksTimeout.isZero() || jwksTimeout.isNegative()) {
             throw new IllegalArgumentException("gatekeeper.resilience.jwks-timeout must be a positive duration");
+        }
+        // Netty takes whole milliseconds as an int, and treats a connect timeout of 0 as none at all.
+        if (jwksTimeout.compareTo(Duration.ofMillis(1)) < 0 || jwksTimeout.compareTo(Duration.ofSeconds(60)) > 0) {
+            throw new IllegalArgumentException(
+                    "gatekeeper.resilience.jwks-timeout must be between 1ms and 60s, was " + jwksTimeout);
         }
         if (responseTimeoutMillis == null || responseTimeoutMillis.isEmpty()) {
             throw new IllegalArgumentException("gatekeeper.resilience.response-timeout-millis must name every route");

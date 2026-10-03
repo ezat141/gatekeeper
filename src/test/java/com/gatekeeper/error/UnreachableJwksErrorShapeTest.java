@@ -49,28 +49,27 @@ class UnreachableJwksErrorShapeTest {
     }
 
     /**
-     * The token is well-formed and would verify if the key set were reachable, but it never
-     * gets that far. {@code ReactiveRemoteJWKSource.getJWKSet()} fails to connect, {@code
-     * NimbusReactiveJwtDecoder} wraps that as {@code IllegalStateException("Could not obtain
-     * the keys", ...)}, and {@code JwtReactiveAuthenticationManager.authenticate()} maps
-     * only {@code JwtException} to a 401 — so this exception passes through unmapped unless
-     * something downstream catches it. It must still read as a refused credential rather
-     * than a server fault: the gateway cannot verify who the caller is either way, and a 500
-     * would additionally advertise that the identity provider is unreachable.
+     * The token is well-formed and would verify if the key set were reachable, but it never gets
+     * that far: the fetch is refused, and {@code NimbusReactiveJwtDecoder} wraps that as {@code
+     * IllegalStateException("Could not obtain the keys", ...)}. Since M7 that is a 503 with {@code
+     * KEYS_UNAVAILABLE}, not a 401: the token is very likely valid, and a 401 would send the caller
+     * to refresh it against the AuthCore that is unreachable (the M7 design, section 4).
      */
     @Test
-    void rendersAnUnreachableJwksAsUnauthorizedNotServerError() {
+    void rendersAnUnreachableJwksAsServiceUnavailable() {
         String token = key.mint(ISSUER, "ezzat",
                 Instant.now().plus(5, ChronoUnit.MINUTES), Map.of("tenant", "acme"));
 
         client.get().uri("/api/ledger/entries")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .exchange()
-                .expectStatus().isUnauthorized()
-                .expectHeader().valueMatches(HttpHeaders.WWW_AUTHENTICATE, "Bearer.*")
+                .expectStatus().isEqualTo(503)
+                .expectHeader().valueEquals(HttpHeaders.RETRY_AFTER, "5")
+                .expectHeader().doesNotExist(HttpHeaders.WWW_AUTHENTICATE)
                 .expectBody()
-                .jsonPath("$.error").isEqualTo("unauthorized")
-                .jsonPath("$.status").isEqualTo(401)
-                .jsonPath("$.path").isEqualTo("/api/ledger/entries");
+                .jsonPath("$.error").isEqualTo("service_unavailable")
+                .jsonPath("$.status").isEqualTo(503)
+                .jsonPath("$.path").isEqualTo("/api/ledger/entries")
+                .jsonPath("$.detail").isEqualTo("KEYS_UNAVAILABLE");
     }
 }
