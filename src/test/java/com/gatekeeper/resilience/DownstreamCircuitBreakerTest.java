@@ -39,7 +39,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * never counts. The M7 design, sections 6 to 8. Small values (a window of 4, open for 1 s) keep it fast;
  * {@code ProductionValuesTest} pins the real ones.
  *
- * <p>POST throughout, so the GET-only retry (Task 6) never changes how many calls the downstream sees.
+ * <p>POST throughout, so the GET-only retry (the M7 design, section 9) never changes how many calls the downstream sees.
  * Breakers are reset before each test: they live for the whole context.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -209,8 +209,9 @@ class DownstreamCircuitBreakerTest {
 
     /**
      * A caller's own failure is not the downstream's: a claim that Netty refuses to forward fails inside
-     * the routing filter, the caller gets 401, and the breaker must not count it. Otherwise one caller
-     * could cut the downstream off for everyone. The M7 design, sections 6 and 7.
+     * the routing filter, the caller gets 401, and the breaker must count it neither for nor against the
+     * downstream. Otherwise one caller could cut the downstream off for everyone, or pad its success
+     * count. The M7 design, sections 6 and 7.
      */
     @Test
     void aCallersBadRequestNeverCountsAgainstTheDownstream() {
@@ -229,8 +230,11 @@ class DownstreamCircuitBreakerTest {
         }
 
         assertThat(state("ledger")).isEqualTo(CircuitBreaker.State.CLOSED);
-        assertThat(breakers.getCircuitBreakerRegistry().find("ledger").orElseThrow().getMetrics().getNumberOfFailedCalls())
-                .isZero();
+        // The six requests went through the breaker filter, so the breaker exists by now. Neutral: not
+        // failures, and not successes either, which in half-open could close it unreached.
+        CircuitBreaker.Metrics metrics = breakers.getCircuitBreakerRegistry().find("ledger").orElseThrow().getMetrics();
+        assertThat(metrics.getNumberOfFailedCalls()).isZero();
+        assertThat(metrics.getNumberOfSuccessfulCalls()).isZero();
         postEntry().expectStatus().isOk();
     }
 

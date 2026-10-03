@@ -37,8 +37,14 @@ public record ResilienceProperties(
             throw new IllegalArgumentException(
                     "gatekeeper.resilience.jwks-timeout must be between 1ms and 60s, was " + jwksTimeout);
         }
+        // Only non-emptiness is checked here: this record does not know the route ids. A route whose
+        // timeout is missing does not fail the boot either (verified): its metadata placeholder,
+        // ${gatekeeper.resilience.response-timeout-millis.<route id>}, stays unresolved, Spring Cloud
+        // Gateway ignores the non-numeric value, and the route falls back to the global response
+        // timeout. ProductionValuesTest.timeouts is what catches it.
         if (responseTimeoutMillis == null || responseTimeoutMillis.isEmpty()) {
-            throw new IllegalArgumentException("gatekeeper.resilience.response-timeout-millis must name every route");
+            throw new IllegalArgumentException(
+                    "gatekeeper.resilience.response-timeout-millis must give at least one route's timeout");
         }
         responseTimeoutMillis.forEach((route, millis) -> {
             if (millis == null || millis <= 0) {

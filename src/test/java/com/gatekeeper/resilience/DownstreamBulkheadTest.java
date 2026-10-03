@@ -37,8 +37,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * With a limit of 2: two slow requests in flight to ledger, and the next is refused at once 503
- * DOWNSTREAM_BUSY. Refusals never count as breaker failures, and AuthCore is unaffected. The M7 design,
- * section 10. The breaker's window is small here so that, were refusals counted, it would open.
+ * DOWNSTREAM_BUSY. Refusals count neither as breaker failures nor as successes, and AuthCore is
+ * unaffected. The M7 design, section 10. The breaker's window is small here so that, were refusals
+ * counted as failures, it would open.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @AutoConfigureWebTestClient
@@ -125,6 +126,9 @@ class DownstreamBulkheadTest {
         CircuitBreaker ledger = breakers.getCircuitBreakerRegistry().find("ledger").orElseThrow();
         assertThat(ledger.getState()).isEqualTo(CircuitBreaker.State.CLOSED);
         assertThat(ledger.getMetrics().getNumberOfFailedCalls()).isZero();
+        // The two held requests are the only successes: the refusals are neutral, neither failures nor
+        // successes, so a burst of them cannot pad the window either.
+        assertThat(ledger.getMetrics().getNumberOfSuccessfulCalls()).isEqualTo(2);
     }
 
     private static String token() {
