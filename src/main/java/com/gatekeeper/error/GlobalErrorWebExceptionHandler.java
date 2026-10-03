@@ -19,7 +19,10 @@ import org.springframework.web.reactive.function.server.RouterFunction;
 import org.springframework.web.reactive.function.server.RouterFunctions;
 import org.springframework.web.reactive.function.server.ServerRequest;
 import org.springframework.web.reactive.function.server.ServerResponse;
+import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
+
+import java.net.ConnectException;
 
 /**
  * One JSON error shape across the platform. Without it a client gets an empty body from
@@ -50,6 +53,10 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
 
     /** AuthCore's key set could not be fetched. The M7 design, section 4. */
     public static final String KEYS_UNAVAILABLE = "KEYS_UNAVAILABLE";
+    /** A downstream did not answer within its route's response timeout. The M7 design, section 5. */
+    public static final String DOWNSTREAM_TIMEOUT = "DOWNSTREAM_TIMEOUT";
+    /** A downstream could not be connected to. The M7 design, section 8. */
+    public static final String DOWNSTREAM_UNREACHABLE = "DOWNSTREAM_UNREACHABLE";
 
     public GlobalErrorWebExceptionHandler(ErrorAttributes errorAttributes,
                                           WebProperties webProperties,
@@ -110,6 +117,13 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
      * type matches, with no message narrowing: each is a type this gateway declares for itself and
      * throws from exactly one place for exactly one reason, so there is no ambient use of it an
      * unrelated bug could collide with. Both are 503 — see their own Javadoc for why.
+     *
+     * <p>A downstream that exceeds its route's response timeout is 504 {@link #DOWNSTREAM_TIMEOUT}; a
+     * downstream that cannot be connected to is 502 {@link #DOWNSTREAM_UNREACHABLE}. The latter is a bare
+     * {@link ConnectException} match, which is safe: it covers a refused connection (Netty's
+     * {@code AnnotatedConnectException}) and a connect timeout (Netty's {@code ConnectTimeoutException}),
+     * both subclasses, and every other remote call in the gateway — introspection, the key set, Redis —
+     * wraps its connect errors in its own exception before they could reach here.
      */
     private Answer answerFor(ServerRequest request, Throwable error) {
         if (isRejectedOutboundHeader(error)) {
@@ -124,6 +138,12 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
         if (error instanceof RevocationUnavailableException) {
             return new Answer(HttpStatus.SERVICE_UNAVAILABLE, RevocationUnavailableException.DETAIL, "5");
         }
+        if (isDownstreamTimeout(error)) {
+            return new Answer(HttpStatus.GATEWAY_TIMEOUT, DOWNSTREAM_TIMEOUT, null);
+        }
+        if (error instanceof ConnectException) {
+            return new Answer(HttpStatus.BAD_GATEWAY, DOWNSTREAM_UNREACHABLE, null);
+        }
 
         int code = (int) getErrorAttributes(request, ErrorAttributeOptions.defaults())
                 .getOrDefault("status", 500);
@@ -131,6 +151,17 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
         HttpStatus status = resolved != null ? resolved : HttpStatus.INTERNAL_SERVER_ERROR;
         // Any other 503 still tells the caller it is worth retrying.
         return new Answer(status, null, status == HttpStatus.SERVICE_UNAVAILABLE ? "5" : null);
+    }
+
+    /**
+     * Spring Cloud Gateway's routing filter, when a downstream exceeds the route's response timeout:
+     * a 504 {@code ResponseStatusException} caused by the gateway's own {@code TimeoutException}
+     * (verified in 5.0.2). Matched on both, so a 504 raised for another reason is not relabelled.
+     */
+    private static boolean isDownstreamTimeout(Throwable error) {
+        return error instanceof ResponseStatusException status
+                && status.getStatusCode().value() == HttpStatus.GATEWAY_TIMEOUT.value()
+                && status.getCause() instanceof org.springframework.cloud.gateway.support.TimeoutException;
     }
 
     /**
