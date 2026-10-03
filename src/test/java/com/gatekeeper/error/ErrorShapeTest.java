@@ -26,12 +26,13 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 
 /**
  * One JSON error shape ({@code error}, {@code status}, {@code path}) regardless of which
- * layer refused the request. The second test here is one of two paths that used to
- * misreport as a 500 — see the class Javadoc on {@link GlobalErrorWebExceptionHandler} for
- * why it is actually a 401 in disguise. The unreachable-JWKS case is the other one, and it
- * lives in {@link UnreachableJwksErrorShapeTest} because it needs a {@code
- * gatekeeper.auth.jwk-set-uri} that cannot coexist with this class's live WireMock JWKS in
- * the same {@code @DynamicPropertySource}.
+ * layer refused the request. Two paths used to misreport as a 500: the rejected outbound
+ * header, which is a 401 (the second test here), and the unreachable key set, which has been
+ * a 503 since M7 — see the Javadoc on {@code GlobalErrorWebExceptionHandler.answerFor} for
+ * why each is what it is. The unreachable-JWKS case lives in {@link
+ * UnreachableJwksErrorShapeTest} because it needs a {@code gatekeeper.auth.jwk-set-uri} that
+ * cannot coexist with this class's live WireMock JWKS in the same {@code
+ * @DynamicPropertySource}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @AutoConfigureWebTestClient

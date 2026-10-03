@@ -155,8 +155,9 @@ class IntrospectionClientTest {
 
     /**
      * A host that accepts the connection and never answers in time must fail, not hang — the
-     * JWKS fetch has exactly this gap and it is filed as an M7 defect; see {@link
-     * IntrospectionClient}'s class Javadoc. The delay is well above the client's configured
+     * JWKS fetch had exactly this gap until M7 gave it a timeout ({@code
+     * gatekeeper.resilience.jwks-timeout}); see {@link IntrospectionClient}'s class Javadoc.
+     * The delay is well above the client's configured
      * timeout, and the overall assertion is bounded by {@code verify(Duration)} so a
      * regression that removed the timeout would fail this test instead of hanging the build.
      */

@@ -4,8 +4,11 @@ import com.gatekeeper.support.TestKey;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.webtestclient.autoconfigure.AutoConfigureWebTestClient;
 import org.springframework.http.HttpHeaders;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -30,6 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @AutoConfigureWebTestClient
+@ExtendWith(OutputCaptureExtension.class)
 class JwksTimeoutTest {
 
     static final String ISSUER = "http://localhost:8080";
@@ -73,7 +77,7 @@ class JwksTimeoutTest {
     }
 
     @Test
-    void refusesWith503WithinTheTimeoutInsteadOfHanging() {
+    void refusesWith503WithinTheTimeoutInsteadOfHanging(CapturedOutput output) {
         String token = key.mint(ISSUER, "ezzat", Instant.now().plus(5, ChronoUnit.MINUTES),
                 Map.of("tenant", "acme", "scope", List.of("payments:read")));
         long started = System.nanoTime();
@@ -91,5 +95,8 @@ class JwksTimeoutTest {
                 .jsonPath("$.detail").isEqualTo("KEYS_UNAVAILABLE");
 
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(3));
+        // Proves the logging filter is wired into the decoder's WebClient: the failed fetch is logged once.
+        String warning = "AuthCore's key set could not be fetched";
+        assertThat(output.getOut().split(java.util.regex.Pattern.quote(warning), -1).length - 1).isEqualTo(1);
     }
 }

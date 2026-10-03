@@ -21,12 +21,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 class JwksFetchLoggingTest {
 
     static final ClientRequest REQUEST = ClientRequest.create(HttpMethod.GET, URI.create("http://authcore/oauth2/jwks")).build();
+    static final String KEY_SET = "{\"keys\":[]}";
 
     @Test
     void warnsOnceThenInformsOnRecovery(CapturedOutput output) {
         JwksFetchLogging logging = new JwksFetchLogging();
         ExchangeFunction refused = request -> Mono.error(new ConnectException("Connection refused"));
-        ExchangeFunction ok = request -> Mono.just(ClientResponse.create(HttpStatus.OK).build());
+        ExchangeFunction ok = request -> Mono.just(ClientResponse.create(HttpStatus.OK).body(KEY_SET).build());
 
         for (int i = 0; i < 3; i++) {
             logging.filter(REQUEST, refused).onErrorResume(e -> Mono.empty()).block();
@@ -45,6 +46,30 @@ class JwksFetchLoggingTest {
         logging.filter(REQUEST, request -> Mono.just(ClientResponse.create(HttpStatus.BAD_GATEWAY).build())).block();
 
         assertThat(output.getOut()).contains("AuthCore's key set could not be fetched");
+    }
+
+    @Test
+    void aSuccessfulStatusWithABodyThatIsNotAKeySetIsAFailure(CapturedOutput output) {
+        JwksFetchLogging logging = new JwksFetchLogging();
+
+        ClientResponse handedOn = logging.filter(REQUEST,
+                request -> Mono.just(ClientResponse.create(HttpStatus.OK).body("<html>login</html>").build())).block();
+
+        assertThat(output.getOut()).contains("AuthCore's key set could not be fetched");
+        // The decoder still sees exactly what the server sent.
+        assertThat(handedOn.bodyToMono(String.class).block()).isEqualTo("<html>login</html>");
+    }
+
+    @Test
+    void aValidEmptyKeySetAfterAFailureIsAnAnswer(CapturedOutput output) {
+        JwksFetchLogging logging = new JwksFetchLogging();
+
+        logging.filter(REQUEST, request -> Mono.just(ClientResponse.create(HttpStatus.BAD_GATEWAY).build())).block();
+        ClientResponse handedOn = logging.filter(REQUEST,
+                request -> Mono.just(ClientResponse.create(HttpStatus.OK).body(KEY_SET).build())).block();
+
+        assertThat(output.getOut()).contains("AuthCore's key set answered again");
+        assertThat(handedOn.bodyToMono(String.class).block()).isEqualTo(KEY_SET);
     }
 
     private static int count(String text, String needle) {

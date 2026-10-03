@@ -13,9 +13,10 @@ import java.util.Map;
  * Asks AuthCore about a key, presenting the gateway's own key as identification.
  *
  * <p>Carries an explicit response timeout. Spring Security's ReactiveRemoteJWKSource does
- * not, which is why an unreachable-but-listening JWKS host hangs the request instead of
- * failing closed; that is recorded as an M7 defect. Building a second outbound call with
- * the same gap would be repeating a known bug deliberately.
+ * not by default, which is why an unreachable-but-listening JWKS host used to hang the
+ * request instead of failing closed. The JWKS fetch has one since M7
+ * ({@code gatekeeper.resilience.jwks-timeout}); building a second outbound call without
+ * one would repeat that known bug deliberately.
  *
  * <p>A failed call is never cached, unlike a definitive "active" or "inactive" answer.
  * Caching "AuthCore could not be reached" would need a policy for how long to keep
