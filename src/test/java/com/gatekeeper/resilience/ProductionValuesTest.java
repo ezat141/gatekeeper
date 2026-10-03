@@ -83,6 +83,15 @@ class ProductionValuesTest {
             assertThat(retry.get("methods")).isEqualTo("GET");
             assertThat(retry.get("statuses")).isEqualTo("BAD_GATEWAY,SERVICE_UNAVAILABLE");
             assertThat(retry.get("exceptions")).isEqualTo("java.net.ConnectException");
+            // Once, after 100 ms: the nested backoff binds as dotted keys.
+            assertThat(retry.get("backoff.firstBackoff")).isEqualTo("100ms");
+            assertThat(retry.get("backoff.maxBackoff")).isEqualTo("100ms");
+            assertThat(retry.get("backoff.factor")).isEqualTo("1");
+            assertThat(retry.get("backoff.basedOnPreviousValue")).isEqualTo("false");
+            // Present and empty, so only the listed statuses are retried: absent, the filter's default
+            // series would retry the whole 5xx range.
+            assertThat(retry).containsKey("series");
+            assertThat(retry.get("series")).isEmpty();
         }
     }
 

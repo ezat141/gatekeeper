@@ -28,9 +28,10 @@ spring:
               predicates:
                 - Path=/api/accounts/**
               filters:
-                # First, so it wraps everything after it, Retry included (Task 6). Counts connect
-                # errors, timeouts and these statuses; a downstream 500 is the downstream's own
-                # answer and passes through uncounted. The M7 design, sections 6 and 7.
+                # First, so it wraps everything after it, Retry included (the M7 design, section 9).
+                # Counts connect errors, timeouts and these statuses; a downstream 500 is the
+                # downstream's own answer and passes through uncounted. The M7 design, sections 6
+                # and 7.
                 - name: CircuitBreaker
                   args:
                     name: authcore
@@ -61,9 +62,10 @@ spring:
               predicates:
                 - Path=/api/machine/**
               filters:
-                # First, so it wraps everything after it, Retry included (Task 6). Counts connect
-                # errors, timeouts and these statuses; a downstream 500 is the downstream's own
-                # answer and passes through uncounted. The M7 design, sections 6 and 7.
+                # First, so it wraps everything after it, Retry included (the M7 design, section 9).
+                # Counts connect errors, timeouts and these statuses; a downstream 500 is the
+                # downstream's own answer and passes through uncounted. The M7 design, sections 6
+                # and 7.
                 - name: CircuitBreaker
                   args:
                     name: authcore
@@ -94,9 +96,10 @@ spring:
               predicates:
                 - Path=/api/ledger/**
               filters:
-                # First, so it wraps everything after it, Retry included (Task 6). Counts connect
-                # errors, timeouts and these statuses; a downstream 500 is the downstream's own
-                # answer and passes through uncounted. The M7 design, sections 6 and 7.
+                # First, so it wraps everything after it, Retry included (the M7 design, section 9).
+                # Counts connect errors, timeouts and these statuses; a downstream 500 is the
+                # downstream's own answer and passes through uncounted. The M7 design, sections 6
+                # and 7.
                 - name: CircuitBreaker
                   args:
                     name: ledger

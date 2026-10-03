@@ -22,14 +22,19 @@ import java.time.Duration;
  * <p>One per downstream service — {@link #AUTHCORE}, shared by both AuthCore routes, and {@link #LEDGER}
  * — named by each route's {@code CircuitBreaker} filter in {@code application.yml}.
  *
- * <p>Exactly three things count as a failure, by {@link DownstreamFailures#isAvailabilityFailure}: a
- * connect error, a response timeout, and a downstream 502, 503 or 504 (the routes' {@code statusCodes}).
- * Resilience4j records every exception thrown inside the chain unless told otherwise, so without that
- * predicate a caller's own failure, such as a claim Netty refuses to forward (answered 401), would count,
- * and enough of them would cut the downstream off for everyone. An exception that is neither recorded nor
- * ignored counts as a success, which is what such a failure should be. A downstream 500 is the
- * downstream's own answer and never reaches the breaker as an error. A full bulkhead's refusal is
- * ignored: the downstream did not fail, the gateway chose not to call it.
+ * <p>The breaker records only availability failures, by {@link DownstreamFailures#isAvailabilityFailure}:
+ * a connect error, a response timeout, and a downstream 502, 503 or 504 (the routes' {@code statusCodes}).
+ * It ignores everything else (a bulkhead refusal, a caller's own error), so they count neither for nor
+ * against the downstream. Successful responses, including a passed-through 500, are successes.
+ *
+ * <p>Both halves matter. Resilience4j records every exception thrown inside the chain unless told
+ * otherwise, so without the record predicate a caller's own failure, such as a claim Netty refuses to
+ * forward (answered 401), would count, and enough of them would cut the downstream off for everyone. And
+ * an exception it neither records nor ignores counts as a success (verified in 2.3.0's
+ * {@code CircuitBreakerStateMachine}), so without the ignore predicate the same failure would inflate the
+ * success count and, in half-open, could close the breaker without the downstream ever being reached. A
+ * full bulkhead's refusal is also ignored explicitly: the downstream did not fail, the gateway chose not
+ * to call it. Resilience4j ORs the two ignore rules.
  *
  * <p>The TimeLimiter is disabled by {@code spring.cloud.circuitbreaker.resilience4j.disable-time-limiter};
  * the {@code timeLimiterConfig} given here is required by the builder and never applied.
@@ -53,6 +58,7 @@ public class ResilienceConfig {
                 .waitDurationInOpenState(breaker.openFor())
                 .permittedNumberOfCallsInHalfOpenState(breaker.trialCalls())
                 .recordException(DownstreamFailures::isAvailabilityFailure)
+                .ignoreException(error -> !DownstreamFailures.isAvailabilityFailure(error))
                 .ignoreExceptions(BulkheadFullException.class)
                 .build();
         return factory -> {

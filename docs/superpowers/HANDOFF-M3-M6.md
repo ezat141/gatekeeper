@@ -1,45 +1,53 @@
 # GateKeeper M3–M6 — Handoff
 
 Written at the close of M0–M2 so the next session starts productive rather than rediscovering what
-this one learned by failing, and kept current through M6. Read this before touching code.
+this one learned by failing, and kept current through M7. Read this before touching code.
 
 ---
 
 ## 1. Where things stand
 
-**M0–M6 are complete.** M0–M2 was verified against three live services; M3 (API-key authentication)
+**M0–M7 are complete.** M0–M2 was verified against three live services; M3 (API-key authentication)
 landed across AuthCore and GateKeeper with its own spec and plan, dated 2026-08-24; M4 (route-to-scope
 authorization and the tenant check) was a GateKeeper-only milestone, spec and plan dated 2026-09-26,
 verified by mutation and against the three live services. M5 (distributed rate limiting and daily
 quotas) was GateKeeper-only too, spec and plan dated 2026-09-27, verified by mutation and by two
 gateway processes against the live platform and one shared Redis. M6 (the token revocation check) was
 GateKeeper-only in code, spec and plan dated 2026-09-30, verified by ten mutations and against the
-real AuthCore with Redis stopped and restarted.
+real AuthCore with Redis stopped and restarted. M7 (resilience) was GateKeeper-only, spec and plan
+dated 2026-10-03: timeouts toward the downstreams and on the JWKS fetch, a circuit breaker and a
+semaphore bulkhead per downstream, one retry for a GET, an unreachable key set answered 503 rather than
+401, and Lettuce reconnecting within 2 s. It was verified by fourteen mutations and against the real
+AuthCore, ledger-service and Redis, with ledger stopped and restarted, a downstream and a key set that
+never answer, and Redis stopped and restarted twice.
 
 | Repo | `master` | Tests | Visibility |
 |---|---|---|---|
 | [authcore](https://github.com/ezat141/authcore) | `f345f8d` | 78 | public |
 | [ledger-service](https://github.com/ezat141/ledger-service) | `3cd3738` | 26 | public |
-| [gatekeeper](https://github.com/ezat141/gatekeeper) | `b0921d5` — M6's last code merge; the merge of M6's documentation follows it | 278 | public |
+| [gatekeeper](https://github.com/ezat141/gatekeeper) | `ee64220` — M7's last code merge; the merge of M7's documentation follows it | 323 | public |
 
-All three clean, and all three counts confirmed by running the suites. ledger-service was not changed
-by M4, M5 or M6. AuthCore's code was not changed either; its one M6 commit, `f345f8d`, is a README
-paragraph naming the deny-list key `authcore:revoked:jti:<jti>` as a cross-service contract, since the
-gateway now reads it. AuthCore's run takes over ten minutes — every test class starts its own
-Spring context against Testcontainers, at roughly 45 seconds each — so give it a generous timeout or
-run it in the background rather than assume it has hung.
+All three clean. GateKeeper's count was confirmed by running its suite at the close of M7; AuthCore's
+and ledger-service's are unchanged since they were last run. ledger-service was not changed by M4, M5,
+M6 or M7. AuthCore's code was not changed either, and M7 did not touch it at all; its one M6 commit,
+`f345f8d`, is a README paragraph naming the deny-list key `authcore:revoked:jti:<jti>` as a
+cross-service contract, since the gateway now reads it. AuthCore's run takes over ten minutes — every
+test class starts its own Spring context against Testcontainers, at roughly 45 seconds each — so give
+it a generous timeout or run it in the background rather than assume it has hung.
 
 **GateKeeper's suite requires Redis.** Without it (measured with `-Dspring.data.redis.port=1`), the run
-reports `Tests run: 275, Failures: 54, Errors: 20`: 74 failures reported, one of them
-`TwoGatewaysShareOneLimitTest`'s setup standing for its four tests — 77 of 278 not passing, up from
-45 of 242 before M6. Most of the increase is correct behaviour: without Redis the revocation
-check refuses every bearer token with 503, so every test that expects a JWT to get through fails. By
-class: `AuthorizationTest` 13, `RedisRateLimitStoreTest` 11, `ApiKeyAuthenticationTest` 9,
-`RateLimitTest` 8, `IdentityPropagationTest` 7, `RedisApiKeyCacheTest` 5, `IntrospectionUnavailableTest`
-4, `RoutingTest` 4, `KeyRotationTest` 3, `RedisRevocationStoreTest` 3, `RevocationTest` 3,
-`JwtAuthenticationTest` 2, `ErrorShapeTest` 1, and `TwoGatewaysShareOneLimitTest` 1 (folded from 4).
-It reads like a regression and is not one. Start Redis first: `docker compose up -d redis` from the
-authcore directory.
+reports `Tests run: 320, Failures: 73, Errors: 21`: 94 failures reported, one of them
+`TwoGatewaysShareOneLimitTest`'s setup standing for its four tests — 97 of 323 not passing, up from
+77 of 278 before M7 and 45 of 242 before M6. The increase is correct behaviour: without Redis the
+revocation check refuses every bearer token with 503, so every test that expects a JWT to get through
+fails — and since M7 that includes every downstream resilience test, whose requests are refused before
+any downstream is called. By class: `AuthorizationTest` 13, `RedisRateLimitStoreTest` 11,
+`ApiKeyAuthenticationTest` 9, `RateLimitTest` 8, `DownstreamRetryTest` 8, `IdentityPropagationTest` 7,
+`DownstreamCircuitBreakerTest` 7, `RedisApiKeyCacheTest` 5, `IntrospectionUnavailableTest` 4,
+`RoutingTest` 4, `KeyRotationTest` 3, `RedisRevocationStoreTest` 3, `RevocationTest` 3,
+`JwtAuthenticationTest` 2, `DownstreamTimeoutTest` 2, `DownstreamUnreachableTest` 2, `ErrorShapeTest` 1,
+`DownstreamBulkheadTest` 1, and `TwoGatewaysShareOneLimitTest` 1 (folded from 4). It reads like a
+regression and is not one. Start Redis first: `docker compose up -d redis` from the authcore directory.
 
 **GateKeeper today:** three routes (`/api/accounts/**` and `/api/machine/**` to AuthCore with the path
 preserved, `/api/ledger/**` to ledger-service with `StripPrefix=1` and `X-API-Key` removed). A caller
@@ -86,19 +94,56 @@ AuthCore that is itself stuck. It refuses fast through the same pieces M5 built,
 beside the limiter's `rateLimitBreaker`, one `RedisCircuitBreaker` class — whose open state refuses. API
 keys are not deny-listed. The M6 design (`specs/2026-09-30-gatekeeper-m6-design.md`) is the reference;
 its section 11 records the live run, including recovery after a Redis restart taking 17.8 s, not about
-five, because of Lettuce's reconnect backoff (§5).
+five, because of Lettuce's reconnect backoff — fixed in M7 (§5).
 
-**Next: M7 — resilience**, the milestone plan's circuit breaker, per-route timeouts, bounded retry for
-idempotent GETs, and bulkheads, toward the downstreams: today a downstream that hangs holds gateway
-connections until the client gives up. One open item is already M7's: the JWKS fetch has no response
-timeout, so an AuthCore that accepts the connection and never answers hangs the request (§5). The
-Lettuce-backoff item in §5 is unowned, and M7 is a natural place for it. The gateway's two
-`RedisCircuitBreaker`s guard Redis calls only; M7's breakers toward the downstreams are a separate
-concern. Any endpoint M7 adds needs its own row in `RouteScopeAuthorizationManager`, or it is refused
-`NO_RULE`.
+Since M7 the gateway survives its dependencies being slow, sick or gone, through Spring Cloud Gateway's
+own `CircuitBreaker` and `Retry` route filters, backed by Resilience4j through Spring Cloud
+CircuitBreaker and configured from `gatekeeper.resilience` (`ResilienceProperties`, strictly bound).
+Every routed call has a 2 s connect and a 5 s response timeout — globally, and stated by each route in
+its `metadata` as **plain milliseconds**, because Spring Cloud Gateway silently ignores a non-numeric
+route timeout. One breaker per downstream service, `authcore` (both AuthCore routes) and `ledger`:
+a 20-call window judged after 10, opening at 50 %, open 10 s, 3 trial calls; while open, 503
+`DOWNSTREAM_UNAVAILABLE` with `Retry-After: 10`. It counts exactly three things —
+a `ConnectException`, the gateway's response timeout, and a downstream 502/503/504 — through
+`DownstreamFailures`, the single source of truth for what the breaker records and what
+`GlobalErrorWebExceptionHandler` maps. **The assumption it rests on, the M7 design's section 7:** a
+downstream 502/503/504 is an availability signal, counted, and replaced by the gateway's shape with
+`DOWNSTREAM_ERROR`, headers included; a 500 is the downstream's own answer and passes through untouched,
+never counted, so one caller cannot cut a service off for everyone — at the stated cost that an
+all-500 downstream never opens its breaker (§5). Everything else is neutral: the breaker records only
+availability failures and ignores every other exception, so a caller's own error or a bulkhead refusal
+counts neither for nor against the downstream — a final-review fix, since Resilience4j counts an
+exception it neither records nor ignores as a success. One retry, for GET only, 100 ms later, on a
+connect error, 502 or 503, inside the breaker and costing no second rate-limit token. A semaphore
+bulkhead per downstream, 50 in flight, refusing 503 `DOWNSTREAM_BUSY` with `Retry-After: 1`; a refusal
+has two guards, that ignore rule and an explicit `ignoreExceptions(BulkheadFullException)`, and removing
+either one alone is harmless by design. The JWKS fetch has a 2 s connect and response timeout, and an
+unreachable key set is now 503 `KEYS_UNAVAILABLE`, not 401 — a change from M2, made for the reason M3
+and M6 already gave. `JwksFetchLogging` logs it once per outage, judging a fetch by its body. Lettuce
+reconnects with full jitter from 100 ms up to 2 s. The M7 design
+(`specs/2026-10-03-gatekeeper-m7-design.md`) is the reference; its section 11 records what was built
+beyond the plan and the live run: ledger cut off after nine 502s and recovering on its own, a silent
+downstream answered 504 at about 5 s, a silent key set answered 503 at about 2 s, and recovery from a
+Redis restart in 0.55–5.96 s against M6's 17.8 s.
+
+**Next: M8 — audit and observability**, the milestone plan's per-request audit event (principal, tenant,
+route, status, latency) to Kafka `gateway.audit` through a reactive producer, Micrometer metrics
+(request rate, 401/403/429 counts, per-route latency percentiles, gateway overhead, circuit state), a
+Grafana dashboard, and W3C `traceparent` propagation so a trace spans gateway and downstream. Two open
+items in §5 are natural for it. The first is counting what M7 logs per request only at DEBUG or TRACE:
+bulkhead refusals, response timeouts, connect errors, counted statuses and open-breaker refusals are
+each one DEBUG line per request from Boot's error handler, which `GlobalErrorWebExceptionHandler`
+inherits, enabled with
+`logging.level.org.springframework.boot.webflux.autoconfigure.error.AbstractErrorWebExceptionHandler=DEBUG`;
+and Resilience4j's `CircuitBreakerStateMachine` logs "recorded … as failure" or "ignored …" at DEBUG;
+retries are visible only at TRACE on
+`org.springframework.cloud.gateway.filter.factory.RetryGatewayFilterFactory`, several lines per GET;
+breaker state changes are already WARN and INFO. The second is quieting Reactor Netty's per-request WARN
+on a timed-out key-set fetch. Any endpoint M8 adds — a metrics scrape, say — needs its own row in
+`RouteScopeAuthorizationManager`, or it is refused `NO_RULE`.
 
 Design and plan documents are in `docs/superpowers/specs/` and `docs/superpowers/plans/`. Milestone
-scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up.
+scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up from the repository.
 
 ---
 
@@ -118,7 +163,8 @@ scope for M3–M10 is in `GateKeeper-Implementation-Plan.md`, two levels up.
   contains spaces (`'D:\courses\My' is not recognized`). To start GateKeeper with arguments — two
   instances on different ports, say — build with `.\mvnw.cmd -o -q package -DskipTests` and run
   `java -jar target/gatekeeper-0.0.1-SNAPSHOT.jar --server.port=… …`.
-- **Never add a `Co-Authored-By` line.** Standing preference: it keeps Claude out of the contributors graph.
+- **Never add a `Co-Authored-By` line, or any tool attribution.** Standing rule: the repo owner is the
+  only contributor.
 - **Docker Desktop must be running** for AuthCore (Postgres + Redis):
   `docker compose up -d postgres redis` from the authcore directory. It stops often.
 - Heredocs with markdown content fail in this shell often enough that a file-writing tool is the
@@ -161,7 +207,7 @@ Three more, each of which cost a build:
 
 ---
 
-## 4. What M3–M6 build
+## 4. What M3–M7 build
 
 **M3 — API-key authentication.** An `X-API-Key` converter plus a reactive authentication manager,
 composed with JWT so *either* mechanism authenticates.
@@ -259,12 +305,31 @@ milestone plan, which the M6 design, section 12, records:
   signature and claims, a revoked token is simply an invalid one, refused before authorization, rate
   limiting and routing.
 
+**M7 — Resilience.** Resilience4j through the gateway's `CircuitBreaker` filter, per-route timeouts,
+a bounded retry for idempotent GETs only, and bulkheads. Kill a downstream: the circuit opens, the
+gateway fails fast, and it recovers when the downstream returns. **Built**, and demonstrated live with
+ledger-service stopped and started (the M7 design, section 11) — with these departures from the
+milestone plan, each in the M7 design:
+
+- **No `FallbackController`.** An open breaker is answered 503 `DOWNSTREAM_UNAVAILABLE` by
+  `GlobalErrorWebExceptionHandler`, like every other error. A fallback endpoint would be a new path
+  needing its own rule-table row and tests, to return nothing the handler cannot (section 6).
+- **One breaker per downstream service, not per route.** Both AuthCore routes share `authcore`, since
+  they reach one process (section 6).
+- **A downstream 500 never counts and passes through untouched**; 502/503/504 count and are replaced,
+  headers included (section 7).
+- **Configured from `gatekeeper.resilience`**, strictly bound, rather than Resilience4j's own loosely
+  bound `resilience4j.*` properties, where a misspelt key leaves a breaker silently on its defaults
+  (section 11).
+- **Two items it took over from §5:** the JWKS fetch's timeout, with an unreachable key set now 503
+  rather than 401 (section 4), and Lettuce's reconnect delay (section 3).
+
 ---
 
 ## 5. Deferred items these milestones inherit
 
-Found during M0–M6 and recorded rather than fixed. Each names the milestone that owns it, or says it
-has none.
+Found during M0–M7 and recorded rather than fixed, or closed by a later milestone and marked so. Each
+names the milestone that owns it, or says it has none.
 
 - ~~**M4 — the 403 path still has the empty-body gap that 401 lost.**~~ **Closed in M4.**
   `JsonServerAccessDeniedHandler` renders every 403 in the platform shape with a fixed `detail` and no
@@ -319,9 +384,13 @@ has none.
   subdomain returns as a tenant source that outranks `X-Tenant` (M4 design, section 5).
 - **AuthCore's concern — its own 403s have an empty body.** Observed in the M4 run. Recorded so nobody
   assumes the gateway's 403 shape extends past the gateway: a 403 with no body came from AuthCore.
-- **M7 — the JWKS fetch has no response timeout.** Spring Security's `ReactiveRemoteJWKSource` builds
-  a bare `WebClient.create()`, so a host that accepts the connection and never answers hangs the
-  request rather than failing closed. An active refusal is handled; a silent hang is not.
+- ~~**M7 — the JWKS fetch has no response timeout.**~~ **Closed in M7.** Spring Security's
+  `ReactiveRemoteJWKSource` built a bare `WebClient.create()`, so a host that accepted the connection
+  and never answered hung the request. `JwtDecoderConfig.jwksWebClient` now gives the decoder its own
+  `WebClient` with a 2 s connect and a 2 s response timeout (`gatekeeper.resilience.jwks-timeout`,
+  bounded to 1 ms–60 s), and any failed fetch is answered 503 `KEYS_UNAVAILABLE` with `Retry-After: 5`
+  instead of the former 401 — the M7 design, section 4. In the M7 run a silent key set was refused in
+  2.01–2.49 s. `JwksTimeoutTest` pins it.
 - **Do not "fix" `TenantRequiredException` in ledger-service.** It is unreachable in production:
   clearing the permission gate requires the `permissions` claim, and AuthCore writes `tenant`, `roles`
   and `permissions` inside one block, so a token carries all of them or none. It is a deliberate guard
@@ -337,7 +406,9 @@ Found during M5, by its reviews and its live run:
   run: with Redis stopped, requests through the gateway's AuthCore routes hung about 60 seconds and
   ended 401, and AuthCore called directly gave no answer in 15 seconds. The gateway's ledger route
   answered in 22–26 ms meanwhile. M6's revocation check must fail closed *fast*, not like this (§1).
-  It does: in the M6 run, JWT callers were refused 503 in 9–247 ms with Redis stopped.
+  It does: in the M6 run, JWT callers were refused 503 in 9–247 ms with Redis stopped. Since M7 the
+  gateway bounds AuthCore's hang at the route's 5 s response timeout, answering 504
+  `DOWNSTREAM_TIMEOUT`.
 - **Whoever next touches the API-key path — M3's cache on a Redis outage.** It uses the same template
   as the limiter and the revocation check, without their protections. Observed in the M5 run: an
   API-key caller hung with Redis stopped, waiting in Lettuce's disconnected buffer up to the command
@@ -366,11 +437,14 @@ Found during M5, by its reviews and its live run:
   to a replica with a skewed clock (M5 design, section 6).
 - **Unowned — a downstream sending `X-RateLimit-*` or `X-Quota-*` would duplicate the gateway's.**
   Spring Cloud Gateway appends downstream response headers to those a filter set. No downstream sends
-  them today; setting the headers in `beforeCommit` would fix it.
+  them today; setting the headers in `beforeCommit` would fix it. **Since M7 it has a second face** —
+  see the M7 list below.
 - **Unowned — the warm-up's timeout (2 s), the breakers' window (5 s) and their threshold (three
   consecutive failures) are constants, not properties**, and the warm-up does not run under lazy
   initialisation. Since M6 this covers two breakers, `rateLimitBreaker` and `revocationBreaker`, which
-  share the constants in `RedisCircuitBreaker`.
+  share the constants in `RedisCircuitBreaker`. Since M7 it covers Lettuce's reconnect delay too —
+  `RedisConfig.RECONNECT_DELAY`, full jitter from 100 ms to 2 s — a constant by design (M7 design,
+  section 3). M7's own values — timeouts, breakers, bulkheads — are all properties.
 - **Anyone deploying — rate-limit assignment keys cannot be set through environment variables.**
   Relaxed binding lowercases an environment variable and splits it on underscores, so a name like
   `demo-reporting-job` cannot be expressed. Use a mounted configuration file or
@@ -378,8 +452,14 @@ Found during M5, by its reviews and its live run:
 
 Found during M6, by its live run:
 
-- **Unowned (or M7) — Lettuce's reconnect backoff lengthens the revocation check's recovery.**
-  Observed in the M6 run: after Redis was started again, JWT callers kept getting 503 for 17.8 s, not
+- ~~**Unowned (or M7) — Lettuce's reconnect backoff lengthens the revocation check's recovery.**~~
+  **Closed in M7**, as its first task: `RedisConfig` sets `ClientResources.reconnectDelay` to full
+  jitter from 100 ms up to 2 s, through a `ClientResourcesBuilderCustomizer` (M7 design, section 3;
+  `ReconnectDelayTest`). In the M7 run, with Redis stopped for over 30 s and started twice, the gateway
+  reconnected 0.90 s and 0.48 s after `docker start`, and bearer tokens were served again at 5.96 s
+  (the revocation breaker had tripped: one window) and 0.55 s (it had not), against 17.8 s. AuthCore's
+  own client still backs off the old way — a new item below. The original finding, observed in the M6
+  run: after Redis was started again, JWT callers kept getting 503 for 17.8 s, not
   the five or so the design expected. The breaker probed every five seconds as designed, but its
   probes at 6.4 s and 12.1 s each timed out at about 220 ms, because the gateway had not reconnected:
   Lettuce's `ConnectionWatchdog` backs off between reconnect attempts — about 9, 8, 17 and then 30 s
@@ -392,6 +472,40 @@ Found during M6, by its live run:
   applies to the whole client, so it also changes the limiter's and M3's cache's reconnects (the M6
   design, section 11).
 
+Found during M7, by its design, its reviews and its live run:
+
+- **The downstreams, the repo owner to decide — a downstream whose every request fails with 500 never
+  opens its breaker.** The stated cost of the M7 design's section 7: a 500 is the downstream's own
+  answer, passed through and never counted, so that one caller cannot cut a service off for everyone.
+  A broken deployment, or a ledger-service whose database is down — Spring Boot answers that with
+  500 — is therefore never cut off; callers get prompt 500s, not hangs. The fix belongs in the
+  downstreams, which should answer 503 when a dependency they need is down. Not built in the gateway as
+  a "500 rate across all callers" rule.
+- **AuthCore's concern, the repo owner to decide — AuthCore's own Redis client still uses Lettuce's
+  default reconnect backoff.** Observed in the M7 run: its reconnect attempts came about 9, 8, 16 and
+  30 s apart, so after Redis returned the AuthCore routes were answered 504 `DOWNSTREAM_TIMEOUT` by the
+  gateway, AuthCore still hanging, for about 20 s and 31 s in two cycles — long after the gateway had
+  recovered — and those timeouts counted toward the `authcore` breaker. AuthCore should adopt the same
+  reconnect delay as the gateway (full jitter, 100 ms to 2 s). That is an AuthCore change, outside M7.
+- **M8 — Reactor Netty logs a WARN of its own on every timed-out key-set fetch** ("The connection
+  observed an error", with a `ReadTimeoutException`). Observed in the M7 run: the gateway's own WARN
+  appeared once over three requests to a silent key set, Reactor Netty's on each. So the log as a whole
+  is not one line per outage. Quieting the `reactor.netty.http.client.HttpClientConnect` logger is the
+  candidate fix.
+- **Unowned, pre-existing — a downstream echoing an `X-RateLimit-*` header can make the gateway's copy
+  disappear.** On a counted status (502/503/504) `GlobalErrorWebExceptionHandler` removes every header
+  the downstream added, by name, so a downstream sending one of the gateway's rate-limit header names
+  would take the gateway's own value with it on that error. No downstream sends them today. The fix is
+  to spare the names the gateway sets itself; it belongs with the duplicate-header item above.
+- **Accepted — breaker state is per instance.** Each gateway instance judges a downstream from its own
+  traffic, deliberately; nothing is shared through Redis, and M7 has no two-gateway test.
+- **Accepted — the bulkhead is covered by tests only, not by the live run.** Fifty concurrent requests
+  would need a load tool; `DownstreamBulkheadTest` covers it with a limit of two. M10's load test is the
+  natural place to see it live.
+- **Unowned — the JWKS connect timeout is not exercised by a test.** `JwksTimeoutTest` covers a key set
+  that accepts and never answers, and `UnreachableJwksErrorShapeTest` a refused connection; nothing
+  stages a host that never accepts the connection at all.
+
 ---
 
 ## 6. How M0–M2 was run, and why it is worth repeating
@@ -400,8 +514,8 @@ Every task got a `feature/task-N` branch off `master`, merged back with `git mer
 topology stays visible on GitHub. Two reviews per task — spec compliance first, then code quality —
 each by an independent agent explicitly told **not to trust the implementer's report**, followed by
 fix-and-re-review loops until clean. M4 used `feature/m4-task-N` because the `feature/task-N` names
-from M0–M3 still exist, M5 used `feature/m5-task-N` and M6 `feature/m6-task-N`; M7 should use
-`feature/m7-task-N`.
+from M0–M3 still exist, M5 used `feature/m5-task-N`, M6 `feature/m6-task-N` and M7
+`feature/m7-task-N`; M8 should use `feature/m8-task-N`.
 
 One practical note from M5: implementer subagents occasionally stalled, waiting on "background work"
 that had already ended, without reporting. When one goes quiet, check the branch — a reviewer can
@@ -413,12 +527,38 @@ rather than in the implementation.** Two techniques did most of the work:
 
 **Mutation testing.** Delete the line a test claims to cover, in a scratch copy, and confirm the test
 fails. This caught a key-rotation test that would have passed against a decoder with refresh-on-miss
-removed, and an anti-spoofing suite where four of five tests still passed with the strip filter
-deleted entirely. In M5 it caught a shared-tenant test that sent every user through one client, and so
-could not tell a tenant's bucket from a client's. In M6 all ten mutations were caught, one of them —
-the revocation `detail` leaking onto M3's 503 — by an assertion M6 added to M3's test; before the
-sweep, a dead-Redis timing test was found timing an already-open breaker, and passed a mutation that
-delayed every refusal by 1.5 s.
+removed, and an anti-spoofing suite where four of five tests still passed with the strip filter deleted
+entirely. In M5 it caught a shared-tenant test that sent every user through one client, and so could not
+tell a tenant's bucket from a client's. In M6 all ten mutations were caught, one of them — the
+revocation `detail` leaking onto M3's 503 — by an assertion M6 added to M3's test; before the sweep, a
+dead-Redis timing test was found timing an already-open breaker, and passed a mutation that delayed
+every refusal by 1.5 s. In M7 fourteen mutations were run, the bulkhead one in two variants, and all
+were caught but one: 6a, removing `ignoreExceptions(BulkheadFullException)` alone. It was recorded as
+surviving by design, the record predicate taken for a second guard. The final review found it was not
+one: without the explicit ignore, a refusal was neither recorded nor ignored, so it counted as a
+success, and no test looked at successes. The breaker now ignores every exception that is not an
+availability failure, the tests pin success counts, and three more mutations were run: removing only the
+new ignore predicate is caught by the CR/LF test (four successes, not none), the bulkhead test surviving
+it; removing both ignores is caught by the bulkhead test (four successes, not two); and removing only
+the explicit ignore survives by design, the two guards now genuinely equivalent. One mutation, counting
+a 500 on an AuthCore route, is caught only by `ProductionValuesTest`, because the behavioural 500 test
+exercises the ledger route.
+
+M7's reviews found three defects, each fixed with a test that pins it:
+
+- **The breaker counted every exception thrown inside the chain**, because Resilience4j records all of
+  them unless told otherwise — so a caller's own bad request, a claim with CR/LF answered 401, counted
+  against the downstream, and ten could have opened it for everyone. Fixed by `DownstreamFailures`
+  and `recordException(DownstreamFailures::isAvailabilityFailure)`.
+- **A caller's own error then counted as a success**, found in the final review: Resilience4j counts an
+  exception it neither records nor ignores as a success, so the same 401s padded the window and, in
+  half-open, could have closed the breaker without the downstream being reached; a bulkhead refusal
+  would have too, without its explicit ignore. Fixed by an ignore predicate, everything that
+  `DownstreamFailures.isAvailabilityFailure` does not match: a caller's own error is neutral. The CR/LF
+  test pins no successes, the bulkhead test exactly two.
+- **The JWKS logging judged a fetch by its status, not its body**, so a 200 carrying a login page was
+  refused 503 by the decoder with nothing logged, and could even log "answered again".
+  `JwksFetchLogging` now parses a 2xx body as a key set before calling it an answer.
 
 **Running the thing.** Booting the service and hitting it with `curl` found what reading the diff
 could not: a cross-tenant leak that the tests asserted was correct, a missing `WWW-Authenticate` on
@@ -426,6 +566,7 @@ two of three 401 paths, and a 403 branch that cannot occur in production at all.
 AuthCore itself hangs when Redis is down, and that a burst can be demonstrated only once each
 gateway's cold path — its first JWKS fetch or introspection — has been paid. In M6 it found that
 recovery from a Redis outage waits on Lettuce's reconnect backoff, more than three times the breaker's
-window in that run, which nothing in the suite exercises.
+window in that run, which nothing in the suite exercises. In M7 it found that AuthCore's own Redis
+client backs off the same way, and that Reactor Netty logs a WARN on every timed-out key-set fetch.
 
 A test that passes the moment you write it has proven nothing yet. Make it fail first, on purpose.
