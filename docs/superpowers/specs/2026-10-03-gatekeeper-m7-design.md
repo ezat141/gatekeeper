@@ -298,6 +298,75 @@ restore Lettuce's default reconnect delay; give both downstreams one breaker nam
 The bulkhead is not live-run — 50 concurrent requests would need a load tool; the limit-2 test covers
 it exactly, and the README says so.
 
+**As built.** Beyond the plan's text, four things. **`DownstreamFailures`** (in
+`com.gatekeeper.resilience`), added after review, is the single source of truth for what the breakers
+count and what `GlobalErrorWebExceptionHandler` maps: a `java.net.ConnectException`, the gateway's
+response timeout (a 504 `ResponseStatusException` caused by the gateway's `TimeoutException`), and a
+counted status (`CircuitBreakerStatusCodeException`). The breaker is configured with
+`recordException(DownstreamFailures::isAvailabilityFailure)`. Before that fix it counted every exception
+thrown inside the chain, so a caller's own bad request — a token claim with CR/LF, which fails Netty's
+header validation inside the routing filter and is answered 401 — could have opened the breaker for
+everyone; `aCallersBadRequestNeverCountsAgainstTheDownstream` pins that it no longer can. A bulkhead
+refusal is therefore kept from counting by **two independent guards**, the record predicate and
+`ignoreExceptions(BulkheadFullException)`, by design. **`com.gatekeeper.config.JwksFetchLogging`** judges a
+fetch by its **body**, parsed as a key set, not only by its status, so a 200 login page counts as a
+failure; the decoder is handed the same body either way. **`jwks-timeout` must be between 1 ms and
+60 s**: Netty treats a connect timeout of 0 as none, and takes whole milliseconds as an `int`. And
+`spring.cloud.circuitbreaker.resilience4j.blocking.enabled: false` turns off the unused blocking
+factory, which, run first for a downstream's name, would leave a default-configured breaker in the
+shared registry. `GlobalErrorWebExceptionHandler` was reshaped into one `Answer(status, detail,
+retryAfter)` per failure, and removes every downstream header from any error it renders.
+`DownstreamBulkheadTest` waits by polling WireMock for both held requests rather than for a fixed time,
+since a cold context made a fixed sleep racy. The suite went from 278 to **323** tests:
+`ReconnectDelayTest` 4, `ResiliencePropertiesTest` 8, `JwksTimeoutTest` 1, `JwksFetchLoggingTest` 4,
+`DownstreamTimeoutTest` 2, `DownstreamUnreachableTest` 2, `DownstreamCircuitBreakerTest` 7,
+`DownstreamFailuresTest` 5, `DownstreamRetryTest` 8, `DownstreamBulkheadTest` 1 and
+`ProductionValuesTest` 3; `UnreachableJwksErrorShapeTest` moved from 401 to 503. **Mutations:**
+fourteen, with the bulkhead mutation run in two variants, 6a (`ignoreExceptions` removed alone) and 6b
+(both guards removed). Every one was caught except 6a, which survives by design: the record predicate
+still keeps a refusal from counting, and 6b is caught. Mutation 1, a 500 added to an AuthCore route's
+`statusCodes`, is caught only by `ProductionValuesTest`, because the behavioural 500 test exercises the
+ledger route.
+
+**Live run, 2026-10-03**, against the real AuthCore, ledger-service and Redis, with the production
+values.
+
+1. **Ledger stopped** (a machine token on `GET /api/ledger/entries`, which ledger-service answered 200
+   `[]`): nine 502 `DOWNSTREAM_UNREACHABLE` in 0.13–0.20 s each, each including its one retry, then 503
+   `DOWNSTREAM_UNAVAILABLE` in 0.015–0.036 s with `Retry-After: 10`. The breaker opened at a 90.0 %
+   failure rate after nine failures, not ten, because the success just before the outage was in the
+   20-call window — correct breaker behaviour. One WARN: `Downstream ledger: circuit breaker opened
+   (CLOSED -> OPEN) at a 90.0% failure rate; its requests are refused 503 until a trial call succeeds`.
+   The AuthCore route answered 200 in 0.065 s throughout. Trial calls while ledger was still down
+   re-opened it, `(HALF_OPEN -> OPEN) at a 100.0% failure rate`. With ledger restarted, the first 200
+   came 0.2–1.6 s after ledger's "Started" line — ledger's own startup outlasted the 10 s open window —
+   logged `OPEN -> HALF_OPEN`, then `HALF_OPEN -> CLOSED` after three successful trials. The 502 and 503
+   bodies and headers had the platform shape, kept the rate-limit headers, and carried no downstream
+   header.
+2. **A downstream that never answers** (a second gateway, AuthCore pointed at a silent socket): ten 504
+   `DOWNSTREAM_TIMEOUT` in 5.02–5.63 s each, none retried, then 503 in 0.018 s. WARN: `Downstream
+   authcore: circuit breaker opened (CLOSED -> OPEN) at a 100.0% failure rate`.
+3. **A key set that never answers** (a third gateway, `jwk-set-uri` pointed at the silent socket): 503
+   `KEYS_UNAVAILABLE` with `Retry-After: 5` in 2.49 s for the first call, connection setup included,
+   then 2.01 s and 2.03 s. The gateway's WARN appeared once over three requests. **Reactor Netty also
+   logs its own WARN** ("The connection observed an error", with a `ReadTimeoutException`) on every
+   timed-out fetch, so the log as a whole is not one line per outage — an open item; quieting
+   `reactor.netty.http.client.HttpClientConnect` is a candidate for M8.
+4. **Redis stopped for over 30 s, then started, twice.** The gateway's Lettuce reconnected 0.90 s (cycle
+   A) and 0.48 s (cycle B) after `docker start`. In cycle A the revocation breaker had tripped, so the
+   revocation check recovered at 5.96 s — one breaker window; in cycle B it had not, and a ledger call
+   got 200 at 0.55 s. Against M6's 17.8 s. **But AuthCore's own Redis client still uses Lettuce's
+   default backoff**, with gaps of about 9, 8, 16 and 30 s, so the AuthCore routes got 504
+   `DOWNSTREAM_TIMEOUT` from AuthCore until it reconnected — about 20 s (cycle A) and about 31 s (cycle
+   B) after Redis returned — and those timeouts count toward the `authcore` breaker. A new open item,
+   AuthCore's concern: AuthCore should adopt the same reconnect delay. That is an AuthCore change,
+   outside M7, and the repo owner decides.
+5. **Suites.** With Redis: `Tests run: 323, Failures: 0, Errors: 0`. Without it
+   (`-Dspring.data.redis.port=1`): `Tests run: 320, Failures: 73, Errors: 21`;
+   `TwoGatewaysShareOneLimitTest` folds its four tests into one setup failure, so 97 of 323 do not pass
+   (94 − 1 + 4). Without Redis every bearer request is refused 503 by the revocation check, so every
+   downstream test fails — expected, not a regression.
+
 ---
 
 ## 12. Components

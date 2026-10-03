@@ -8,7 +8,7 @@ The thing worth understanding before anything else: **the gateway is a coarse fi
 
 That division is the whole design. A gateway that owns authorization becomes a single point of failure whose compromise unlocks everything behind it. This one enforces coarse, route-level authorization as defence in depth — **scope at the edge, permission and data ownership downstream** — and owns none of the decisions that matter to the data. Removing it costs a layer, not the boundary: two security checks exist only here for a ledger call — whether the *client application* was granted the scope, described under [Authorization at the edge](#authorization-at-the-edge), and whether the token has been [revoked](#revocation), which AuthCore enforces for its own routes and ledger-service does not check. The other thing that exists only here, [rate limiting](#rate-limiting), is a capacity control rather than a security one.
 
-**Scope:** this repository covers milestones M0–M6 — a reverse proxy that authenticates AuthCore-issued JWTs and API keys, refuses a revoked JWT on its next request at every instance, authorizes each request against a route-to-scope rule table and the token's tenant, limits each caller to its plan's rate and daily quota across every gateway instance sharing one Redis, and propagates the verified caller identity to downstreams. Resilience toward downstreams (M7) is planned and **not built**. [Known limitations](#known-limitations) and [Roadmap](#roadmap) say exactly where the line is.
+**Scope:** this repository covers milestones M0–M7 — a reverse proxy that authenticates AuthCore-issued JWTs and API keys, refuses a revoked JWT on its next request at every instance, authorizes each request against a route-to-scope rule table and the token's tenant, limits each caller to its plan's rate and daily quota across every gateway instance sharing one Redis, propagates the verified caller identity to downstreams, and survives its dependencies being slow, sick or gone: every wait is bounded, a failing downstream is cut off by its own circuit breaker, a slow one is held to its own bulkhead, and an idempotent read is retried once. Audit and observability (M8) are planned and **not built**. [Known limitations](#known-limitations) and [Roadmap](#roadmap) say exactly where the line is.
 
 ---
 
@@ -25,6 +25,7 @@ That division is the whole design. A gateway that owns authorization becomes a s
 - [The identity headers it stamps](#the-identity-headers-it-stamps)
 - [Rate limiting](#rate-limiting)
 - [Revocation](#revocation)
+- [Resilience](#resilience)
 - [Why reactive here, when ledger-service is not](#why-reactive-here-when-ledger-service-is-not)
 - [Testing](#testing)
 - [Known limitations](#known-limitations)
@@ -48,7 +49,7 @@ The gateway listens on `:8081`. Health is public:
 curl http://localhost:8081/actuator/health
 ```
 
-**It starts without AuthCore running.** `NimbusReactiveJwtDecoder.withJwkSetUri(...)` builds its key source lazily — nothing is fetched until the first request that actually needs a signature checked. An unreachable AuthCore is a per-request failure, not a startup failure, which is also why every test in this repository points `jwk-set-uri` at a WireMock stub rather than a real server. **It starts without Redis too**: the startup warm-up waits at most two seconds for Redis and logs a warning if it does not answer. Until it does, the limiter [fails open](#when-redis-fails-requests-go-through) and the revocation check [refuses every bearer token with `503`](#when-redis-cannot-answer-503).
+**It starts without AuthCore running.** `NimbusReactiveJwtDecoder.withJwkSetUri(...)` builds its key source lazily — nothing is fetched until the first request that actually needs a signature checked. An unreachable AuthCore is a per-request failure, not a startup failure — a bearer token that needs the key set is [refused `503`](#the-key-set-503-not-401) within about two seconds — which is also why every test in this repository points `jwk-set-uri` at a WireMock stub rather than a real server. **It starts without Redis too**: the startup warm-up waits at most two seconds for Redis and logs a warning if it does not answer. Until it does, the limiter [fails open](#when-redis-fails-requests-go-through) and the revocation check [refuses every bearer token with `503`](#when-redis-cannot-answer-503).
 
 Any request that is not health, with no token, is refused before routing is consulted:
 
@@ -83,7 +84,11 @@ docker compose up -d redis   # from the authcore repo
 | Rate limiting | A per-second token bucket per caller — tenant, client or API key — sized by the caller's plan, shared by every instance through Redis. Over it: `429` with a computed `Retry-After` |
 | Daily quotas | A per-caller request count per UTC day, checked in the same atomic Redis script as the bucket |
 | Fail-open limiter | A Redis failure lets requests through unlimited within 200 ms, rather than taking the gateway down with it |
-| JWKS trust anchor | Public keys fetched from AuthCore, never copied into configuration |
+| Downstream timeouts | A 2 s connect timeout and a 5 s response timeout on every routed call, each route stating its own. Past them: `502` or `504` in the platform shape |
+| Circuit breakers | One per downstream service, counting connect errors, timeouts and downstream `502`/`503`/`504` — never a `500`. Open: `503` at once, the downstream not called |
+| Bounded retry | A `GET` retried once, 100 ms later, on a connect error, `502` or `503`. Never a `POST`, a timeout or a `500`; never a second rate-limit token |
+| Bulkheads | At most 50 requests in flight to each downstream; beyond that, `503` at once, so a slow downstream cannot starve the other |
+| JWKS trust anchor | Public keys fetched from AuthCore, never copied into configuration — with a 2 s timeout, and `503` when the key set cannot be fetched |
 | Key rotation support | An unresolvable `kid` triggers a JWKS refetch, so a rotated key is picked up without redeploying |
 | Issuer pinning | Tokens from an unexpected `iss` are refused even when the signature is valid |
 | Identity propagation | Verified `sub`, `tenant`, and `permissions` stamped downstream as `X-GK-*`, for consumers that are not themselves resource servers |
@@ -91,7 +96,7 @@ docker compose up -d redis   # from the authcore repo
 | Stateless | No session, no CSRF token, and no durable state in the process — rate-limit counts and the API-key cache live in Redis, and nothing about revocation is remembered at all. Killable and restartable at any moment |
 | Public health | `/actuator/health` reachable without a credential, so liveness can be probed |
 
-**Stack:** Java 21 · Spring Boot 4.0.7 · Spring Cloud 2025.1.2 (Gateway 5.0.2) · Spring Security 7 reactive · Netty · WireMock
+**Stack:** Java 21 · Spring Boot 4.0.7 · Spring Cloud 2025.1.2 (Gateway 5.0.2, CircuitBreaker 5.0.2) · Resilience4j 2.3.0 · Spring Security 7 reactive · Netty · Lettuce · WireMock
 
 ### Why Boot 4.0.7 and not 4.1
 
@@ -127,7 +132,7 @@ graph TB
         DEC["ReactiveJwtDecoder<br/>signature · exp · issuer<br/>then the jti against the deny-list"]
         STAMP["IdentityStampFilter<br/>GlobalFilter · reads the verified Jwt<br/>sets X-GK-Subject · -Tenant · -Permissions"]
         RATE["RateLimitFilter<br/>GlobalFilter · the caller's plan<br/>token bucket + daily quota"]
-        ROUTE["Route predicates<br/>/api/accounts · /api/machine · /api/ledger"]
+        ROUTE["Route predicates<br/>/api/accounts · /api/machine · /api/ledger<br/>then per route: CircuitBreaker → Retry<br/>bulkhead · 2 s connect · 5 s response"]
     end
 
     A["AuthCore :8080<br/>issuer · JWKS"]
@@ -137,7 +142,7 @@ graph TB
     C -->|"Bearer JWT<br/>+ any X-GK-* the client invented"| STRIP
     STRIP --> SEC
     SEC --> DEC
-    DEC -.->|"GET /oauth2/jwks<br/>cached, refetched on unknown kid"| A
+    DEC -.->|"GET /oauth2/jwks<br/>cached, refetched on unknown kid<br/>2 s timeout · 503 if it cannot be fetched"| A
     DEC -.->|"EXISTS authcore:revoked:jti:…<br/>200 ms timeout · fails closed"| RD
     DEC -->|"valid, not revoked"| STAMP
     DEC -->|"Redis cannot answer"| R503["503 with Retry-After: 5<br/>detail REVOCATION_UNAVAILABLE"]
@@ -150,6 +155,7 @@ graph TB
 
     ROUTE -->|"/api/accounts/** · /api/machine/**<br/>path unchanged"| A
     ROUTE -->|"/api/ledger/** → /ledger/**<br/>StripPrefix=1"| L
+    ROUTE -->|"breaker open · bulkhead full<br/>timeout · unreachable · downstream 502/503/504"| R5XX["502 · 503 · 504 in the platform shape<br/>a downstream 500 passes through untouched"]
 
     C -.->|"gateway bypassed entirely"| L
     A -. "JWKS" .-> L
@@ -169,15 +175,15 @@ Defined declaratively in [`application.yml`](src/main/resources/application.yml)
 
 | Path at the gateway | Downstream | Filters | Path the downstream sees |
 |---|---|---|---|
-| `/api/accounts/**` | AuthCore `:8080` | none | `/api/accounts/**` — unchanged |
-| `/api/machine/**` | AuthCore `:8080` | none | `/api/machine/**` — unchanged |
-| `/api/ledger/**` | ledger-service `:8082` | `StripPrefix=1` | `/ledger/**` |
+| `/api/accounts/**` | AuthCore `:8080` | `CircuitBreaker` (`authcore`), `Retry` | `/api/accounts/**` — unchanged |
+| `/api/machine/**` | AuthCore `:8080` | `CircuitBreaker` (`authcore`), `Retry` | `/api/machine/**` — unchanged |
+| `/api/ledger/**` | ledger-service `:8082` | `CircuitBreaker` (`ledger`), `Retry`, `StripPrefix=1`, `RemoveRequestHeader=X-API-Key` | `/ledger/**` |
 
 The asymmetry is the interesting part, and it is deliberate. The gateway namespaces every downstream under `/api`, which gives callers one coherent surface. AuthCore already serves `/api/accounts` and `/api/machine` verbatim, so those paths forward untouched. ledger-service serves `/ledger/**` with no `/api` prefix of its own, so that leading segment has to be removed before forwarding.
 
 Getting this backwards fails in a way that is annoying to diagnose: a stripped AuthCore route produces a `404` from AuthCore rather than an error from the gateway, so the gateway looks fine and the downstream looks broken. Three of the four routing tests exist to pin exactly this — `StripPrefix` must apply to the ledger route and must not apply to the other two.
 
-An unmatched path never reaches routing; see [Deny by default](#deny-by-default).
+An unmatched path never reaches routing; see [Deny by default](#deny-by-default). What the `CircuitBreaker` and `Retry` filters do, and each route's timeout, is under [Resilience](#resilience).
 
 ---
 
@@ -445,7 +451,7 @@ The platform's error shape, with one of two fixed `detail` strings ([`RateLimitR
 | `RATE_LIMITED` | `the request rate exceeds the caller's plan` |
 | `QUOTA_EXCEEDED` | `the caller's daily quota is used up` |
 
-- **`Retry-After` is computed**, in whole seconds and at least `1`: the time to one token for `RATE_LIMITED`, the time to the next UTC midnight for `QUOTA_EXCEEDED`. A caller can act on it, unlike the fixed `5` on the `503`s the gateway returns when AuthCore cannot answer an introspection or Redis cannot answer a revocation check.
+- **`Retry-After` is computed**, in whole seconds and at least `1`: the time to one token for `RATE_LIMITED`, the time to the next UTC midnight for `QUOTA_EXCEEDED`. A caller can act on it, unlike the fixed `5` on the `503`s the gateway returns when AuthCore cannot answer an introspection or a key-set fetch, or Redis cannot answer a revocation check.
 - **No `WWW-Authenticate`.** The caller is authenticated; the answer is to wait.
 - **The downstream is never contacted.**
 - **Written in one place.** [`TooManyRequestsWriter`](src/main/java/com/gatekeeper/error/TooManyRequestsWriter.java) renders it through the same `ErrorBody` as the `401` and `403`, and the filter completes the response itself — no exception, no detour through the global error handler.
@@ -476,7 +482,7 @@ It was also run against the real platform: two GateKeeper processes on `:8081` a
 - **One burst.** A machine token, its client reassigned for this step to a tiny plan with a burst of 3, four requests alternating in 714 ms: `200`, `200`, `200`, then `429 RATE_LIMITED` with `Retry-After: 1` from `:8083`, which had itself seen only one earlier request. A first attempt took 1.7 s and never tripped: each gateway fetched AuthCore's JWKS on its first token, and a token refilled meanwhile. Demonstrating a burst needs the cold path paid first.
 - **Plans differ.** The machine client on `pro` showed `X-RateLimit-Burst-Capacity: 100`, `X-RateLimit-Replenish-Rate: 50` and `X-Quota-Limit: 100000`; the demo key on the tiny plan showed a burst of 3.
 - **Redis stopped.** The breaker logged one warning after a 200 ms timeout, and requests to ledger answered `200` in 22–26 ms with no rate-limit headers. Requests to the AuthCore routes hung for about 60 seconds and ended `401` — but that was AuthCore, which itself hangs when Redis is down (called directly, it gave no answer in 15 seconds). An API-key caller hung too, on M3's cache.
-- **Redis restarted.** Limiting resumed about 15 seconds later — Lettuce's reconnect backoff plus the breaker's window — and the breaker logged one line saying so.
+- **Redis restarted.** Limiting resumed about 15 seconds later — Lettuce's reconnect backoff plus the breaker's window — and the breaker logged one line saying so. Since M7 the gateway reconnects within about two seconds; see [Redis reconnects within two seconds](#redis-reconnects-within-two-seconds).
 
 To run two instances yourself, build the jar and start it twice:
 
@@ -544,7 +550,7 @@ No `WWW-Authenticate`: the token is not the problem. Either status would be a re
 - **It is M3's precedent** for the same situation — the gateway cannot complete a check that depends on another component — and M3 answers it `503` with `Retry-After: 5`.
 - **The `detail` tells the two `503`s apart.** M3's introspection `503` keeps its body unchanged, with no `detail`, and `IntrospectionUnavailableTest` pins that.
 
-`Retry-After: 5` is the breaker's window. The [live run](#against-the-real-platform) found that recovering from an outage can take several times that.
+`Retry-After: 5` is the breaker's window. The M6 [live run](#against-the-real-platform) found that recovering from an outage could take several times that, waiting on Lettuce's reconnect backoff; M7 [shortened the backoff](#redis-reconnects-within-two-seconds), and its run recovered within one window.
 
 ### Failing closed, fast
 
@@ -569,7 +575,7 @@ There is no default in code, as for the limiter: a missing, zero or negative tim
 - **If Redis is down at boot, JWT callers are answered `503` until it answers.** The warm-up still runs before the port binds and still never fails the boot; its warning names both consequences.
 - **During a Redis outage, JWT callers get fast `503`s while API-key callers still hang**, on M3's introspection cache — observed below, and recorded under [Known limitations](#known-limitations).
 - **A bearer token sent to `/actuator/health` is authenticated** even though the path is public, so during an outage it is answered `503`. An anonymous health probe is unaffected.
-- **Recovery waits for Lettuce to reconnect**, which can take several times the breaker's window — observed below. This applies to a connection that was established and then lost: if Redis is down at boot, nothing was ever connected, so the connection step's next attempt opens a fresh connection, and recovery takes at most one breaker window.
+- **Recovery waits for Lettuce to reconnect.** In M6 that took several times the breaker's window — observed below. Since M7 Lettuce waits at most two seconds between attempts, so recovery is about two seconds plus at most one breaker window; see [Redis reconnects within two seconds](#redis-reconnects-within-two-seconds). This applies to a connection that was established and then lost: if Redis is down at boot, nothing was ever connected, so the connection step's next attempt opens a fresh connection, and recovery takes at most one breaker window.
 
 ### Against the real platform
 
@@ -577,8 +583,191 @@ Run on 2026-10-02 against the real AuthCore, with the gateway started with `java
 
 - **Revoked, then refused.** A client-credentials token for `authcore-machine` with `payments:read` (`jti` `9a23e3ae-…`, a 600-second lifetime) got `200` on `GET /api/machine/payments`. `POST /oauth2/revoke` answered `200`, and the next call got `401` with `WWW-Authenticate: Bearer` and the body [above](#a-revoked-token-is-the-ordinary-401). Redis held `authcore:revoked:jti:9a23e3ae-6488-47bd-9b58-3c06018cf32c` with a TTL of about 588 seconds.
 - **Redis stopped.** Ten JWT calls were all `503`: the first three in 0.247, 0.229 and 0.228 seconds — the 200 ms timeout — and the next seven in 9–32 ms, with the breaker open. The ledger route answered `503` with `Retry-After: 5`, no `WWW-Authenticate`, and the `REVOCATION_UNAVAILABLE` body [above](#when-redis-cannot-answer-503). The breaker logged one warning — `Revocation check: Redis failed 3 times in a row; refusing bearer-token requests with 503 for 5 s at a time until it answers` — with the `TimeoutException` stack trace as its cause, by design. An API-key caller hung until curl's 15-second limit, as M3's open item predicts.
-- **Redis restarted: recovery took 17.8 seconds, not about five.** JWT calls stayed `503` until 17.8 seconds after Redis was up. The breaker probed every five seconds as designed, but its probes at 6.4 and 12.1 seconds each timed out at about 220 ms, because the gateway had not yet reconnected. Lettuce's `ConnectionWatchdog` backs off between reconnect attempts — during this outage they came about 9, 8, 17 and then 30 seconds apart — and the last one reconnected 17 seconds after Redis was up. The breaker closed right after it, logging `Revocation check: Redis answered again; breaker closed`. **So recovery is Lettuce's reconnect delay, which grows with the outage's length up to about 30 seconds, plus up to one breaker window, and JWT callers are refused `503` throughout.** The limiter has the same delay — M5's run saw limiting resume about 15 seconds after a restart — but there it only means requests go unlimited a little longer; here it means refusals. A shorter reconnect delay, Lettuce's `ClientResources.reconnectDelay`, would shorten it; it applies to the whole client, and was deliberately not changed in M6.
+- **Redis restarted: recovery took 17.8 seconds, not about five.** JWT calls stayed `503` until 17.8 seconds after Redis was up. The breaker probed every five seconds as designed, but its probes at 6.4 and 12.1 seconds each timed out at about 220 ms, because the gateway had not yet reconnected. Lettuce's `ConnectionWatchdog` backs off between reconnect attempts — during this outage they came about 9, 8, 17 and then 30 seconds apart — and the last one reconnected 17 seconds after Redis was up. The breaker closed right after it, logging `Revocation check: Redis answered again; breaker closed`. **So recovery is Lettuce's reconnect delay, which grows with the outage's length up to about 30 seconds, plus up to one breaker window, and JWT callers are refused `503` throughout.** The limiter has the same delay — M5's run saw limiting resume about 15 seconds after a restart — but there it only means requests go unlimited a little longer; here it means refusals. A shorter reconnect delay, Lettuce's `ClientResources.reconnectDelay`, would shorten it; it applies to the whole client, and was deliberately not changed in M6. **M7 made that change**, and its run recovered in 0.55 to 5.96 seconds — see [Redis reconnects within two seconds](#redis-reconnects-within-two-seconds).
 - **After recovery**, the token revoked earlier was still `401`: the deny-list survived the Redis restart.
+
+---
+
+## Resilience
+
+M6 made the gateway refuse what it cannot verify. M7 makes it survive its dependencies being slow, sick or gone. A downstream that hangs no longer holds a request indefinitely; a downstream that keeps failing is cut off for a while instead of being asked again and again; a downstream that is merely slow cannot use up the gateway's capacity for the other one; and the two dependencies the gateway itself needs — AuthCore's key set and Redis — fail fast and recover fast. The M7 design (`docs/superpowers/specs/2026-10-03-gatekeeper-m7-design.md`) is the reference for all of it.
+
+It is built from Spring Cloud Gateway's own `CircuitBreaker` and `Retry` route filters, backed by Resilience4j through Spring Cloud CircuitBreaker, and configured from the gateway's own `gatekeeper.resilience` properties ([`ResilienceProperties`](src/main/java/com/gatekeeper/resilience/ResilienceProperties.java), [`ResilienceConfig`](src/main/java/com/gatekeeper/resilience/ResilienceConfig.java)). Every answer the gateway produces for these cases is the platform's JSON error shape with a fixed `detail`, rendered by `GlobalErrorWebExceptionHandler` — [the table below](#the-responses). AuthCore and ledger-service were not changed.
+
+### Every wait has a bound
+
+| Wait | Bound | Past it |
+|---|---|---|
+| Connecting to a downstream | 2 s, for every route | `502 DOWNSTREAM_UNREACHABLE`, after one retry for a `GET` |
+| A downstream's response | 5 s, stated by each route; 5 s globally as the safety net | `504 DOWNSTREAM_TIMEOUT` |
+| Fetching AuthCore's key set | 2 s to connect, 2 s to answer | `503 KEYS_UNAVAILABLE` |
+| Redis, for the limiter and the revocation check | 200 ms, since M5 and M6 | unchanged: fail open, fail closed |
+
+**Global defaults, and each route its own.** The gateway's HTTP client has a 2 s connect timeout and a 5 s response timeout, so no route added later can go without a bound. Each route also states its own response timeout in its `metadata`, referring to a property named by the route's id, so `application.yml` shows every route's budget and a test overrides it by name:
+
+```yaml
+spring.cloud.gateway.server.webflux:
+  httpclient:
+    connect-timeout: 2000
+    response-timeout: 5s
+  routes:
+    - id: ledger
+      metadata:
+        response-timeout: ${gatekeeper.resilience.response-timeout-millis.ledger}
+
+gatekeeper:
+  resilience:
+    jwks-timeout: 2s
+    response-timeout-millis:
+      authcore-accounts: 5000
+      authcore-machine: 5000
+      ledger: 5000
+```
+
+**A route's timeout must be a plain number of milliseconds.** Spring Cloud Gateway 5.0.2's `NettyRoutingFilter` parses a route's `response-timeout` with `Long.parseLong` and silently ignores anything else, so `5s` there would quietly fall back to the global value, and nothing would say so. `ResilienceProperties` holds the values as numbers and refuses a zero or negative one, and `ProductionValuesTest` parses each route's metadata as a number. The global `response-timeout` binds as a duration, so `5s` is right there.
+
+**5 s, because both downstreams answer in milliseconds**: generous, not unbounded. The connect timeout is shorter because a refused or silent connect needs no long wait. **A timeout is `504` with no `Retry-After`**: for a `POST` the outcome is unknown — the downstream may have processed it — and `504` says exactly that.
+
+**The TimeLimiter is off.** Spring Cloud CircuitBreaker's Resilience4j default wraps each call in a 1 s TimeLimiter, which would cut requests at one second, well before the routes' five; `spring.cloud.circuitbreaker.resilience4j.disable-time-limiter: true` leaves the gateway's own response timeout in charge. The unused blocking circuit-breaker factory is off too (`...resilience4j.blocking.enabled: false`): if it ever ran first for a downstream's name, the shared registry would keep a breaker with default configuration.
+
+### One circuit breaker per downstream
+
+Two breakers: **`authcore`**, shared by the `authcore-accounts` and `authcore-machine` routes, and **`ledger`**. A breaker protects against a sick *service*, and both AuthCore routes reach the same process: when it is down, both are, and a breaker per route would make the second route rediscover the outage request by request. One global breaker would let a sick downstream cut off the healthy one.
+
+| Setting | Value |
+|---|---|
+| Window | the last 20 calls, count-based |
+| Judged after | at least 10 calls |
+| Opens at | 50 % failures |
+| Stays open | 10 s |
+| Then lets through | 3 trial calls, which decide whether it closes |
+
+**While open, a request is answered at once without calling the downstream:** `503` with `"detail":"DOWNSTREAM_UNAVAILABLE"` and `Retry-After: 10`, the open window in whole seconds — an upper bound, since the window may be partly over. There is no `FallbackController`, though the milestone plan suggested one: a fallback endpoint would be a new path, needing its own row in the rule table and its own tests, to return nothing the error handler cannot.
+
+**What counts as a failure — exactly three things, and nothing else:**
+
+- **a connect error**, a `java.net.ConnectException` — a refused connection, or the 2 s connect timeout;
+- **the gateway's response timeout**, a `504` `ResponseStatusException` caused by the gateway's own `TimeoutException`;
+- **a downstream `502`, `503` or `504`**, the route's `statusCodes`, which the breaker filter raises as a `CircuitBreakerStatusCodeException`.
+
+[`DownstreamFailures`](src/main/java/com/gatekeeper/resilience/DownstreamFailures.java) is the single source of truth for both sides: the breaker is configured with `recordException(DownstreamFailures::isAvailabilityFailure)`, and the error handler maps from the same three predicates. It exists because of a review finding. Resilience4j records *every* exception thrown inside the chain unless told otherwise, and not every exception thrown there is the downstream's. A token whose claim contains a CR or LF fails Netty's header validation when the gateway copies the stamped header onto the outbound request — inside the routing filter, so inside the breaker — and the caller is answered `401`. Before the fix each one counted against the downstream, and ten of them could have opened the breaker for every caller. `aCallersBadRequestNeverCountsAgainstTheDownstream` pins that it no longer can. An exception that is neither recorded nor ignored counts as a success, which is what a caller's own failure should be to the downstream's breaker.
+
+**Breaker state is per instance.** Each gateway instance judges a downstream from its own traffic, deliberately; nothing is shared through Redis, and M7 has no two-gateway test.
+
+### The assumption behind what counts
+
+The breaker's behaviour rests on one assumption, stated here plainly because everything above depends on it.
+
+**A downstream `502`, `503` or `504` is an availability and infrastructure signal.** It says "I cannot serve right now", whatever was asked: `503` — overloaded, restarting, in maintenance; `502` and `504` — the downstream's own upstream, a proxy or a database or a dependency, failed or was too slow. The same request a little later is expected to succeed. That is what a breaker exists to detect, so these **count as failures**. Their bodies carry nothing the caller can act on, so they are **replaced by the gateway's error shape**, keeping the downstream's status, with `"detail":"DOWNSTREAM_ERROR"`. **The replacement covers the headers too.** In Spring Cloud Gateway 5.0.2 the downstream's headers are already on the response when the breaker raises its error, and Boot's error handler does not clear them, so a `Set-Cookie` or `Content-Encoding` from the downstream would otherwise ride on the gateway's error. The gateway records which headers came from the downstream, and the handler removes every one of them from any error it renders. Headers the gateway set itself, such as the rate limiter's, stay.
+
+**A downstream `500` is an application-level response owned by the downstream.** It says "this request hit an error" — usually a defect triggered by specific input. So it **passes through untouched** — the downstream's own status, headers and body, byte for byte — and **never counts**:
+
+1. **One caller must not be able to cut a service off for everyone.** With the values above, a single client sending ten requests that trigger a `500`, by accident or on purpose, could open the breaker, and every caller of that downstream would be refused `503` for ten seconds. The gateway would be amplifying one client's bad requests into an outage.
+2. **The downstream's diagnostics would be lost.** The gateway replaces a counted status's body; a `500`'s body is the downstream's account of what went wrong, and it reaches the caller as is.
+3. **It is not transient.** A defect repeats, which is also why a `500` is never retried.
+
+**The cost, stated:** a downstream whose *every* request fails with `500` — a broken deployment, or a database outage that surfaces as `500` — never opens its breaker. Spring Boot answers an unhandled database error with `500`, so a ledger-service whose database is down looks like this today. Callers still get prompt `500`s rather than hangs, and the timeouts and the bulkhead still bound the damage. The proper fix is in the downstream, which should answer `503` when a dependency it needs is down; it is recorded under [Known limitations](#known-limitations) rather than built here as a "500 rate across all callers" rule.
+
+### One retry, for GET only, inside the breaker
+
+```yaml
+filters:
+  - name: CircuitBreaker
+    args:
+      name: ledger
+      statusCodes: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
+  - name: Retry
+    args:
+      retries: 1
+      methods: GET
+      statuses: BAD_GATEWAY,SERVICE_UNAVAILABLE
+      series:
+      exceptions: java.net.ConnectException
+      backoff:
+        firstBackoff: 100ms
+        maxBackoff: 100ms
+        factor: 1
+        basedOnPreviousValue: false
+```
+
+- **`GET` only.** A `POST`, and every other method, is never retried.
+- **Retried:** a connect error — the request never reached the downstream — and a downstream `502` or `503`, usually momentary: a restart, an overload.
+- **Not retried:** a timeout or a `504`, because the downstream may still be working on it and a retry would double the wait; and a `500`, because a defect repeats.
+- **Once, after 100 ms.** A caller waits a few hundred milliseconds more at worst, never twice the timeout.
+- **The exception list is explicit.** The `Retry` filter's defaults retry `IOException` *and* the gateway's `TimeoutException`, matching either the error or its cause, so left at the defaults it would retry every response timeout. `series` is empty so that only the two listed statuses are retried, not the whole 5xx range.
+- **Inside the breaker.** Every route lists `CircuitBreaker` first and `Retry` second, so the breaker sees one outcome per client request — a request that succeeds on its retry is one success — and while the breaker is open nothing is retried.
+- **One rate-limit token per client request.** `RateLimitFilter` is a `GlobalFilter` that runs before the route filters, so a retry never passes through it again.
+
+### A bulkhead per downstream
+
+The breaker answers failure; a bulkhead answers *slowness*. A downstream answering in 4.9 seconds — inside its timeout — never trips the breaker, yet could fill the gateway with waiting requests while the other downstream starves.
+
+- **A Resilience4j semaphore bulkhead per downstream**, named like the breakers, `authcore` and `ledger`, through Spring Cloud CircuitBreaker's own reactive bulkhead support, which applies it inside the breaker and keys it by the breaker's name. It needs `resilience4j-bulkhead` on the classpath, which the starter does not bring.
+- **At most 50 requests in flight per downstream.** Beyond that a request is refused at once, without waiting: `503` with `"detail":"DOWNSTREAM_BUSY"` and `Retry-After: 1`.
+- **A refusal never counts against the breaker**: the downstream did not fail; the gateway chose not to call it. **Two independent guards make sure of it, by design.** The record predicate does not match a `BulkheadFullException`, and the breaker is also configured with `ignoreExceptions(BulkheadFullException.class)`. The mutation sweep confirmed the design: removing either guard alone leaves every test green, and removing both is caught by `DownstreamBulkheadTest`. Either guard can be changed later — the predicate widened, or the ignore list rewritten — without refusals starting to count.
+
+Reactor Netty's per-address connection-pool limits were the alternative, and were rejected: they are tied to a host and port rather than a service, a refusal would need a mapping of its own, and it would count as a breaker failure unless excluded.
+
+**The bulkhead is covered by tests only, not by the live run.** Fifty concurrent requests would need a load tool; `DownstreamBulkheadTest` sets the limit to two and covers it exactly.
+
+### The key set: 503, not 401
+
+`JwtDecoderConfig` gives the decoder its own `WebClient`, with a 2 s connect timeout and a 2 s response timeout (`gatekeeper.resilience.jwks-timeout`) — the same budget as M3's introspection call. Before M7, Spring Security's bare `WebClient` meant an AuthCore that accepted the connection and never answered hung the request. The connect timeout matters as well as the response timeout: without it, a host that never accepts the connection would wait for the operating system's own connect timeout, which can exceed 20 seconds. `jwks-timeout` must lie between 1 ms and 60 s, because Netty takes whole milliseconds as an `int` and treats a connect timeout of zero as none at all.
+
+**A fetch that fails — refused, silent, or answering something that is not a key set — is now `503`**, with `Retry-After: 5`, `"detail":"KEYS_UNAVAILABLE"` and no `WWW-Authenticate`. **This changes behaviour that dated from M2**, when an unreachable key set was answered `401` so as not to advertise that the identity provider was down. Since then M3 (introspection) and M6 (revocation) chose `503` for the same situation, for a reason that applies here equally: a `401` tells a client to discard a token that is very likely valid and refresh it — against AuthCore, the very thing that is down — which turns an outage into a refresh storm. All three "a dependency could not answer" cases now answer alike. The cost — the response reveals that the issuer is unreachable — M3 and M6 had already accepted.
+
+The key set is cached, so a fetch happens only on a cold start, a token with an unknown `kid`, or a cache refresh: most requests during an AuthCore outage never fetch at all.
+
+**The fetch is logged once per outage.** [`JwksFetchLogging`](src/main/java/com/gatekeeper/config/JwksFetchLogging.java), a filter on that `WebClient`, logs WARN on the first failed fetch after a success, DEBUG for further failures, and INFO when a fetch succeeds again. **It judges a fetch by its body, not only its status** — a review finding: the first version called any `2xx` a success, so a `200` carrying a login page, malformed JSON or a stalled body was refused `503` by the decoder with nothing logged, and could even log "answered again". It now reads a `2xx` body, parses it as a key set the way the decoder will, and only then calls it an answer. The decoder is handed the same body either way.
+
+### Redis reconnects within two seconds
+
+M6's live run found the revocation check refusing every bearer token for 17.8 seconds after Redis came back, waiting for Lettuce's reconnect backoff, which grows exponentially up to 30 seconds. [`RedisConfig`](src/main/java/com/gatekeeper/redis/RedisConfig.java) now sets the client's reconnect delay: **exponential from 100 ms, capped at 2 s, with full jitter**.
+
+- The gateway reconnects within about two seconds of Redis returning, and the revocation breaker's next probe — at most one five-second window later — closes it: about seven seconds at worst, instead of 35.
+- During an outage each instance attempts about once every two seconds, which is negligible; jitter keeps several instances from reconnecting in lockstep.
+- It is client-wide: the rate limiter, the API-key cache and the revocation check all recover faster.
+- A Redis that accepts and never answers is unchanged: each attempt is still bounded by Lettuce's handshake timeout, and the breakers protect requests meanwhile.
+- It is a constant, not a property; nothing needs another value.
+
+### The responses
+
+| Situation | Status | `detail` | `Retry-After` |
+|---|---|---|---|
+| Breaker open | `503` | `DOWNSTREAM_UNAVAILABLE` | `10`, the open window |
+| Bulkhead full | `503` | `DOWNSTREAM_BUSY` | `1` |
+| Response timeout | `504` | `DOWNSTREAM_TIMEOUT` | — |
+| Connect error — refused, or the 2 s connect timeout — after the one `GET` retry | `502` | `DOWNSTREAM_UNREACHABLE` | — |
+| Downstream answered `502`, `503` or `504` — after the `GET` retry for `502` and `503` | the same | `DOWNSTREAM_ERROR` | — |
+| Downstream answered `500`, or any other status | passed through untouched | — | — |
+| Key set unreachable or silent | `503` | `KEYS_UNAVAILABLE` | `5` |
+
+```http
+HTTP/1.1 503 Service Unavailable
+Retry-After: 10
+Content-Type: application/json
+
+{"error":"service_unavailable","status":503,"path":"/api/ledger/entries","detail":"DOWNSTREAM_UNAVAILABLE"}
+```
+
+Every gateway-generated row is the platform shape, `{"error","status","path","detail"}`, and none carries `WWW-Authenticate`, since none is a `401`. A routed request's errors keep the rate limiter's headers and carry none of the downstream's. Before M7 a connect error reached Boot's handler unmapped and read as a `500`; it is now a deliberate `502`. `GlobalErrorWebExceptionHandler` was reshaped for this: each failure it recognises maps to one `Answer(status, detail, retryAfter)`.
+
+### Logging
+
+The rule of M5 and M6: log **state changes**, not requests.
+
+- **Breakers:** WARN when one opens, naming it and its failure rate — `Downstream ledger: circuit breaker opened (CLOSED -> OPEN) at a 90.0% failure rate; its requests are refused 503 until a trial call succeeds` — and INFO when it goes half-open and when it closes. The listener is registered once per breaker, so an opening is one line however many requests follow.
+- **Timeouts, connect errors, retries and bulkhead refusals:** not logged per request by the gateway. They happen under load or during an outage, so a line per request would flood the log exactly when it matters; the breaker's WARN reports the outage, and M8 will count them.
+- **The key set:** WARN once per outage, DEBUG after, INFO on recovery — above. **Reactor Netty adds its own WARN on every timed-out fetch**, though: see [Known limitations](#known-limitations).
+
+### Against the real platform
+
+Run on 2026-10-03 against the real AuthCore, ledger-service and Redis, with the gateway started with `java -jar` and the production values.
+
+- **Ledger stopped.** A machine token on `GET /api/ledger/entries`, which ledger-service answered `200 []` beforehand. With ledger-service stopped: nine `502 DOWNSTREAM_UNREACHABLE` in 0.13–0.20 seconds each, each including its one retry, then `503 DOWNSTREAM_UNAVAILABLE` in 0.015–0.036 seconds with `Retry-After: 10`. The breaker opened at a 90.0 % failure rate after **nine** failures, not ten: the window needs ten calls before it judges, and the success just before the outage was one of them — correct breaker behaviour. It logged one WARN, the line quoted [above](#logging). The AuthCore route answered `200` in 0.065 seconds throughout. Trial calls while ledger was still down re-opened it, logged as `(HALF_OPEN -> OPEN) at a 100.0% failure rate`. With ledger-service started again, the first `200` came 0.2–1.6 seconds after ledger's "Started" line — ledger's own startup outlasted the 10-second open window — logged as `OPEN -> HALF_OPEN`, then `HALF_OPEN -> CLOSED` after three successful trials. The `502` and `503` bodies and headers had the platform shape, kept the rate-limit headers, and carried no header from the downstream.
+- **A downstream that never answers.** A second gateway with AuthCore pointed at a socket that accepts and never answers: ten `504 DOWNSTREAM_TIMEOUT` in 5.02–5.63 seconds each, none retried, then `503` in 0.018 seconds. WARN: `Downstream authcore: circuit breaker opened (CLOSED -> OPEN) at a 100.0% failure rate`.
+- **A key set that never answers.** A third gateway with `jwk-set-uri` pointed at the silent socket: `503 KEYS_UNAVAILABLE` with `Retry-After: 5` in 2.49 seconds for the first call, connection setup included, then 2.01 and 2.03 seconds — where before M7 it hung. The gateway's WARN appeared once over the three requests. **Reactor Netty logged its own WARN on every one** ("The connection observed an error", with a `ReadTimeoutException`), so the log as a whole is not one line per outage — an open item.
+- **Redis stopped for over 30 seconds, then started, twice.** The gateway's Lettuce reconnected **0.90 seconds** (first cycle) and **0.48 seconds** (second) after `docker start`, against 17 seconds in M6. In the first cycle the revocation breaker had tripped, so the revocation check recovered at **5.96 seconds** — one breaker window. In the second it had not, and a ledger call got `200` at **0.55 seconds**. Against M6's 17.8 seconds. **AuthCore's own Redis client still uses Lettuce's default backoff**, though — its reconnect attempts came about 9, 8, 16 and 30 seconds apart — so the AuthCore routes were answered `504 DOWNSTREAM_TIMEOUT` by the gateway, AuthCore hanging, until AuthCore reconnected: about 20 seconds (first cycle) and about 31 seconds (second) after Redis returned. Those timeouts count toward the `authcore` breaker, as any timeout does. AuthCore adopting the same reconnect delay is AuthCore's change to make, outside M7, and recorded as an open item.
 
 ---
 
@@ -612,7 +801,7 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 ./mvnw test
 ```
 
-**278 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services. Redis does not have a stand-in: the tests that exercise an API key, the rate limiter's script or the deny-list need a real one, started as shown in the [Quickstart](#quickstart), and since M6 so does every test that sends a bearer token, because without Redis the revocation check refuses it `503`. Without Redis, 77 of the 278 fail or never run (45 of 242 before M6, 23 before M5) — a missing container, not a defect, and the new failures are the check refusing correctly. The fail-open and fail-closed tests pass either way, because they bring their own dead or silent Redis.
+**323 tests.** WireMock stands in for AuthCore's JWKS and introspection endpoints and for the downstream services; a plain `ServerSocket` that accepts and never answers stands in for a silent key set. Redis does not have a stand-in: the tests that exercise an API key, the rate limiter's script or the deny-list need a real one, started as shown in the [Quickstart](#quickstart), and since M6 so does every test that sends a bearer token, because without Redis the revocation check refuses it `503`. Without Redis, 97 of the 323 fail or never run (77 of 278 before M7, 45 of 242 before M6, 23 before M5) — a missing container, not a defect. M7's share is every downstream resilience test, since each sends a bearer token that the revocation check correctly refuses before any downstream is called. The fail-open and fail-closed tests pass either way, because they bring their own dead or silent Redis.
 
 **Routing and startup**
 
@@ -628,6 +817,8 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 | `JwtAuthenticationTest` | 7 | No token, valid token, expired token, wrong issuer, bad signature, unknown `kid`, public health |
 | `KeyRotationTest` | 3 | A token minted before a rotation still validates while the retiring key is published — the property that makes rotation zero-downtime |
 | `IdentityPropagationTest` | 7 | Verified claims stamped downstream; forged headers overwritten; casing variants stripped; absent claims produce no header; the spoof stamping cannot mask |
+| `JwksTimeoutTest` | 1 | A key set that accepts the connection and never answers: `503 KEYS_UNAVAILABLE` with `Retry-After: 5` and no `WWW-Authenticate`, within three seconds at a 300 ms timeout, rather than a hang; the WARN logged exactly once, which fails if the logging filter is not wired into the decoder's `WebClient` |
+| `JwksFetchLoggingTest` | 4 | One WARN over three failed fetches and one INFO on recovery; a non-`2xx` answer is a failure; a `200` whose body is not a key set is a failure, and the decoder is still handed that exact body; a valid empty key set after a failure is an answer |
 
 **API keys**
 
@@ -655,7 +846,7 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 | Class | Tests | Covers |
 |---|---|---|
 | `ErrorShapeTest` | 2 | One JSON shape — `error`, `status`, `path` — whichever layer refused the request |
-| `UnreachableJwksErrorShapeTest` | 1 | An unreachable JWKS reads as a `401`, not the `500` it used to. Separate from `ErrorShapeTest` because one class cannot register two values for `jwk-set-uri` |
+| `UnreachableJwksErrorShapeTest` | 1 | A refused JWKS fetch reads as `503` with `Retry-After: 5`, the `KEYS_UNAVAILABLE` detail and no `WWW-Authenticate`; it was a `401` before M7, and an unmapped `500` before that. Separate from `ErrorShapeTest` because one class cannot register two values for `jwk-set-uri` |
 | `JsonServerAccessDeniedHandlerTest` | 7 | Each reason renders as its own `detail`; a plain denial gets the generic `detail`, never its exception message; no `WWW-Authenticate` on a `403` |
 | `TooManyRequestsWriterTest` | 3 | The `429` body in the platform shape with the given `detail` and headers; no `WWW-Authenticate`; the content type stays JSON whatever headers the caller passes |
 
@@ -693,8 +884,22 @@ Using the reactive type is not by itself enough. M5 found that `ReactiveStringRe
 | `RedisConnectionStepTest` | 4 | One connection attempt at a time: callers who give up neither cancel nor repeat it; a success is kept, a failure is retried, an empty ping is retried |
 | `RedisCircuitBreakerTest` | 15 | Opens on three consecutive failures and not on one, any success resetting the count and the count starting again after it closes; denies for the window, lets exactly one caller probe, closes only on the probe's success, re-opens at once on a failed probe, and opens once — not hundreds of times — when answers arrive around the timeout; its opening and closing lines name its consumer and what that consumer does while it is open |
 | `RedisWarmUpTest` | 3 | The startup ping returns within its bound when Redis never answers, quietly when it fails, and after one ping when it answers |
+| `ReconnectDelayTest` | 4 | Over forty attempts the reconnect delay never exceeds two seconds nor falls below 100 ms; it backs off exponentially from 100 ms; it is jittered; and the context's `LettuceConnectionFactory` actually uses it, not Lettuce's default |
 
-Current run, with Redis up: `Tests run: 278, Failures: 0, Errors: 0, Skipped: 0`.
+**Resilience toward the downstreams**, in `com.gatekeeper.resilience`. The behavioural tests use small values — a breaker window of four, open for one second, a 300 ms route timeout, a bulkhead of two — and `ProductionValuesTest` pins the real ones, so a small test value can never hide a production change.
+
+| Class | Tests | Covers |
+|---|---|---|
+| `ResiliencePropertiesTest` | 8 | `gatekeeper.resilience` binds as written; a missing block, a sub-millisecond JWKS timeout, a non-positive route timeout, minimum calls above the window, a failure rate outside 1–100, a zero bulkhead, or an unknown key stops the boot |
+| `ProductionValuesTest` | 3 | The real `application.yml` with **no** test overrides: a 2 s connect and 5 s response timeout, a 2 s JWKS timeout, and each route's timeout a number, 5000; every route with `CircuitBreaker` first and `Retry` second, the right breaker name, `502`/`503`/`504` counted, and the retry `GET`-only, once, on `502`, `503` and `ConnectException`; each breaker 20 / 10 / 50 % / 10 s / 3, each bulkhead 50 with no wait, the TimeLimiter disabled, and the blocking factory off |
+| `DownstreamFailuresTest` | 5 | What counts: a `504` caused by the gateway's `TimeoutException` is a timeout, a `504` raised for another reason is not; a connect error counts; a counted status counts; a caller's own failure does not |
+| `DownstreamTimeoutTest` | 2 | A slow `GET` and a slow `POST` are each answered `504 DOWNSTREAM_TIMEOUT` within the route's timeout. The global timeout is set long and the route's short, so a pass proves the route's own value is the one in force |
+| `DownstreamUnreachableTest` | 2 | Nothing listening on the downstream's port: `502 DOWNSTREAM_UNREACHABLE`, not an unmapped `500`; and connect errors open the breaker |
+| `DownstreamCircuitBreakerTest` | 7 | Repeated `503`s open it, after which every request is `503 DOWNSTREAM_UNAVAILABLE` with `Retry-After` and no `WWW-Authenticate`, the downstream's request count stops growing, and the opening is logged once; `502`, `503` and `504` come back in the gateway's shape with their status and `DOWNSTREAM_ERROR`, the downstream's `Set-Cookie` and other headers removed; ten `500`s pass through byte-identical, headers included, and leave it closed with no failure recorded; timeouts count; after the open window one successful trial closes it; with `ledger`'s breaker open, AuthCore still answers; and a caller's bad request — a claim with CR/LF, answered `401` — never counts |
+| `DownstreamRetryTest` | 8 | A `GET` answered `503` then `200` gets `200` after two downstream requests, and likewise for `502`; only once; a `POST` is never retried; a timeout and a `500` are not retried; the breaker sees one outcome per client request; a retried request costs one rate-limit token |
+| `DownstreamBulkheadTest` | 1 | With a limit of two: two slow requests held, and each of six more refused `503 DOWNSTREAM_BUSY` with `Retry-After: 1` at once, not after the slow downstream's 1.5 seconds; the refusals leave the breaker closed with no failure recorded, though its window is small enough to open were they counted; AuthCore unaffected; the held two answered `200`. It waits by polling WireMock until both slow requests have arrived, not for a fixed time — a cold context made a fixed sleep racy |
+
+Current run, with Redis up: `Tests run: 323, Failures: 0, Errors: 0, Skipped: 0`.
 
 Five earlier tests are worth explaining, because each was written against a specific way the obvious version of the test passes while proving nothing.
 
@@ -723,11 +928,15 @@ The M5 tests were checked the same way. Deleting the quota check from the script
 
 The M6 tests were checked the same way, with ten mutations, and every one turned at least one test red: the store always answering "not revoked"; a token with no `jti` admitted; an open breaker skipping the check instead of refusing; the unavailable check mapped to `401`; a store failure admitting the token; the check made before the inner decoder rather than after it; a five-second in-process cache of "not revoked"; `JwtDecoderConfig` returning the Nimbus decoder unwrapped; the revocation `503` without its `detail`; and that `detail` leaking onto M3's introspection `503`. Two gaps were found and closed before the sweep. The dead-Redis timing test could run after its sibling had already opened the breaker, so every request it timed was refused without touching Redis, and a mutation delaying each refusal by 1.5 seconds passed; it now starts from a fresh context, and that mutation fails it. And the silent-Redis test accepted *at most* one connection, which zero also satisfies; it now requires exactly one.
 
+The M7 tests were checked the same way, with fourteen mutations, the bulkhead one run in two variants, and every one was caught except the variant that is meant to survive. Among them: counting a `500` (adding it to an AuthCore route's `statusCodes`); dropping `502` and `503` from the counted statuses; retrying a `POST`; dropping the retry's explicit exception list, so that timeouts are retried; `Retry` before `CircuitBreaker`; turning the 1 s TimeLimiter back on; removing the JWKS timeouts; answering an unreachable key set `401` again; restoring Lettuce's default reconnect delay; giving both downstreams one breaker name; leaving the downstream's headers on the gateway's error; and answering every counted status `503`. Two results are worth recording. **The `500` mutation is caught only by `ProductionValuesTest`**: the behavioural `500` test exercises the ledger route, and the mutation was made on an AuthCore route — which is what pinning the production values is for. **The bulkhead mutation survives when only one guard is removed**, whichever one, and is caught by `DownstreamBulkheadTest` when both are; that is the [two guards](#a-bulkhead-per-downstream) working as designed, not a gap.
+
+Two findings came from review rather than the sweep. The breaker counted every exception thrown inside the chain, so a caller's own bad request could open it for everyone — now `DownstreamFailures`, pinned by `aCallersBadRequestNeverCountsAgainstTheDownstream`. And the key-set logging judged a fetch by its status, so a `200` login page was neither logged as a failure nor kept from logging "answered again" — now judged by its body, pinned by `JwksFetchLoggingTest`.
+
 ---
 
 ## Known limitations
 
-Honest about what this is not, yet. Several of these are the direct consequence of M0–M6 being a deliberately narrow slice. The handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5) keeps the open items the milestones' reviews and runs found, with an owner for each.
+Honest about what this is not, yet. Several of these are the direct consequence of M0–M7 being a deliberately narrow slice. The handoff (`docs/superpowers/HANDOFF-M3-M6.md`, §5) keeps the open items the milestones' reviews and runs found, with an owner for each.
 
 - **Identity headers are informational, not authoritative.** They are stamped from verified claims and inbound ones are stripped — see [the section above](#the-identity-headers-it-stamps) — but no downstream should authorize on them, and ledger-service deliberately does not. Treating `X-GK-*` as a trust signal would make every service behind this gateway depend on the gateway being unbypassable, which it is not.
 
@@ -740,7 +949,7 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 
 - **A request the firewall rejects gets a bare `400`.** Spring Security's `StrictServerWebExchangeFirewall` refuses `..`, `//`, encoded slashes, `;`, `%25` and similar with an empty-bodied `400` — outside the platform's JSON error shape. It is Spring's default and predates M4; M4 only came to depend on it (see [the section above](#the-table-and-the-routes-must-see-the-same-path)).
 
-- ~~**A JWKS fetch failure returns `500`, not the `401` it should.**~~ **Fixed.** `ReactiveRemoteJWKSource.getJWKSet()`'s `WebClientRequestException` is wrapped as `IllegalStateException("Could not obtain the keys", ...)` inside `NimbusReactiveJwtDecoder`, and `JwtReactiveAuthenticationManager.authenticate()` maps only `JwtException` to a `401`, so the `IllegalStateException` used to reach Boot's default handler unmapped and misreport an authentication failure as a server fault. `GlobalErrorWebExceptionHandler` now recognises it, and `UnreachableJwksErrorShapeTest` stops the `500` returning.
+- ~~**A JWKS fetch failure returns an unmapped `500`.**~~ **Fixed, and since M7 a `503`.** `ReactiveRemoteJWKSource.getJWKSet()`'s failure is wrapped as `IllegalStateException("Could not obtain the keys", ...)` inside `NimbusReactiveJwtDecoder`, and `JwtReactiveAuthenticationManager.authenticate()` maps only `JwtException` to a `401`, so the `IllegalStateException` used to reach Boot's default handler unmapped and read as a server fault. `GlobalErrorWebExceptionHandler` recognises it: until M7 it answered `401`, so as not to advertise that the identity provider was down; since M7 it answers `503` with `Retry-After: 5` and `KEYS_UNAVAILABLE`, because a `401` would send a caller holding a valid token to refresh it against the AuthCore that cannot answer — see [The key set: 503, not 401](#the-key-set-503-not-401). `UnreachableJwksErrorShapeTest` and `JwksTimeoutTest` pin it.
 
 - ~~**No unified error shape.**~~ **Fixed.** `GlobalErrorWebExceptionHandler` renders one JSON shape — `error`, `status`, `path` — whichever layer refused the request, and ledger-service matches it one hop downstream. `ErrorShapeTest` pins it.
 
@@ -750,19 +959,31 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 
 - **No per-IP flood protection.** The limiter counts only authenticated, authorized requests, by the caller's identity. A flood of unauthenticated or forbidden requests is refused without reaching a downstream, but costs gateway CPU and, for random API keys, negatively cached introspection calls. Limiting by IP before authentication is a different mechanism, and is not built.
 
-- **API-key callers neither fail open nor fail fast when Redis does.** M3's introspection cache reads the same Redis through the same client. Observed live with Redis stopped: an API-key caller hung, waiting in Lettuce's reconnect buffer up to the command timeout, and a Redis that accepts connections and never answers could block an event loop on the cache's first connection. The contrast since M6 is stark: in the M6 run, JWT callers were refused `503` in 9–247 ms while an API-key caller hung until curl gave up at 15 seconds. The limiter and the revocation check bound only their own shares; Lettuce buffers commands without limit while disconnected, and rejecting them client-wide would change M3's behaviour, so it was not done here. Separately, AuthCore itself hangs when Redis is down, so its routes answer late whatever the gateway does.
+- **API-key callers neither fail open nor fail fast when Redis does.** M3's introspection cache reads the same Redis through the same client. Observed live with Redis stopped: an API-key caller hung, waiting in Lettuce's reconnect buffer up to the command timeout, and a Redis that accepts connections and never answers could block an event loop on the cache's first connection. The contrast since M6 is stark: in the M6 run, JWT callers were refused `503` in 9–247 ms while an API-key caller hung until curl gave up at 15 seconds. The limiter and the revocation check bound only their own shares; Lettuce buffers commands without limit while disconnected, and rejecting them client-wide would change M3's behaviour, so it was not done here. Separately, AuthCore itself hangs when Redis is down; since M7 the gateway bounds that at its 5 s response timeout and answers `504 DOWNSTREAM_TIMEOUT`, but it cannot make AuthCore answer.
 
 - **Redis's clock stepping backwards.** Refill is never negative, so after a backward step a drained bucket stays drained — refused with `Retry-After: 1` — until Redis's clock passes the stored time again, and a step back across midnight resets the day's count. The triggers are an NTP step on the Redis host or a failover to a replica with a skewed clock.
 
-- **A downstream's own `X-RateLimit-*` or `X-Quota-*` headers would be duplicated.** Spring Cloud Gateway appends a downstream's response headers to those the gateway set, so a downstream sending the same names would produce two of each. None does today; setting the headers in `beforeCommit` would fix it.
+- **A downstream's own `X-RateLimit-*` or `X-Quota-*` headers would be duplicated — and on a counted status, would take the gateway's with them.** Spring Cloud Gateway appends a downstream's response headers to those the gateway set, so a downstream sending the same names would produce two of each. And since M7, when a downstream answers `502`, `503` or `504`, the error handler removes every header the downstream added, by name: a downstream echoing an `X-RateLimit-*` header would make the gateway's own copy of it disappear from that error. Both predate any downstream doing it — none does today. Setting the headers in `beforeCommit` would fix the first; the second needs the removal to spare the names the gateway sets itself.
 
-- **The warm-up's two seconds, and both breakers' five-second window and threshold of three failures, are constants, not properties**, and the warm-up does not run under lazy initialisation.
+- **The warm-up's two seconds, both Redis breakers' five-second window and threshold of three failures, and Lettuce's reconnect delay (100 ms to 2 s) are constants, not properties**, and the warm-up does not run under lazy initialisation.
 
-- **Recovering from a Redis outage takes as long as Lettuce takes to reconnect.** Lettuce backs off between reconnect attempts, by up to about 30 seconds as an outage lengthens, and neither breaker's probe can succeed until it has reconnected. That holds for a connection that was established and then lost; if Redis is down at boot, nothing was ever connected, so the connection step's next attempt opens a fresh connection, and recovery takes at most one breaker window. In the M6 run JWT callers were refused `503` for 17.8 seconds after Redis came back, against a breaker window of five; the limiter lags the same way, where it costs only a longer unlimited stretch. A shorter reconnect delay would apply to the whole Redis client and was deliberately not set — see [Against the real platform](#against-the-real-platform).
+- ~~**Recovering from a Redis outage takes as long as Lettuce takes to reconnect**, up to about 30 seconds as an outage lengthens.~~ **Shortened in M7.** Lettuce now waits at most two seconds between reconnect attempts, with jitter, so recovery is about two seconds plus at most one breaker window: in the M7 run the gateway reconnected 0.48–0.90 seconds after Redis returned, and bearer tokens were served again within 0.55–5.96 seconds, against 17.8 seconds in M6 — see [Redis reconnects within two seconds](#redis-reconnects-within-two-seconds).
+
+- **AuthCore's own Redis client still uses Lettuce's default reconnect backoff.** In the M7 run its reconnect attempts came about 9, 8, 16 and 30 seconds apart, so after Redis returned the AuthCore routes were answered `504 DOWNSTREAM_TIMEOUT` for about 20 and 31 seconds in two cycles — long after the gateway itself had recovered — and those timeouts counted toward the `authcore` breaker. AuthCore adopting the same reconnect delay would fix it; that is an AuthCore change, outside M7, and the repo owner's decision.
+
+- **A downstream whose every request fails with `500` never opens its breaker.** That is the cost of [the assumption](#the-assumption-behind-what-counts) that a `500` is the downstream's own answer: a broken deployment, or a ledger-service whose database is down — Spring Boot answers that with `500` — is never cut off. Callers get prompt `500`s, not hangs. The fix belongs to the downstreams, which should answer `503` when a dependency they need is down.
+
+- **Reactor Netty logs a WARN of its own on every timed-out key-set fetch** — "The connection observed an error", with a `ReadTimeoutException` — so while the gateway's own WARN appears once per outage, the log as a whole does not. Observed in the M7 run. Quieting the `reactor.netty.http.client.HttpClientConnect` logger is the candidate fix, for M8.
+
+- **Breaker state is per instance.** Each gateway instance opens its own breakers from its own traffic, deliberately; nothing is shared through Redis. Behind a load balancer, one instance may still be calling a downstream that another has cut off.
+
+- **The bulkhead is covered by tests only, not by the live run.** Fifty concurrent requests would need a load tool; `DownstreamBulkheadTest` covers it with a limit of two.
+
+- **The key set's connect timeout is not exercised by a test.** `JwksTimeoutTest` covers a key set that accepts the connection and never answers — the response timeout — and `UnreachableJwksErrorShapeTest` a refused connection. No test stages a host that never accepts the connection at all, so the connect timeout, set in `JwtDecoderConfig.jwksWebClient` beside the response timeout, is not observed on its own.
 
 - **Downstream URIs are static configuration.** Two hardcoded `localhost` URLs, no service discovery, no health-aware load balancing. Fine for a single-instance local platform, insufficient for more than one instance of anything.
 
-- **No resilience toward downstreams.** No circuit breaker, no timeout, no retry, no bulkhead on a routed call. A downstream that hangs will hold gateway connections until the client gives up. (The rate limiter's and the revocation check's timeouts and breakers guard only their own Redis calls.) Nor does the JWKS fetch have a response timeout: Spring Security builds its `WebClient` bare, so an AuthCore that accepts the connection and never answers hangs the request. M7 owns both.
+- ~~**No resilience toward downstreams.**~~ **Built in M7** — see [Resilience](#resilience): timeouts on every routed call and on the JWKS fetch, a circuit breaker and a bulkhead per downstream, and one retry for a `GET`. What remains is listed above: the all-`500` downstream, breakers per instance, and AuthCore's own reconnect backoff. There are no fallback responses with content — cached data or defaults; every failure is an honest error.
 
 - ~~**No rate limiting or quotas.**~~ **Built in M5** — see [Rate limiting](#rate-limiting).
 
@@ -784,7 +1005,7 @@ Honest about what this is not, yet. Several of these are the direct consequence 
 | M4 | Route → scope authorization, tenant enforcement at the edge | ✅ |
 | M5 | Distributed rate limiting and per-plan quotas (Redis) | ✅ |
 | M6 | Revocation check against AuthCore's deny-list | ✅ |
-| M7 | Resilience — circuit breaker, timeout, retry, bulkhead | planned |
+| M7 | Resilience — circuit breaker, timeout, retry, bulkhead | ✅ |
 | M8 | Audit events to Kafka, observability | planned |
 | M9 | Dynamic route and plan administration | planned |
 | M10 | Hardening, load test, CI/CD | planned |
