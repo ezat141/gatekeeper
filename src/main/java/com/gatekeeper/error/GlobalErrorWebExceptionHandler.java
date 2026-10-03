@@ -1,6 +1,7 @@
 package com.gatekeeper.error;
 
 import com.gatekeeper.apikey.IntrospectionUnavailableException;
+import com.gatekeeper.resilience.DownstreamFailures;
 import com.gatekeeper.resilience.ResilienceProperties;
 import com.gatekeeper.revocation.RevocationUnavailableException;
 import org.jspecify.annotations.Nullable;
@@ -27,7 +28,6 @@ import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
-import java.net.ConnectException;
 import java.util.Set;
 
 /**
@@ -150,7 +150,7 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
      *
      * <p>A downstream that exceeds its route's response timeout is 504 {@link #DOWNSTREAM_TIMEOUT}; a
      * downstream that cannot be connected to is 502 {@link #DOWNSTREAM_UNREACHABLE}. The latter is a bare
-     * {@link ConnectException} match, which is safe: it covers a refused connection (Netty's
+     * {@link DownstreamFailures#isConnectError} (a {@code ConnectException}) match, which is safe: it covers a refused connection (Netty's
      * {@code AnnotatedConnectException}) and a connect timeout (Netty's {@code ConnectTimeoutException}),
      * both subclasses, and every other remote call in the gateway — introspection, the key set, Redis —
      * wraps its connect errors in its own exception before they could reach here.
@@ -178,13 +178,14 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
         if (error instanceof ServiceUnavailableException) {
             return new Answer(HttpStatus.SERVICE_UNAVAILABLE, DOWNSTREAM_UNAVAILABLE, breakerRetryAfter);
         }
-        if (error instanceof CircuitBreakerStatusCodeException counted) {
-            return new Answer(HttpStatus.valueOf(counted.getStatusCode().value()), DOWNSTREAM_ERROR, null);
+        if (DownstreamFailures.isCountedStatus(error)) {
+            return new Answer(HttpStatus.valueOf(((CircuitBreakerStatusCodeException) error).getStatusCode().value()),
+                    DOWNSTREAM_ERROR, null);
         }
-        if (isDownstreamTimeout(error)) {
+        if (DownstreamFailures.isTimeout(error)) {
             return new Answer(HttpStatus.GATEWAY_TIMEOUT, DOWNSTREAM_TIMEOUT, null);
         }
-        if (error instanceof ConnectException) {
+        if (DownstreamFailures.isConnectError(error)) {
             return new Answer(HttpStatus.BAD_GATEWAY, DOWNSTREAM_UNREACHABLE, null);
         }
 
@@ -194,17 +195,6 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
         HttpStatus status = resolved != null ? resolved : HttpStatus.INTERNAL_SERVER_ERROR;
         // Any other 503 still tells the caller it is worth retrying.
         return new Answer(status, null, status == HttpStatus.SERVICE_UNAVAILABLE ? "5" : null);
-    }
-
-    /**
-     * Spring Cloud Gateway's routing filter, when a downstream exceeds the route's response timeout:
-     * a 504 {@code ResponseStatusException} caused by the gateway's own {@code TimeoutException}
-     * (verified in 5.0.2). Matched on both, so a 504 raised for another reason is not relabelled.
-     */
-    private static boolean isDownstreamTimeout(Throwable error) {
-        return error instanceof ResponseStatusException status
-                && status.getStatusCode().value() == HttpStatus.GATEWAY_TIMEOUT.value()
-                && status.getCause() instanceof org.springframework.cloud.gateway.support.TimeoutException;
     }
 
     /**

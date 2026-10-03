@@ -74,6 +74,10 @@ spring:
                 - RemoveRequestHeader=X-API-Key
     circuitbreaker:
       resilience4j:
+        # Only the reactive factory is used; if the unused blocking one ever ran first for a downstream's
+        # name, the shared registry would keep a breaker with default configuration.
+        blocking:
+          enabled: false
         # Spring Cloud CircuitBreaker's default wraps each call in a 1 s TimeLimiter, which would cut
         # requests before the routes' own 5 s timeout. The gateway's response timeout governs instead.
         # The M7 design, section 6.

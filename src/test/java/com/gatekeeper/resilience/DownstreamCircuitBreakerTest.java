@@ -110,7 +110,8 @@ class DownstreamCircuitBreakerTest {
 
         downstream.verify(4, postRequestedFor(urlEqualTo("/ledger/entries")));
         assertThat(state("ledger")).isEqualTo(CircuitBreaker.State.OPEN);
-        assertThat(output.getOut()).contains("Downstream ledger: circuit breaker opened");
+        // Logged once, not once per request: the listener is registered once per breaker.
+        assertThat(output.getOut().split("Downstream ledger: circuit breaker opened", -1)).hasSize(2);
     }
 
     /**
@@ -204,6 +205,33 @@ class DownstreamCircuitBreakerTest {
                 .expectStatus().isOk();
         assertThat(state("ledger")).isEqualTo(CircuitBreaker.State.OPEN);
         assertThat(state("authcore")).isEqualTo(CircuitBreaker.State.CLOSED);
+    }
+
+    /**
+     * A caller's own failure is not the downstream's: a claim that Netty refuses to forward fails inside
+     * the routing filter, the caller gets 401, and the breaker must not count it. Otherwise one caller
+     * could cut the downstream off for everyone. The M7 design, sections 6 and 7.
+     */
+    @Test
+    void aCallersBadRequestNeverCountsAgainstTheDownstream() {
+        downstream.stubFor(post(urlEqualTo("/ledger/entries")).willReturn(okJson("{}")));
+        String badToken = "Bearer " + signingKey.mint(ISSUER, "ezzat", Instant.now().plus(5, ChronoUnit.MINUTES),
+                Map.of("tenant", "acme", "scope", List.of("payments:read", "payments:write"),
+                        "permissions", List.of("evil\r\nX-Injected: yes")));
+
+        for (int i = 0; i < 6; i++) {
+            client.post().uri("/api/ledger/entries")
+                    .header(HttpHeaders.AUTHORIZATION, badToken)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue("{}")
+                    .exchange()
+                    .expectStatus().isUnauthorized();
+        }
+
+        assertThat(state("ledger")).isEqualTo(CircuitBreaker.State.CLOSED);
+        assertThat(breakers.getCircuitBreakerRegistry().find("ledger").orElseThrow().getMetrics().getNumberOfFailedCalls())
+                .isZero();
+        postEntry().expectStatus().isOk();
     }
 
     private WebTestClient.ResponseSpec postEntry() {

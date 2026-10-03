@@ -16,10 +16,16 @@ import org.springframework.context.annotation.Configuration;
  * The downstreams' breakers, from {@link ResilienceProperties}. The M7 design, sections 6, 7 and 14.
  *
  * <p>One per downstream service — {@link #AUTHCORE}, shared by both AuthCore routes, and {@link #LEDGER}
- * — named by each route's {@code CircuitBreaker} filter in {@code application.yml}. What counts as a
- * failure is decided there ({@code statusCodes}: 502, 503, 504) and by the errors that reach the breaker
- * (connect errors, timeouts); a downstream 500 is neither, so it never counts. A full bulkhead's
- * refusal is ignored: the downstream did not fail, the gateway chose not to call it.
+ * — named by each route's {@code CircuitBreaker} filter in {@code application.yml}.
+ *
+ * <p>Exactly three things count as a failure, by {@link DownstreamFailures#isAvailabilityFailure}: a
+ * connect error, a response timeout, and a downstream 502, 503 or 504 (the routes' {@code statusCodes}).
+ * Resilience4j records every exception thrown inside the chain unless told otherwise, so without that
+ * predicate a caller's own failure, such as a claim Netty refuses to forward (answered 401), would count,
+ * and enough of them would cut the downstream off for everyone. An exception that is neither recorded nor
+ * ignored counts as a success, which is what such a failure should be. A downstream 500 is the
+ * downstream's own answer and never reaches the breaker as an error. A full bulkhead's refusal is
+ * ignored: the downstream did not fail, the gateway chose not to call it.
  *
  * <p>The TimeLimiter is disabled by {@code spring.cloud.circuitbreaker.resilience4j.disable-time-limiter};
  * the {@code timeLimiterConfig} given here is required by the builder and never applied.
@@ -42,6 +48,7 @@ public class ResilienceConfig {
                 .failureRateThreshold(breaker.failureRateThreshold())
                 .waitDurationInOpenState(breaker.openFor())
                 .permittedNumberOfCallsInHalfOpenState(breaker.trialCalls())
+                .recordException(DownstreamFailures::isAvailabilityFailure)
                 .ignoreExceptions(BulkheadFullException.class)
                 .build();
         return factory -> {
