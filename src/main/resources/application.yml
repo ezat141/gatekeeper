@@ -27,6 +27,14 @@ spring:
                 response-timeout: ${gatekeeper.resilience.response-timeout-millis.authcore-accounts}
               predicates:
                 - Path=/api/accounts/**
+              filters:
+                # First, so it wraps everything after it, Retry included (Task 6). Counts connect
+                # errors, timeouts and these statuses; a downstream 500 is the downstream's own
+                # answer and passes through uncounted. The M7 design, sections 6 and 7.
+                - name: CircuitBreaker
+                  args:
+                    name: authcore
+                    statusCodes: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
             - id: authcore-machine
               uri: ${gatekeeper.downstream.authcore}
               metadata:
@@ -34,6 +42,14 @@ spring:
                 response-timeout: ${gatekeeper.resilience.response-timeout-millis.authcore-machine}
               predicates:
                 - Path=/api/machine/**
+              filters:
+                # First, so it wraps everything after it, Retry included (Task 6). Counts connect
+                # errors, timeouts and these statuses; a downstream 500 is the downstream's own
+                # answer and passes through uncounted. The M7 design, sections 6 and 7.
+                - name: CircuitBreaker
+                  args:
+                    name: authcore
+                    statusCodes: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
             - id: ledger
               uri: ${gatekeeper.downstream.ledger}
               metadata:
@@ -42,6 +58,13 @@ spring:
               predicates:
                 - Path=/api/ledger/**
               filters:
+                # First, so it wraps everything after it, Retry included (Task 6). Counts connect
+                # errors, timeouts and these statuses; a downstream 500 is the downstream's own
+                # answer and passes through uncounted. The M7 design, sections 6 and 7.
+                - name: CircuitBreaker
+                  args:
+                    name: ledger
+                    statusCodes: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
                 - StripPrefix=1
                 # ledger-service is JWT-only, and a key caller is refused before reaching it
                 # (RouteScopeAuthorizationManager). What remains is a JWT caller sending a
@@ -49,6 +72,16 @@ spring:
                 # nothing with it. The AuthCore routes keep the header: AuthCore
                 # re-authenticates the key itself.
                 - RemoveRequestHeader=X-API-Key
+    circuitbreaker:
+      resilience4j:
+        # Only the reactive factory is used; if the unused blocking one ever ran first for a downstream's
+        # name, the shared registry would keep a breaker with default configuration.
+        blocking:
+          enabled: false
+        # Spring Cloud CircuitBreaker's default wraps each call in a 1 s TimeLimiter, which would cut
+        # requests before the routes' own 5 s timeout. The gateway's response timeout governs instead.
+        # The M7 design, section 6.
+        disable-time-limiter: true
   data:
     redis:
       host: localhost
