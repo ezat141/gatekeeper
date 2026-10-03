@@ -8,6 +8,12 @@ spring:
     gateway:
       server:
         webflux:
+          # The safety net for every route, present and future: a connect timeout in milliseconds and
+          # a response timeout. Each route below also states its own response timeout, which wins.
+          # The M7 design, section 5.
+          httpclient:
+            connect-timeout: 2000
+            response-timeout: 5s
           # StripPrefix=1 applies to the ledger route only. The gateway namespaces every
           # downstream under /api, but ledger-service itself serves /ledger/** with no /api
           # prefix, so that leading segment must be removed before forwarding. AuthCore, by
@@ -16,14 +22,23 @@ spring:
           routes:
             - id: authcore-accounts
               uri: ${gatekeeper.downstream.authcore}
+              metadata:
+                # Plain milliseconds; see gatekeeper.resilience.response-timeout-millis.
+                response-timeout: ${gatekeeper.resilience.response-timeout-millis.authcore-accounts}
               predicates:
                 - Path=/api/accounts/**
             - id: authcore-machine
               uri: ${gatekeeper.downstream.authcore}
+              metadata:
+                # Plain milliseconds; see gatekeeper.resilience.response-timeout-millis.
+                response-timeout: ${gatekeeper.resilience.response-timeout-millis.authcore-machine}
               predicates:
                 - Path=/api/machine/**
             - id: ledger
               uri: ${gatekeeper.downstream.ledger}
+              metadata:
+                # Plain milliseconds; see gatekeeper.resilience.response-timeout-millis.
+                response-timeout: ${gatekeeper.resilience.response-timeout-millis.ledger}
               predicates:
                 - Path=/api/ledger/**
               filters:
