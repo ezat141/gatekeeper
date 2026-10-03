@@ -94,8 +94,11 @@ connection would wait for the operating system's own connect timeout, which can 
   timeout**. They are the safety net: no future route can be added without a bound.
 - **Each route states its own** in its `metadata`: `authcore-accounts`, `authcore-machine` and `ledger`,
   5 s each today. The value refers to a property of ours — e.g.
-  `response-timeout: ${gatekeeper.resilience.timeouts.ledger}` — so `application.yml` shows every
-  route's budget, and a test overrides it by name rather than by the route's position in a list.
+  `response-timeout: ${gatekeeper.resilience.response-timeout-millis.ledger}` — so `application.yml`
+  shows every route's budget, and a test overrides it by name rather than by the route's position in a
+  list. **It must be a plain number of milliseconds:** verified in 5.0.2, `NettyRoutingFilter` parses a
+  route's `response-timeout` with `Long.parseLong` and silently ignores anything else, so `5s` would
+  quietly fall back to the global value. `ProductionValuesTest` (§11) checks each is numeric.
 - A response timeout is answered **504** with `"detail": "DOWNSTREAM_TIMEOUT"` and no `Retry-After`:
   for a POST the outcome is unknown, since the downstream may have processed it, and 504 says exactly
   that.
@@ -149,7 +152,10 @@ cannot serve right now", independent of what was asked: 503 — overloaded, rest
 The same request a little later is expected to succeed. That is exactly what a breaker exists to detect,
 so they **count as failures**, and their bodies — which carry no information the caller can act on —
 **are replaced by the gateway's error shape**, keeping the downstream's status, with
-`"detail": "DOWNSTREAM_ERROR"`.
+`"detail": "DOWNSTREAM_ERROR"`. The replacement covers the downstream's **headers** too: verified in
+5.0.2, they are already on the response when the breaker raises its error, and Boot's error handler
+does not clear them, so without removing them a `Set-Cookie` or `Content-Encoding` from the downstream
+would ride on the gateway's error. The handler removes every header the downstream added.
 
 **A downstream 500 remains an application-level response owned by the downstream.** It says "this
 request hit an error" — usually a defect triggered by specific input. So it **passes through untouched**,
@@ -208,6 +214,10 @@ is written" true, and a test pins it, §11.)
   double the wait; a **500** — a defect repeats (§7).
 - **Once, after 100 ms.** A caller waits a few hundred milliseconds more at worst, never twice the
   timeout.
+- **The filter's exception list is set explicitly to `java.net.ConnectException`.** Verified in 5.0.2:
+  its defaults retry `IOException` *and* the gateway's `TimeoutException`, matching either the error or
+  its cause, so left at the defaults it would retry every response timeout. `series` is set empty so
+  that only the listed statuses, 502 and 503, are retried, not the whole 5xx range.
 - **Inside the breaker:** each route lists `CircuitBreaker` first and `Retry` after it, so the breaker
   sees one outcome per client request — a request that succeeds on its retry is a success — and while
   the breaker is open nothing is retried.
@@ -246,9 +256,13 @@ case nothing else covers).
 ## 11. Testing
 
 **Every production value is a property, and tests override it with small values** — chosen with the
-repo owner. Spring Cloud Gateway's timeouts already are; Resilience4j is configured from our own
-properties (below), since its own property binding needs the `resilience4j-spring-boot` module, which the
-starter does not include and whose Boot 4 version would not match the 2.3.0 Spring Cloud pins.
+repo owner. Spring Cloud Gateway's timeouts already are. The breakers and bulkheads are configured from
+**our own** `gatekeeper.resilience` properties, applied through Spring Cloud CircuitBreaker's
+customizers, rather than from Resilience4j's own `resilience4j.*` properties. Those would also bind —
+verified, the starter brings `resilience4j-spring-boot3` 2.3.0 transitively, and it supplies the
+registries — but they are loosely bound: a misspelt key is ignored and the breaker silently runs on its
+defaults (a 100-call window, 60 s open). Ours are strictly bound and validated, as in M5 and M6, so a
+typo fails the boot.
 
 | Class | What it proves |
 |---|---|
@@ -291,8 +305,9 @@ it exactly, and the README says so.
 New package **`com.gatekeeper.resilience`**:
 
 - **`ResilienceProperties`** — `gatekeeper.resilience`, strictly bound (`ignoreUnknownFields = false`)
-  and validated in the constructor: the per-route response timeouts, the breaker's window, minimum
-  calls, failure-rate threshold, open duration and trial calls, and the bulkhead's limit.
+  and validated in the constructor: the JWKS timeout, the per-route response timeouts in milliseconds,
+  the breaker's window, minimum calls, failure-rate threshold, open duration and trial calls, and the
+  bulkhead's limit.
 - **`ResilienceConfig`** — applies those values to the `authcore` and `ledger` breakers and bulkheads
   through Spring Cloud CircuitBreaker's customizers; the breaker ignores `BulkheadFullException`; logs
   breaker state transitions (§14).
@@ -314,11 +329,17 @@ Changed:
 **No new endpoint**, so no new row in `RouteScopeAuthorizationManager`. The rate limiter and the
 revocation check are unchanged.
 
-**Verified at plan time, not assumed:** where the registries come from without `resilience4j-spring-boot`;
-the exact exceptions for a connect error, a timeout, an open breaker and a full bulkhead; the filter
-order that puts the status check before the body is written; that route `metadata` accepts a property
-placeholder; and that a JWKS timeout reaches the handler as the "Could not obtain the keys" failure the
-handler already recognises.
+**Verified before planning** (jars, source at the release tags, and a throwaway probe app on the same
+versions): the registries come from the transitive `resilience4j-spring-boot3`; a connect error reaches
+the handler as `java.net.ConnectException` (refused, or Netty's `ConnectTimeoutException`), a response
+timeout as a 504 `ResponseStatusException` caused by the gateway's `TimeoutException`, an open breaker as
+the gateway's `ServiceUnavailableException`, a counted status as `CircuitBreakerStatusCodeException` —
+which Boot would render as 500, so the handler maps it explicitly — and a full bulkhead as Resilience4j's
+`BulkheadFullException`; the breaker's status check runs before the body is written (route filters take
+orders 1, 2, … by position, inside `NettyWriteResponseFilter` at −1); route `metadata` accepts a property
+placeholder; a JWKS timeout reaches the handler as the "Could not obtain the keys" failure it already
+recognises; and the breaker-state listener must be registered once per breaker
+(`Customizer.once`), since the factory's customizer runs on every call.
 
 ---
 
