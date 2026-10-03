@@ -1,12 +1,16 @@
 package com.gatekeeper.error;
 
 import com.gatekeeper.apikey.IntrospectionUnavailableException;
+import com.gatekeeper.resilience.ResilienceProperties;
 import com.gatekeeper.revocation.RevocationUnavailableException;
 import org.jspecify.annotations.Nullable;
 import org.springframework.boot.autoconfigure.web.WebProperties;
 import org.springframework.boot.web.error.ErrorAttributeOptions;
 import org.springframework.boot.webflux.autoconfigure.error.AbstractErrorWebExceptionHandler;
 import org.springframework.boot.webflux.error.ErrorAttributes;
+import org.springframework.cloud.gateway.filter.factory.SpringCloudCircuitBreakerFilterFactory.CircuitBreakerStatusCodeException;
+import org.springframework.cloud.gateway.support.ServerWebExchangeUtils;
+import org.springframework.cloud.gateway.support.ServiceUnavailableException;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpHeaders;
@@ -20,9 +24,11 @@ import org.springframework.web.reactive.function.server.RouterFunctions;
 import org.springframework.web.reactive.function.server.ServerRequest;
 import org.springframework.web.reactive.function.server.ServerResponse;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
 import java.net.ConnectException;
+import java.util.Set;
 
 /**
  * One JSON error shape across the platform. Without it a client gets an empty body from
@@ -57,14 +63,23 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
     public static final String DOWNSTREAM_TIMEOUT = "DOWNSTREAM_TIMEOUT";
     /** A downstream could not be connected to. The M7 design, section 8. */
     public static final String DOWNSTREAM_UNREACHABLE = "DOWNSTREAM_UNREACHABLE";
+    /** The downstream's breaker is open. The M7 design, section 6. */
+    public static final String DOWNSTREAM_UNAVAILABLE = "DOWNSTREAM_UNAVAILABLE";
+    /** The downstream answered 502, 503 or 504 — an availability signal. The M7 design, section 7. */
+    public static final String DOWNSTREAM_ERROR = "DOWNSTREAM_ERROR";
+
+    private final String breakerRetryAfter;
 
     public GlobalErrorWebExceptionHandler(ErrorAttributes errorAttributes,
                                           WebProperties webProperties,
                                           ApplicationContext applicationContext,
-                                          ServerCodecConfigurer codecConfigurer) {
+                                          ServerCodecConfigurer codecConfigurer,
+                                          ResilienceProperties resilience) {
         super(errorAttributes, webProperties.getResources(), applicationContext);
         setMessageWriters(codecConfigurer.getWriters());
         setMessageReaders(codecConfigurer.getReaders());
+        // The open window, in whole seconds: an upper bound, since the window may be partly over.
+        this.breakerRetryAfter = Long.toString(Math.max(1, (resilience.breaker().openFor().toMillis() + 999) / 1000));
     }
 
     /** What the caller is told: status, the fixed {@code detail} if any, and {@code Retry-After} if any. */
@@ -79,6 +94,7 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
     private Mono<ServerResponse> render(ServerRequest request) {
         Throwable error = getError(request);
         Answer answer = answerFor(request, error);
+        removeDownstreamHeaders(request.exchange());
 
         ServerResponse.BodyBuilder builder = ServerResponse.status(answer.status())
                 .contentType(MediaType.APPLICATION_JSON);
@@ -92,6 +108,20 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
             builder = builder.header(HttpHeaders.RETRY_AFTER, answer.retryAfter());
         }
         return builder.bodyValue(ErrorBody.of(answer.status(), request.path(), answer.detail()));
+    }
+
+    /**
+     * A counted downstream status reaches here after the downstream's headers were copied onto the
+     * response, and Boot's handler does not clear them (verified in 5.0.2 and Boot 4.0.7): without this,
+     * a downstream's {@code Set-Cookie} or {@code Content-Encoding} would ride on the gateway's error. The
+     * gateway records which headers came from the downstream; they are removed from every error it
+     * renders. Headers the gateway set itself, such as the rate limiter's, stay.
+     */
+    private static void removeDownstreamHeaders(ServerWebExchange exchange) {
+        Set<String> fromDownstream = exchange.getAttribute(ServerWebExchangeUtils.CLIENT_RESPONSE_HEADER_NAMES);
+        if (fromDownstream != null) {
+            fromDownstream.forEach(exchange.getResponse().getHeaders()::remove);
+        }
     }
 
     /**
@@ -124,6 +154,13 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
      * {@code AnnotatedConnectException}) and a connect timeout (Netty's {@code ConnectTimeoutException}),
      * both subclasses, and every other remote call in the gateway — introspection, the key set, Redis —
      * wraps its connect errors in its own exception before they could reach here.
+     *
+     * <p>The M7 design, section 7, rests on one assumption: a downstream 502, 503 or 504 is an availability
+     * signal, so the breaker counts it and it reaches here as a {@link CircuitBreakerStatusCodeException},
+     * answered with the same status and {@link #DOWNSTREAM_ERROR} in the gateway's own shape. A 500 is the
+     * downstream's own answer: it never reaches this handler, and passes through untouched. An open breaker
+     * is a {@link ServiceUnavailableException}, answered 503 {@link #DOWNSTREAM_UNAVAILABLE} with
+     * {@code Retry-After} set to the open window.
      */
     private Answer answerFor(ServerRequest request, Throwable error) {
         if (isRejectedOutboundHeader(error)) {
@@ -137,6 +174,12 @@ public class GlobalErrorWebExceptionHandler extends AbstractErrorWebExceptionHan
         }
         if (error instanceof RevocationUnavailableException) {
             return new Answer(HttpStatus.SERVICE_UNAVAILABLE, RevocationUnavailableException.DETAIL, "5");
+        }
+        if (error instanceof ServiceUnavailableException) {
+            return new Answer(HttpStatus.SERVICE_UNAVAILABLE, DOWNSTREAM_UNAVAILABLE, breakerRetryAfter);
+        }
+        if (error instanceof CircuitBreakerStatusCodeException counted) {
+            return new Answer(HttpStatus.valueOf(counted.getStatusCode().value()), DOWNSTREAM_ERROR, null);
         }
         if (isDownstreamTimeout(error)) {
             return new Answer(HttpStatus.GATEWAY_TIMEOUT, DOWNSTREAM_TIMEOUT, null);

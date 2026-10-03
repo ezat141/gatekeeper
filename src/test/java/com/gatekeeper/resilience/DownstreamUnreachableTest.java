@@ -2,12 +2,15 @@ package com.gatekeeper.resilience;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.gatekeeper.support.TestKey;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webtestclient.autoconfigure.AutoConfigureWebTestClient;
+import org.springframework.cloud.circuitbreaker.resilience4j.ReactiveResilience4JCircuitBreakerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -42,6 +45,9 @@ class DownstreamUnreachableTest {
     @Autowired
     WebTestClient client;
 
+    @Autowired
+    ReactiveResilience4JCircuitBreakerFactory breakers;
+
     @BeforeAll
     static void start() throws IOException {
         signingKey = TestKey.generate("k1");
@@ -64,6 +70,16 @@ class DownstreamUnreachableTest {
         registry.add("gatekeeper.auth.issuer", () -> ISSUER);
         registry.add("gatekeeper.downstream.ledger", () -> "http://localhost:" + closedPort);
         registry.add("gatekeeper.downstream.authcore", () -> authCore.baseUrl());
+        registry.add("gatekeeper.resilience.breaker.sliding-window-size", () -> "4");
+        registry.add("gatekeeper.resilience.breaker.minimum-calls", () -> "4");
+        registry.add("gatekeeper.resilience.breaker.open-for", () -> "1s");
+        registry.add("gatekeeper.resilience.breaker.trial-calls", () -> "1");
+    }
+
+    @BeforeEach
+    void freshBreakers() {
+        // The breakers live for the whole context and test order is not fixed.
+        breakers.getCircuitBreakerRegistry().getAllCircuitBreakers().forEach(CircuitBreaker::reset);
     }
 
     @Test
@@ -78,6 +94,20 @@ class DownstreamUnreachableTest {
                 .jsonPath("$.status").isEqualTo(502)
                 .jsonPath("$.path").isEqualTo("/api/ledger/entries")
                 .jsonPath("$.detail").isEqualTo("DOWNSTREAM_UNREACHABLE");
+    }
+
+    /** Connect errors count: after enough of them the breaker answers at once. The M7 design, section 6. */
+    @Test
+    void connectErrorsOpenTheBreaker() {
+        for (int i = 0; i < 4; i++) {
+            client.get().uri("/api/ledger/entries").header(HttpHeaders.AUTHORIZATION, token()).exchange();
+        }
+
+        client.get().uri("/api/ledger/entries")
+                .header(HttpHeaders.AUTHORIZATION, token())
+                .exchange()
+                .expectStatus().isEqualTo(503)
+                .expectBody().jsonPath("$.detail").isEqualTo("DOWNSTREAM_UNAVAILABLE");
     }
 
     static String token() {
