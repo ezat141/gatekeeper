@@ -91,6 +91,30 @@ gatekeeper:
     # opposite of rate-limit.redis-timeout above — and it must refuse fast, not hang. See the M6
     # design, sections 4 and 7.
     redis-timeout: 200ms
+  resilience:
+    # Fetching AuthCore's key set: connect and response timeout. Past it, bearer tokens that need a
+    # key fetch are refused 503 KEYS_UNAVAILABLE rather than left hanging. The M7 design, section 4.
+    jwks-timeout: 2s
+    # Each route's response timeout, by route id, in PLAIN MILLISECONDS: the routes' metadata refers
+    # to these, and Spring Cloud Gateway silently ignores a non-numeric route timeout. A timeout is
+    # answered 504 DOWNSTREAM_TIMEOUT. The M7 design, section 5.
+    response-timeout-millis:
+      authcore-accounts: 5000
+      authcore-machine: 5000
+      ledger: 5000
+    # One breaker per downstream (authcore, ledger). It counts connect errors, timeouts and
+    # downstream 502/503/504 — never a 500, which is the downstream's own answer. The M7 design,
+    # sections 6 and 7.
+    breaker:
+      sliding-window-size: 20
+      minimum-calls: 10
+      failure-rate-threshold: 50
+      open-for: 10s
+      trial-calls: 3
+    # One semaphore bulkhead per downstream: beyond this many requests in flight, refused at once
+    # 503 DOWNSTREAM_BUSY. A refusal never counts as a breaker failure. The M7 design, section 10.
+    bulkhead:
+      max-concurrent-calls: 50
 
 management:
   endpoints:
